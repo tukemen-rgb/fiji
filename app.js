@@ -1,114 +1,104 @@
-const DEFAULT_PICKUP = { lat: -17.7554, lng: 177.4434, label: 'Nadi International Airport' };
-const DEFAULT_DROPOFF = { lat: -17.7848, lng: 177.4217, label: 'Ramada Suites by Wyndham Wailoaloa Beach Fiji' };
-
+const FALLBACK = { lat: -17.773, lng: 177.428, label: 'Nadi, Fiji' };
 let map;
-let directionsService;
-let directionsRenderer;
-let pickupAutocomplete;
+let pickup = FALLBACK;
 let destinationAutocomplete;
-let pickupPlace = DEFAULT_PICKUP;
-let destinationPlace = DEFAULT_DROPOFF;
+let pickupMarker;
+
+function setPickupLabel(text) {
+  document.getElementById('pickup-label').textContent = text;
+}
 
 function loadGoogleMaps() {
   const key = localStorage.getItem('googleMapsApiKey') || new URLSearchParams(location.search).get('gmapsKey');
   if (!key) {
     document.getElementById('map-error').hidden = false;
-    const entered = prompt('Google Maps APIキーを入力するとルート地図を表示できます。\nこの端末だけに保存します。');
+    const entered = prompt('Google Maps JavaScript APIキーを入力してください。\nこの端末だけに保存します。');
     if (!entered) return;
     localStorage.setItem('googleMapsApiKey', entered.trim());
     location.reload();
     return;
   }
-
-  window.initTaxiMap = initTaxiMap;
+  window.initHomeMap = initHomeMap;
   const script = document.createElement('script');
-  script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&libraries=places&callback=initTaxiMap`;
+  script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&libraries=places&callback=initHomeMap`;
   script.async = true;
   script.defer = true;
-  script.onerror = () => {
-    document.getElementById('map-error').hidden = false;
-  };
+  script.onerror = () => document.getElementById('map-error').hidden = false;
   document.head.appendChild(script);
 }
 
-function initTaxiMap() {
+function initHomeMap() {
   document.getElementById('map-error').hidden = true;
   map = new google.maps.Map(document.getElementById('map'), {
-    center: DEFAULT_PICKUP,
-    zoom: 13,
+    center: FALLBACK,
+    zoom: 15,
     disableDefaultUI: true,
-    zoomControl: true,
     gestureHandling: 'greedy',
-    mapId: undefined
+    styles: [
+      { featureType: 'poi', stylers: [{ visibility: 'off' }] },
+      { featureType: 'transit', stylers: [{ visibility: 'off' }] }
+    ]
   });
 
-  directionsService = new google.maps.DirectionsService();
-  directionsRenderer = new google.maps.DirectionsRenderer({
+  pickupMarker = new google.maps.Marker({
     map,
-    suppressMarkers: false,
-    polylineOptions: { strokeColor: '#111318', strokeOpacity: 0.9, strokeWeight: 5 }
+    position: FALLBACK,
+    title: 'Pickup'
   });
 
-  pickupAutocomplete = new google.maps.places.Autocomplete(document.getElementById('pickup-input'), {
-    fields: ['geometry', 'name', 'formatted_address'],
-    componentRestrictions: { country: 'fj' }
-  });
-  destinationAutocomplete = new google.maps.places.Autocomplete(document.getElementById('destination-input'), {
-    fields: ['geometry', 'name', 'formatted_address'],
-    componentRestrictions: { country: 'fj' }
-  });
-
-  pickupAutocomplete.addListener('place_changed', () => {
-    const p = pickupAutocomplete.getPlace();
-    if (!p.geometry?.location) return;
-    pickupPlace = { lat: p.geometry.location.lat(), lng: p.geometry.location.lng(), label: p.name || p.formatted_address };
-    renderRoute();
-  });
+  destinationAutocomplete = new google.maps.places.Autocomplete(
+    document.getElementById('destination-input'),
+    { fields: ['geometry','name','formatted_address'], componentRestrictions: { country: 'fj' } }
+  );
 
   destinationAutocomplete.addListener('place_changed', () => {
-    const p = destinationAutocomplete.getPlace();
-    if (!p.geometry?.location) return;
-    destinationPlace = { lat: p.geometry.location.lat(), lng: p.geometry.location.lng(), label: p.name || p.formatted_address };
-    renderRoute();
+    const place = destinationAutocomplete.getPlace();
+    if (!place.geometry?.location) return;
+    const lat = place.geometry.location.lat();
+    const lng = place.geometry.location.lng();
+    sessionStorage.setItem('taxiDestination', JSON.stringify({ lat, lng, label: place.name || place.formatted_address || 'Destination' }));
+    alert('目的地を設定しました。次画面では車種・料金・評価を比較します。');
   });
 
-  renderRoute();
+  locateUser();
 }
 
-function renderRoute() {
-  if (!directionsService || !directionsRenderer) return;
-  directionsService.route({
-    origin: { lat: pickupPlace.lat, lng: pickupPlace.lng },
-    destination: { lat: destinationPlace.lat, lng: destinationPlace.lng },
-    travelMode: google.maps.TravelMode.DRIVING,
-    provideRouteAlternatives: false
-  }).then((result) => {
-    directionsRenderer.setDirections(result);
-    const leg = result.routes?.[0]?.legs?.[0];
-    if (leg) {
-      document.getElementById('route-duration').textContent = leg.duration?.text || '—';
-      document.getElementById('route-distance').textContent = leg.distance?.text || '';
+function locateUser() {
+  if (!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(async (pos) => {
+    pickup = { lat: pos.coords.latitude, lng: pos.coords.longitude, label: 'Current location' };
+    map.setCenter(pickup);
+    pickupMarker.setPosition(pickup);
+    try {
+      const geocoder = new google.maps.Geocoder();
+      const result = await geocoder.geocode({ location: pickup });
+      const address = result.results?.[0]?.formatted_address;
+      if (address) setPickupLabel(address.replace(', Fiji',''));
+      else setPickupLabel('Current location');
+    } catch {
+      setPickupLabel('Current location');
     }
-  }).catch(() => {
-    document.getElementById('route-duration').textContent = 'ルート取得失敗';
-  });
+  }, () => {
+    setPickupLabel('Nadi, Fiji');
+  }, { enableHighAccuracy: true, timeout: 10000 });
 }
 
-document.getElementById('use-location').addEventListener('click', () => {
-  if (!navigator.geolocation) return alert('この端末では位置情報を利用できません。');
-  navigator.geolocation.getCurrentPosition((pos) => {
-    pickupPlace = { lat: pos.coords.latitude, lng: pos.coords.longitude, label: '現在地' };
-    document.getElementById('pickup-input').value = '現在地';
-    renderRoute();
-  }, () => alert('位置情報の取得を許可してください。'), { enableHighAccuracy: true, timeout: 10000 });
+document.querySelectorAll('.recent').forEach((row) => {
+  row.addEventListener('click', () => {
+    document.getElementById('destination-input').value = row.dataset.place || '';
+    document.getElementById('destination-input').focus();
+  });
 });
 
-document.querySelectorAll('.primary-button').forEach((button) => {
-  button.addEventListener('click', () => {
-    const driver = button.dataset.driver;
-    const fare = button.dataset.fare;
-    alert(`${driver}を選択しました。FJ$${fare}の提示額を証拠としてロックします。`);
+document.querySelectorAll('.service-card').forEach((card) => {
+  card.addEventListener('click', () => {
+    document.querySelectorAll('.service-card').forEach(x => x.classList.remove('active'));
+    card.classList.add('active');
   });
+});
+
+document.getElementById('schedule-button').addEventListener('click', () => {
+  alert('予約日時選択は次の実装で追加します。');
 });
 
 loadGoogleMaps();
