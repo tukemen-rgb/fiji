@@ -3,100 +3,54 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <meta name="theme-color" content="#f6f7f8" />
+  <meta name="theme-color" content="#f8fafc" />
   <title>Taxi Protection</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-  <main class="app-shell">
-    <header class="topbar">
-      <div>
-        <h1>Taxi Protection</h1>
-        <p>Travel without fare surprises.</p>
-      </div>
-      <button class="icon-button" aria-label="設定">•••</button>
-    </header>
+  <main class="screen">
+    <div class="notice" id="notice"><span>🔕</span><div><strong>Notifications are off</strong><small>You may miss ride offers and updates.</small></div><button>›</button></div>
 
-    <section class="map-card" aria-label="乗車ルート">
+    <section class="map-stage">
       <div id="map" class="map"></div>
-      <div class="map-overlay">
-        <span class="protection-chip">🛡 Protection active</span>
-        <div class="route-summary">
-          <strong id="route-duration">ルートを計算中…</strong>
-          <span id="route-distance"></span>
-        </div>
-      </div>
-      <div id="map-error" class="map-error" hidden>
-        Google Maps APIキーを設定すると、乗車地点・降車地点とルートがここに表示されます。
-      </div>
+      <div id="map-error" class="map-error" hidden>Google Maps APIキーを設定すると現在地を表示します。</div>
+      <button class="profile-button" aria-label="profile">●</button>
+      <div class="pickup-pill"><span class="pickup-dot"></span><span id="pickup-label">Current location</span></div>
     </section>
 
-    <section class="route-card">
-      <label class="location-row">
-        <span class="dot pickup"></span>
-        <span>
-          <small>乗車地点</small>
-          <input id="pickup-input" value="Nadi International Airport" autocomplete="off" />
-        </span>
-      </label>
-      <div class="route-line"></div>
-      <label class="location-row">
-        <span class="dot destination"></span>
-        <span>
-          <small>降車地点</small>
-          <input id="destination-input" value="Ramada Suites by Wyndham Wailoaloa Beach Fiji" autocomplete="off" />
-        </span>
-      </label>
-      <button id="use-location" class="secondary-button">現在地を乗車地点にする</button>
-    </section>
+    <section class="bottom-sheet">
+      <div class="grabber"></div>
+      <div class="greeting"><h1>Hi 👋</h1><p>Where are you headed?</p></div>
 
-    <section class="rule-card">
-      <div>
-        <strong>✓ Meter check required</strong>
-        <p>空港ルールを自動適用。認証済みAirport Taxiのみを表示し、提示額を選択時に保存します。</p>
-      </div>
-      <span class="verified-badge">Verified rule</span>
-    </section>
-
-    <section class="offers-section">
-      <div class="section-heading">
-        <h2>Live taxi offers</h2>
-        <button class="text-button">並び替え</button>
+      <div class="destination-search">
+        <span>⌕</span>
+        <input id="destination-input" placeholder="Where to?" autocomplete="off" />
+        <button id="schedule-button">◷ Now</button>
       </div>
 
-      <article class="offer-card best">
-        <div class="offer-topline"><span>BEST MATCH · DRIVER OFFER</span><span class="verified">✓ Verified</span></div>
-        <div class="price">FJ$18</div>
-        <div class="metrics">
-          <div><strong>4 min</strong><small>ETA</small></div>
-          <div><strong>★ 4.9</strong><small>328 rides</small></div>
-          <div><strong>0</strong><small>料金問題</small></div>
-        </div>
-        <div class="driver-row"><strong>Jone · LT 4821</strong><span>Card accepted</span></div>
-        <button class="primary-button" data-driver="Jone" data-fare="18">このタクシーを選ぶ</button>
-      </article>
+      <div class="service-grid">
+        <button class="service-card active" data-service="ride"><span class="service-icon">🚕</span><strong>Ride</strong><small>Book a car</small></button>
+        <button class="service-card" data-service="parcel"><span class="service-icon">📦</span><strong>Parcel</strong><small>Send a package</small></button>
+      </div>
 
-      <article class="offer-card">
-        <div class="offer-topline"><span>DRIVER OFFER</span><span class="verified">✓ Verified</span></div>
-        <div class="price">FJ$15</div>
-        <div class="metrics">
-          <div><strong>9 min</strong><small>ETA</small></div>
-          <div><strong>★ 4.6</strong><small>91 rides</small></div>
-          <div><strong>3</strong><small>料金問題</small></div>
-        </div>
-        <div class="driver-row"><strong>Sam · LT 7130</strong><span>3 fare reports</span></div>
-        <button class="primary-button" data-driver="Sam" data-fare="15">このタクシーを選ぶ</button>
-      </article>
+      <div class="section-title">SAVED PLACES</div>
+      <div class="list-card">
+        <button class="place-row"><span class="round-icon">⌂</span><span><strong>Home</strong><small>Set your home address</small></span><b>＋</b></button>
+        <button class="place-row"><span class="round-icon">▣</span><span><strong>Work</strong><small>Set your work address</small></span><b>＋</b></button>
+      </div>
+
+      <div class="section-title">RECENT</div>
+      <div class="list-card">
+        <button class="place-row recent" data-place="Nadi"><span class="round-icon">◷</span><span><strong>Nadi</strong><small>Nadi, Fiji</small></span><b>›</b></button>
+        <button class="place-row recent" data-place="Naboutini"><span class="round-icon">◷</span><span><strong>Naboutini</strong><small>Naboutini, Nadi, Fiji</small></span><b>›</b></button>
+      </div>
+
+      <div class="protection-card">
+        <div><small>🛡 TAXI PROTECTION</small><strong>Fare protection runs automatically after you choose a ride.</strong></div>
+        <button>View</button>
+      </div>
     </section>
-
-    <nav class="bottom-nav">
-      <button class="active">⌂<span>配車</span></button>
-      <button>⌖<span>乗車中</span></button>
-      <button>🛡<span>Protection</span></button>
-      <button>★<span>履歴</span></button>
-    </nav>
   </main>
-
   <script src="./app.js"></script>
 </body>
 </html>
