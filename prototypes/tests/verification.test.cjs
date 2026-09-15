@@ -1,0 +1,26 @@
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const V = require('../verification.js');
+const record = () => V.samples()[0];
+const iso = days => new Date(Date.now()+days*86400000).toISOString();
+test('full reviewed record passes the reference gate',()=>assert.equal(V.assess(record()).eligible,true));
+test('upload/submitted alone does not approve a taxi',()=>{let r=record();r.status='submitted';assert.equal(V.assess(r).eligible,false)});
+test('suspension overrides valid documents',()=>{let r=record();r.status='suspended';assert.equal(V.assess(r).code,'suspended')});
+test('expiry blocks dispatch',()=>{let r=record();r.documents.taxi_permit.expiresAt=iso(-1);assert.equal(V.assess(r).eligible,false)});
+test('missing insurance blocks dispatch',()=>{let r=record();delete r.documents.insurance;assert.equal(V.assess(r).eligible,false)});
+test('no evidence reference blocks approval',()=>{let r=record();r.documents.taxi_permit.evidenceRef='';assert.equal(V.assess(r).eligible,false)});
+test('self approval is disallowed',()=>{let r=record();r.documents.taxi_permit.reviewerId=r.driverId;assert.equal(V.assess(r).eligible,false)});
+test('unknown method is not trusted',()=>{let r=record();r.documents.taxi_permit.method='self_report';assert.equal(V.assess(r).eligible,false)});
+test('invalid and future check dates fail closed',()=>{for(const date of ['bad',iso(1)]){let r=record();r.documents.taxi_permit.checkedAt=date;assert.equal(V.assess(r).eligible,false)}});
+test('stale confirmation requires recheck',()=>{let r=record();r.documents.taxi_permit.recheckAt=iso(-1);assert.equal(V.assess(r).eligible,false)});
+test('vehicle and driver reassignment invalidates prior proof',()=>{for(const key of ['driverId','vehicleId','holderId','plate']){let r=record();r[key]='changed';assert.equal(V.assess(r).eligible,false)}});
+test('a city taxi cannot pass the airport gate',()=>{let r=V.samples()[1];assert.equal(V.assess(r).eligible,true);assert.equal(V.assess(r,{airport:true}).eligible,false)});
+test('invalid current timestamp fails closed',()=>assert.equal(V.assess(record(),{now:'invalid'}).eligible,false));
+test('unknown registry record is not a finding of illegality',()=>assert.equal(V.assess(null).code,'not_found'));
+test('plate normalization handles spaces/dashes/full-width',()=>assert.equal(V.normalizePlate(' ｄｅｍｏ－００１ '),'DEMO001'));
+test('plate mismatch is rejected',()=>assert.equal(V.matchVehicle(record(),'DEMO 002').code,'plate_mismatch'));
+test('a different approved car is not the booked car',()=>assert.equal(V.matchVehicle(record(),'DEMO 001',{expectedId:'demo-2'}).code,'wrong_vehicle'));
+function input(){return {name:'Sample',phone:'+6790000000',plate:'DEMO005',holder:'holder',vehicle:'vehicle',taxiPermit:'DEMO-T',driverLicence:'DEMO-L',psvPermit:'DEMO-P',base:'Nadi',consent:true,documents:Object.fromEntries(V.REQUIRED.map(k=>[k,{attachment:'DEMO.pdf',expiresAt:iso(180)}]))}}
+test('registration cannot inject approved flag or status',()=>{let x=input();x.status='reviewed';x.approved=true;const a=V.submitApplication(x);assert.equal(a.ok,true);assert.equal(a.application.status,'submitted');assert.equal(a.application.eligible,false);assert.equal(a.application.approved,undefined)});
+test('application requires consent, attachments and expiry',()=>{let x=input();x.consent=false;x.documents.taxi_permit.expiresAt=iso(-1);delete x.documents.insurance;assert.equal(V.submitApplication(x).ok,false)});
+test('airport application also requires airport evidence',()=>{let x=input();x.airport=true;assert.equal(V.submitApplication(x).ok,false)});
