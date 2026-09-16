@@ -4,7 +4,7 @@
 Select Passenger or Driver FIRST. Register the information required for that role. Route to the corresponding home using that registered information. Each role must see different information and input controls, not a shared mixed-role menu.
 
 ## Status and ownership
-Current update: the standalone HTML at `prototypes/role-split/index.html` now fixes the vehicle-confirmation regression found at intake. All 35 reference tests pass; see `PROGRESS.md`. The original user-supplied bytes remain in the intake commit, and `HANDOVER_REVIEW_2026-09-16.md` preserves that earlier review. The prototype has not been integrated into the root application.
+Current update: the standalone HTML at `prototypes/role-split/index.html` now supports pre-boarding passenger cancellation as well as the vehicle-confirmation fix found at intake. All 43 reference tests pass; see `PROGRESS.md`. The original user-supplied bytes remain in the intake commit, and `HANDOVER_REVIEW_2026-09-16.md` preserves that earlier review. The prototype has not been integrated into the root application.
 GDP / ChatGPT created and locally tested an interaction prototype, delivered in the conversation as `taxi_protection_role_test.html` and `taxi_protection_role_source.zip`. The complete UI source is in that downloadable archive, NOT in this repository's root application. This commit records the production implementation contract; it does not deploy the prototype or invoke Claude. Claude remains the requested production implementer.
 
 All accounts, permits, fares, vehicles, matches and approval records in the preview are fictional. State is in memory in one open document. No authentication, OTP, database persistence, cross-device synchronization, issuer verification, upload, notification, payment or real dispatch is connected. Existing optional Maps adapters were retained, but live Google Maps requests were not tested in this update.
@@ -50,6 +50,21 @@ The role chooser has an explicitly labelled test-only entry for a different alre
 6. Driver begins pickup; passenger checks the assigned vehicle; driver can then start/complete the simulated trip.
 
 This is one in-memory state observed through two interfaces, NOT real multi-user messaging or notification.
+
+## Pre-boarding cancellation — prototype contract (2026-09-17 Fiji)
+- Passenger History offers a cancellation dialog for the owner's collecting, assigned and arriving requests. The non-destructive dialog action keeps the request; final confirmation rechecks ownership and status.
+- Only the owning passenger can cancel. A repeated cancellation returns the same record without changing timestamps, reason or price history. An unknown/foreign request or a ride already on_trip/completed is rejected without changes.
+- Cancellation expires all offers (including the selected offer) and clears vehicle confirmation. Old quote/select/confirm/pickup/start operations are rejected. No automatic driver-duty resumption.
+- Retain driverId, selectedOfferId and the immutable quoteSnapshot (fare, ETA, estimate basis, selection time). Record cancelledAt (ISO UTC), cancelledFrom, cancelledBy and cancelReason. Route replacement uses route_changed; explicit cancellation uses passenger_requested.
+- Passenger history and assigned-driver Trips retain the cancelled record and explain that quoted amounts are not charges. Remove cancelled rides from eligible request lists and active-trip counts; do not show ride-advance controls.
+- No real notification, refund or cancellation fee is implemented. Production needs an authenticated server transaction coordinating cancel/select/start and an idempotent audit/event record. Client state and sequential Node tests are not evidence of backend authorization or multi-device atomicity.
+
+### Manual cancellation acceptance steps — NOT executed in this update
+1. Register the sample passenger, request a ride, open History -> cancel; choose Continue or Escape and confirm the request is unchanged. Reopen and confirm; History must show cancelled and no actionable offers.
+2. Quote from the reviewed driver, accept as passenger, begin pickup and confirm the correct car; cancel from passenger History. Driver Trips must show the cancellation, preserved price and no start button; Home must show no active trip.
+3. Explicitly resume driver duty and create a new passenger request. The new request can receive a quote, but the cancelled request cannot.
+4. Start a confirmed trip first; History must no longer offer cancellation. Recheck at 360/390/430px and on an Android device when authorized browser/device access is available.
+The model equivalents are covered by the eight added Node tests; dialog clicks, focus, mobile layout and real browser event dispatch remain unverified.
 
 ## Production authorization acceptance criteria
 - Separate account/membership, passenger_profile, driver_profile and reviewer permissions.

@@ -78,6 +78,15 @@
 <dialog id="settings-dialog"><div class="row"><h2>プレビュー設定</h2><button class="icon-btn" data-close="settings-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><p class="muted">実配車・審査・決済は未接続。入力はこの画面内だけで扱います。</p><label class="field">制限付き Google Maps ブラウザキー<input id="maps-key" type="password" autocomplete="off" placeholder="APIキー（任意）"></label><p class="muted">キーは保存しません。公開サイト用キーを設定してHTTPSで接続テストしてください。地図のAPI利用料が生じる場合があります。</p><button class="primary" id="connect-maps">Google Maps に接続</button><p id="maps-message" class="muted" aria-live="polite"></p><button class="small-action" id="reset-demo">入力を消してやり直す</button></dialog>
 <dialog id="pickup-dialog"><div class="row"><h2>乗車地点</h2><button class="icon-btn" data-close="pickup-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><label class="field">乗車地点・施設名<input id="pickup-text" value="Nadi, Fiji" maxlength="160"></label><label class="checkbox"><input id="airport-pickup" type="checkbox">空港内での迎車（テスト条件）</label><p class="muted">GPSだけでは空港の営業資格を判定しません。</p><button class="primary" id="save-pickup">乗車地点を設定</button></dialog>
 <dialog id="schedule-dialog"><div class="row"><h2>乗車予定 · デモ</h2><button class="icon-btn" data-close="schedule-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><label class="field">日時（端末のタイムゾーン）<input id="schedule-time" type="datetime-local"></label><button class="primary" id="save-schedule">テスト日時を設定</button><p class="muted">実際の予約は送信されません。</p></dialog>
+<dialog id="cancel-dialog" aria-labelledby="cancel-title">
+  <h2 id="cancel-title">依頼を取り消しますか？</h2>
+  <div id="cancel-summary"></div>
+  <p class="muted">取り消すと、この依頼の提示・車両確認は使えなくなります。選択済みの提示額は履歴に残ります。実際のキャンセル料・通知・配車は発生しないテストです。</p>
+  <p id="cancel-error" class="banner error" role="alert" hidden></p>
+  <button class="secondary" data-close="cancel-dialog" autofocus>依頼を続ける</button>
+  <div class="spacer"></div>
+  <button class="primary" id="confirm-cancel">この依頼を取り消す（デモ）</button>
+</dialog>
 <div id="toast" role="status" hidden></div><script>/* Reference model for UI testing, NOT a regulator connection or authorization API.
  * In production, load this model only from authenticated server-owned records.
  * A browser-side result must never authorize dispatch or certify a taxi. */
@@ -233,12 +242,27 @@
       const existing=state.requests.find(r=>r.passengerId===p.id&&r.status==='collecting'&&r.pickup===pickup&&r.destination===destination&&r.airport===!!input.airport);
       if(existing)return existing;
       // Only one open request per test passenger; changing route invalidates old offers.
-      state.requests.filter(r=>r.passengerId===p.id&&r.status==='collecting').forEach(r=>{r.status='cancelled';state.offers.filter(o=>o.requestId===r.id).forEach(o=>o.status='expired');});
+      state.requests.filter(r=>r.passengerId===p.id&&r.status==='collecting').forEach(r=>markCancelled(r,'route_changed'));
       const request={id:'ride-'+(++seq),passengerId:p.id,passengerName:p.name,pickup,destination,airport:!!input.airport,passengers:Math.max(1,Math.min(4,Number(input.passengers)||1)),language:p.language,payment:p.payment,status:'collecting',createdAt:new Date().toISOString()};
       state.requests.push(request);seedOffers(request);return request;
     }
     function myRequests(){const p=need('passenger');return state.requests.filter(r=>r.passengerId===p.id);}
-    function getOffers(id){const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);if(!r)throw Error('この依頼を閲覧できません。');return state.offers.filter(o=>o.requestId===id&&o.status==='active'&&o.expiresAt>Date.now()&&eligibleRecord(o.driverId,r));}
+    function getOffers(id){const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);if(!r)throw Error('この依頼を閲覧できません。');if(r.status!=='collecting')return [];return state.offers.filter(o=>o.requestId===id&&o.status==='active'&&o.expiresAt>Date.now()&&eligibleRecord(o.driverId,r));}
+    function markCancelled(request,reason){
+      request.cancelledFrom=request.status;request.cancelledAt=new Date().toISOString();
+      request.cancelledBy='passenger';request.cancelReason=reason;request.status='cancelled';
+      clearVehicleConfirmation(request);
+      state.offers.filter(o=>o.requestId===request.id).forEach(o=>o.status='expired');
+      // Retain the assignment and frozen quote as history; never resume driver duty automatically.
+      return request;
+    }
+    function cancelRide(id){
+      const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);
+      if(!r)throw Error('この依頼を取り消せません。');
+      if(r.status==='cancelled')return r;
+      if(!['collecting','assigned','arriving'].includes(r.status))throw Error('乗車開始後・完了後の依頼は取り消せません。');
+      return markCancelled(r,'passenger_requested');
+    }
     function driverRequests(){need('driver');if(!gate().eligible||!state.online[state.profile.recordId])return [];return state.requests.filter(r=>r.status==='collecting'&&eligibleRecord(state.profile.recordId,r));}
     function submitOffer(id,input){
       const p=need('driver'),r=driverRequests().find(r=>r.id===id);if(!r)throw Error('受付状態・依頼・営業資格を再確認してください。');
@@ -295,7 +319,7 @@
       state.requests.push({id:'sample-city',passengerId:'sample-p-1',passengerName:'Sample Passenger',pickup:'Nadi Town · 見本',destination:'Wailoaloa Beach · 見本',airport:false,passengers:2,language:'en',payment:'cash',status:'collecting',createdAt:new Date().toISOString()}, {id:'sample-airport',passengerId:'sample-p-2',passengerName:'Sample Guest',pickup:'Nadi Airport · 見本',destination:'Denarau · 見本',airport:true,passengers:2,language:'ja',payment:'card',status:'collecting',createdAt:new Date().toISOString()});
     }
     seedRequests();
-    return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,myRequests,getOffers,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
+    return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
   const api={pages,route,fareInput,create};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
@@ -576,14 +600,41 @@ $('edit-passenger').onclick=()=>{
 };
 function renderPassengerHistory(){
   const trips=model.myRequests().slice().reverse();
-  $('passenger-history').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge">${esc(statusLabel(r.status))}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}${r.quoteSnapshot?`<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong> <span class="muted">/ 概算・デモ</span></p>`:''}${r.status==='collecting'?`<button class="secondary" data-view-offers="${esc(r.id)}">提示額を見る</button>`:['assigned','arriving'].includes(r.status)?`<button class="secondary" data-view-car="${esc(r.id)}">予約車両を確認</button>`:''}</article>`).join(''):'<div class="empty">まだ依頼はありません。配車画面から行き先を入力してください。</div>';
+  $('passenger-history').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge">${esc(statusLabel(r.status))}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}${r.quoteSnapshot?`<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong> <span class="muted">/ 概算・デモ</span></p>`:''}${r.status==='collecting'?`<button class="secondary" data-view-offers="${esc(r.id)}">提示額を見る</button>`:['assigned','arriving'].includes(r.status)?`<button class="secondary" data-view-car="${esc(r.id)}">予約車両を確認</button>`:''}${['collecting','assigned','arriving'].includes(r.status)?`<div class="spacer"></div><button class="secondary" data-cancel-ride="${esc(r.id)}">依頼を取り消す</button>`:''}${r.status==='cancelled'?cancellationMarkup(r):''}</article>`).join(''):'<div class="empty">まだ依頼はありません。配車画面から行き先を入力してください。</div>';
   $('passenger-history').querySelectorAll('[data-view-offers]').forEach(b=>b.onclick=()=>{state.currentRequest=b.dataset.viewOffers;show('offers');});
   $('passenger-history').querySelectorAll('[data-view-car]').forEach(b=>b.onclick=()=>openVehicleCheck(trips.find(r=>r.id===b.dataset.viewCar)));
+  $('passenger-history').querySelectorAll('[data-cancel-ride]').forEach(b=>b.onclick=()=>openCancellation(b.dataset.cancelRide));
 }
+function cancellationMarkup(r){
+  return `<p class="banner">${r.cancelReason==='route_changed'?'行き先の変更により、この依頼を取り消しました。':'利用者が依頼を取り消しました。'}迎車・乗車開始はできません。</p><p class="muted">取消日時：${esc(r.cancelledAt||'記録なし')}<br>記録した提示額は請求・キャンセル料ではありません。</p>`;
+}
+let cancelRequestId=null;
+function openCancellation(id){
+  try{
+    const r=model.myRequests().find(r=>r.id===id);
+    if(!r||!['collecting','assigned','arriving'].includes(r.status))throw Error('この依頼は取り消せません。履歴を確認してください。');
+    cancelRequestId=id;
+    $('cancel-summary').innerHTML=`<p class="muted">${esc(r.id)} · ${esc(statusLabel(r.status))}</p>${routeMarkup(r)}`;
+    $('cancel-error').hidden=true;openDialog('cancel-dialog');
+  }catch(e){toast(e.message);}
+}
+$('cancel-dialog').addEventListener('close',()=>{cancelRequestId=null;});
+$('confirm-cancel').onclick=()=>{
+  if(!cancelRequestId)return;
+  try{
+    const id=cancelRequestId;model.cancelRide(id);
+    if(state.currentRequest===id){
+      state.currentRequest=null;state.expectedId=null;state.selected=null;
+      $('lookup-result').innerHTML='';
+    }
+    $('cancel-dialog').close();show('passenger-history');
+    toast('依頼を取り消しました。実配車・請求は行っていません。');
+  }catch(e){$('cancel-error').textContent=e.message;$('cancel-error').hidden=false;}
+};
 function renderDriverHome(){
   const p=model.state.profile,g=model.gate(),online=!!model.state.online[p.recordId];
   $('driver-name').textContent=p.name+' さん';
-  const active=model.driverTrips().filter(r=>r.status!=='completed');
+  const active=model.driverTrips().filter(r=>['assigned','arriving','on_trip'].includes(r.status));
   $('driver-dashboard').innerHTML=`<div class="card"><div class="row"><span class="plate">${esc(p.plate)}</span><span class="badge ${g.eligible?'good':''}">${g.eligible?'審査済みの見本':'審査待ち'}</span></div><p class="muted" style="margin-top:12px">${esc(p.vehicle)}<br>${esc(p.base)}</p></div>`+(g.eligible?`
     <div class="card"><div class="row"><h2>依頼の受付</h2><span class="badge"><i class="status-dot ${online?'online':''}"></i>${online?'受付中':'受付停止'}</span></div><p class="muted">${p.fixture?'審査済みの架空アカウントです。実際の営業資格を認証していません。':''}</p><button class="${online?'secondary':'primary'}" id="toggle-duty">${online?'受付を停止する':'受付を開始する（デモ）'}</button></div>
     <div class="driver-stats"><div><b>${model.driverRequests().length}</b><span>確認できる依頼</span></div><div><b>${active.length}</b><span>担当の運行</span></div></div><button class="secondary" id="open-requests">依頼一覧へ</button>${active.length?'<div class="spacer"></div><button class="primary" id="open-driver-trips">選ばれた依頼を確認</button>':''}
@@ -604,7 +655,7 @@ function renderDriverRequests(){
 }
 function renderDriverTrips(){
   const trips=model.driverTrips().slice().reverse();
-  $('driver-trip-list').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge good">${esc(statusLabel(r.status))} · デモ</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong></p><p class="muted">利用者：${esc(r.passengerName)} · ${r.passengers}名<br>提示を承諾した依頼です。実際の配車は行っていません。</p>${r.status==='assigned'?`<button class="primary" data-advance="${r.id}">迎車に向かう（デモ）</button>`:r.status==='arriving'?`<p class="banner">${model.canStartTrip(r.id)?'利用者が車両照合を完了しました（デモ）。':'利用者の車両照合を待っています。役割選択から利用者画面に戻って照合を試せます。'}</p><button class="primary" data-advance="${r.id}" ${model.canStartTrip(r.id)?'':'disabled'}>乗車開始（デモ）</button>`:r.status==='on_trip'?`<button class="secondary" data-advance="${r.id}">運行を完了する（デモ）</button>`:'<p class="muted">決済は未接続です。金額は入金済み売上ではありません。</p>'}</article>`).join(''):'<div class="empty">まだ利用者が選択した依頼はありません。料金提示後、利用者の承諾を待ってください。</div>';
+  $('driver-trip-list').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge ${r.status==='cancelled'?'':'good'}">${esc(statusLabel(r.status))} · デモ</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong></p><p class="muted">利用者：${esc(r.passengerName)} · ${r.passengers}名<br>${r.status==='cancelled'?'取消済みの依頼の記録です。':'提示を承諾した依頼です。'}実際の配車は行っていません。</p>${r.status==='cancelled'?cancellationMarkup(r):r.status==='assigned'?`<button class="primary" data-advance="${r.id}">迎車に向かう（デモ）</button>`:r.status==='arriving'?`<p class="banner">${model.canStartTrip(r.id)?'利用者が車両照合を完了しました（デモ）。':'利用者の車両照合を待っています。役割選択から利用者画面に戻って照合を試せます。'}</p><button class="primary" data-advance="${r.id}" ${model.canStartTrip(r.id)?'':'disabled'}>乗車開始（デモ）</button>`:r.status==='on_trip'?`<button class="secondary" data-advance="${r.id}">運行を完了する（デモ）</button>`:'<p class="muted">決済は未接続です。金額は入金済み売上ではありません。</p>'}</article>`).join(''):'<div class="empty">まだ利用者が選択した依頼はありません。料金提示後、利用者の承諾を待ってください。</div>';
   $('driver-trip-list').querySelectorAll('[data-advance]').forEach(b=>b.onclick=()=>{try{model.advanceTrip(b.dataset.advance);renderDriverTrips();}catch(e){toast(e.message);}});
 }
 function renderDriverProfile(){

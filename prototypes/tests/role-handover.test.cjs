@@ -156,3 +156,76 @@ test('revocation after a successful check still blocks ride start', () => {
   m.state.records.find(x=>x.id===ride.driverId).status='suspended';
   m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
 });
+
+test('passenger cancels a collecting request and all stale quotes become unusable', () => {
+  const {m}=setup(); passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}), offer=m.getOffers(ride.id)[0];
+  m.cancelRide(ride.id);
+  assert.equal(ride.status,'cancelled'); assert.equal(m.getOffers(ride.id).length,0);
+  assert.ok(m.state.offers.filter(o=>o.requestId===ride.id).every(o=>o.status==='expired'));
+  assert.throws(()=>m.selectOffer(offer.id));
+  m.useReviewedFixture(); m.setOnline(true);
+  assert.ok(!m.driverRequests().some(r=>r.id===ride.id));
+  assert.throws(()=>m.submitOffer(ride.id,{fare:'25',eta:'3'}));
+});
+test('assigned cancellation preserves the agreed price and driver history, not vehicle proof', () => {
+  const {m,ride,offer}=selected(), snapshot=ride.quoteSnapshot, driverId=ride.driverId;
+  m.confirmVehicle(ride.id,'DEMO 001',true,true);
+  m.cancelRide(ride.id);
+  assert.equal(ride.quoteSnapshot,snapshot); assert.ok(Object.isFrozen(snapshot));
+  assert.equal(snapshot.fareCents,2350); assert.equal(snapshot.eta,7);
+  assert.equal(ride.driverId,driverId); assert.equal(ride.selectedOfferId,offer.id);
+  assert.equal(offer.status,'expired'); assert.equal(ride.vehicleConfirmed,false); assert.equal(ride.vehicleConfirmation,null);
+  assert.equal(ride.cancelledFrom,'assigned'); assert.equal(ride.cancelledBy,'passenger');
+  assert.ok(Number.isFinite(Date.parse(ride.cancelledAt)));
+  assert.throws(()=>m.confirmVehicle(ride.id,'DEMO 001',true,true));
+  m.useReviewedFixture(); assert.equal(m.driverTrips()[0],ride);
+  assert.equal(m.state.online[driverId],false); assert.equal(m.canStartTrip(ride.id),false);
+  assert.throws(()=>m.advanceTrip(ride.id));
+});
+test('cancellation during pickup wins over a stale ride-start action even after confirmation', () => {
+  const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
+  m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
+  m.cancelRide(ride.id); assert.equal(ride.cancelledFrom,'arriving');
+  m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
+});
+test('cancellation requires the owning passenger and a known request', () => {
+  const {m,ride}=selected(); m.useReviewedFixture(); assert.throws(()=>m.cancelRide(ride.id),/この操作/);
+  m.chooseRole('passenger'); const owner=m.state.profile;
+  m.state.profile={...owner,id:'unrelated-passenger'}; assert.throws(()=>m.cancelRide(ride.id),/この依頼を取り消せません/);
+  m.state.profile=owner; assert.throws(()=>m.cancelRide('missing-ride'),/この依頼を取り消せません/);
+  assert.equal(ride.status,'assigned'); assert.equal(ride.cancelledAt,undefined);
+  m.leave(); assert.throws(()=>m.cancelRide(ride.id),/この操作/);
+});
+test('repeated cancellation is idempotent and cannot be performed by another passenger', () => {
+  const {m,ride}=selected(); m.cancelRide(ride.id); const first=JSON.stringify(ride);
+  assert.equal(m.cancelRide(ride.id),ride); assert.equal(JSON.stringify(ride),first);
+  m.state.profile={...m.state.profile,id:'unrelated-passenger'}; assert.throws(()=>m.cancelRide(ride.id));
+  assert.equal(JSON.stringify(ride),first);
+});
+test('an already started or completed ride cannot be cancelled from a stale dialog', () => {
+  for(const status of ['on_trip','completed']) {
+    const {m,ride}=selected(); m.confirmVehicle(ride.id,'DEMO 001',true,true);
+    m.useReviewedFixture(); m.advanceTrip(ride.id); m.advanceTrip(ride.id);
+    if(status==='completed') m.advanceTrip(ride.id);
+    m.chooseRole('passenger'); const before=JSON.stringify(ride);
+    assert.throws(()=>m.cancelRide(ride.id),/乗車開始後・完了後/); assert.equal(JSON.stringify(ride),before);
+  }
+});
+test('after cancellation a new ride can be requested and the driver explicitly resumes receiving requests', () => {
+  const {m,ride,offer}=selected(); m.cancelRide(ride.id);
+  const next=m.requestRide({pickup:ride.pickup,destination:ride.destination});
+  assert.notEqual(next.id,ride.id); assert.equal(next.status,'collecting');
+  assert.equal(m.myRequests().length,2); assert.throws(()=>m.selectOffer(offer.id));
+  m.useReviewedFixture(); assert.equal(m.driverRequests().length,0);
+  m.setOnline(true); assert.ok(m.driverRequests().some(r=>r.id===next.id));
+  assert.throws(()=>m.submitOffer(ride.id,{fare:'20',eta:'5'}));
+  m.submitOffer(next.id,{fare:'20',eta:'5'});
+});
+test('route replacement records a distinct cancellation reason and invalidates the old request', () => {
+  const {m}=setup(); passenger(m);
+  const first=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+  m.requestRide({pickup:'Demo Hotel',destination:'Demo Town'});
+  assert.equal(first.cancelReason,'route_changed'); assert.equal(first.cancelledFrom,'collecting');
+  const at=first.cancelledAt; m.cancelRide(first.id); assert.equal(first.cancelReason,'route_changed'); assert.equal(first.cancelledAt,at);
+});
