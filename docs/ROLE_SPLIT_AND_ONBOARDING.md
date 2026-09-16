@@ -4,6 +4,7 @@
 Select Passenger or Driver FIRST. Register the information required for that role. Route to the corresponding home using that registered information. Each role must see different information and input controls, not a shared mixed-role menu.
 
 ## Status and ownership
+Intake update: the user-supplied standalone HTML is now available at `prototypes/role-split/index.html`, with reproducible acceptance tests and an unresolved vehicle-confirmation regression documented in `HANDOVER_REVIEW_2026-09-16.md`. It has not been integrated into the root application.
 GDP / ChatGPT created and locally tested an interaction prototype, delivered in the conversation as `taxi_protection_role_test.html` and `taxi_protection_role_source.zip`. The complete UI source is in that downloadable archive, NOT in this repository's root application. This commit records the production implementation contract; it does not deploy the prototype or invoke Claude. Claude remains the requested production implementer.
 
 All accounts, permits, fares, vehicles, matches and approval records in the preview are fictional. State is in memory in one open document. No authentication, OTP, database persistence, cross-device synchronization, issuer verification, upload, notification, payment or real dispatch is connected. Existing optional Maps adapters were retained, but live Google Maps requests were not tested in this update.
@@ -61,7 +62,8 @@ This is one in-memory state observed through two interfaces, NOT real multi-user
 
 Security reference: https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html (checked 2026-09-16). A browser UI guard is not authorization enforcement.
 
-## Actual prototype test results
+## Prior-session prototype test report
+These counts were reported in the earlier handoff. This intake independently reran 20 verification tests and added 8 passing role tests plus one known TODO regression. Browser revalidation was blocked; see `HANDOVER_REVIEW_2026-09-16.md`.
 - Node reference-model tests: 44 PASS (20 previous verification + 24 role/quote/lifecycle).
 - Browser scenarios: 18 PASS, including profile propagation, role route separation, pending-driver blocks, quote/acceptance round-trip, vehicle mismatch gate, profile edits and 360/390/430px overflow checks.
 - Browser test used Chromium set_content rendering of the standalone HTML. No external requests or JS runtime errors during tested flows. This is NOT an Android-device/file-navigation/live-API/production-authentication test.

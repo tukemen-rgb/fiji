@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#ffffff"><meta name="referrer" content="strict-origin-when-cross-origin"><title>Taxi Protection · 利用者 / 運転手</title><style>:root{--paper:#fff;--ink:#232524;--muted:#6e7470;--line:#e5e7e3;--wash:#f4f5f2;--accent:#365e51;--warning:#85402e;--radius:14px}
+*{box-sizing:border-box}html,body{margin:0;background:#eceeea;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",sans-serif;-webkit-font-smoothing:antialiased}button,input,select{font:inherit}button,a,input,select{-webkit-tap-highlight-color:transparent}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.45}a{color:inherit}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}[hidden]{display:none!important}.screen{width:100%;max-width:460px;min-height:100svh;margin:auto;background:var(--paper);position:relative;padding-bottom:88px}.topbar{padding:16px 20px 12px;display:flex;align-items:center;justify-content:space-between}.brand{font-size:17px;font-weight:650;letter-spacing:-.5px}.demo-tag{font-size:10px;letter-spacing:.04em;color:var(--muted);border:1px solid var(--line);padding:4px 7px;border-radius:4px}.top-actions{display:flex;align-items:center;gap:8px}.icon-btn{display:grid;place-items:center;width:44px;height:44px;border:0;background:transparent;border-radius:10px;color:var(--ink)}.icon{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}.map-stage{height:290px;position:relative;background:#eeefec;overflow:hidden}.map-stage>svg,.map{width:100%;height:100%;position:absolute;inset:0}.map-caption{position:absolute;left:14px;bottom:14px;font-size:10px;background:#fffffff0;padding:5px 8px;border-radius:4px;max-width:calc(100% - 70px);color:#606762}.pickup-pill{position:absolute;left:16px;right:16px;top:14px;min-height:48px;background:#fff;border:1px solid #dfe3dd;border-radius:10px;display:flex;align-items:center;gap:10px;padding:0 12px;font-size:13px}.pickup-pill span{flex:1}.location-btn{position:absolute;bottom:10px;right:12px;background:#fff;border:1px solid var(--line);border-radius:50%}.sheet{padding:20px 20px 8px;border-radius:20px 20px 0 0;background:var(--paper);position:relative}.eyebrow{font-size:10px;letter-spacing:.11em;color:var(--muted);text-transform:uppercase;margin:0 0 8px}h1{font-size:25px;font-weight:650;letter-spacing:-.8px;margin:0 0 7px;line-height:1.4}h2{font-size:17px;font-weight:650;margin:0 0 12px}h3{font-size:14px;font-weight:600;margin:0 0 6px}p{line-height:1.7;margin:0 0 12px}.muted{color:var(--muted);font-size:12px}.search-box{display:flex;align-items:center;gap:10px;border:1px solid #d6dbd5;border-radius:12px;min-height:58px;padding:0 13px;margin:18px 0 12px}.search-box input{border:0;min-width:0;flex:1;font-size:16px;background:transparent;outline:0;padding:16px 0}.search-box .icon{color:#555f58}.time-btn{border:0;border-left:1px solid var(--line);background:transparent;font-size:11px;padding:8px 0 8px 10px;color:var(--muted);min-height:44px}.primary,.secondary{width:100%;min-height:48px;border-radius:10px;font-weight:600;font-size:14px;padding:12px 15px;border:1px solid var(--ink);display:flex;justify-content:center;gap:8px;align-items:center}.primary{background:var(--ink);color:#fff}.secondary{background:white;color:var(--ink);border-color:var(--line)}.quick-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:16px 0 22px}.quick{display:flex;align-items:center;gap:10px;text-align:left;border:1px solid var(--line);border-radius:12px;background:white;padding:16px 12px;min-height:72px}.quick .icon{width:24px;height:24px}.quick b{font-size:13px;font-weight:600;display:block}.quick small{font-size:10px;color:var(--muted);display:block;margin-top:3px}.section-title{font-size:11px;color:var(--muted);margin:24px 0 8px;letter-spacing:.03em}.place-row{width:100%;display:flex;align-items:center;gap:12px;min-height:63px;border:0;border-bottom:1px solid var(--line);background:transparent;text-align:left;padding:10px 0}.place-row>span{flex:1;font-size:13px}.place-row small{display:block;color:var(--muted);font-size:11px;margin-top:4px}.place-row .icon{color:#717972}.notice-line{display:flex;align-items:flex-start;gap:9px;padding:14px 0;color:var(--muted);font-size:11px;line-height:1.6}.notice-line .icon{width:17px;height:17px;margin-top:2px}.nav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:min(100%,460px);display:grid;grid-template-columns:repeat(3,1fr);background:#fff;border-top:1px solid var(--line);padding:9px 10px calc(9px + env(safe-area-inset-bottom));z-index:30}.nav button{border:0;background:none;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:4px;font-size:10px;min-height:44px}.nav button.active{color:var(--ink);font-weight:650}.panel{padding:18px 20px}.backline{display:flex;align-items:center;gap:4px;margin-left:-12px;margin-bottom:16px;font-size:12px;color:var(--muted)}.card{border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:12px}.card .muted:last-child{margin-bottom:0}.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.price{font-size:27px;font-weight:650;letter-spacing:-.7px}.price small{font-size:12px;font-weight:400;color:var(--muted)}.plate{display:inline-block;font-size:18px;font-weight:650;letter-spacing:1px;border:1px solid #cfd4ce;border-radius:5px;padding:7px 13px;background:white}.badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:5px 7px;border:1px solid var(--line);border-radius:5px;line-height:1.4}.good{color:var(--accent);background:#f0f5f1}.caution{color:var(--warning);background:#faf2ed;border-color:#e6d5ca}.details{margin:14px 0}.detail{display:flex;justify-content:space-between;gap:15px;padding:10px 0;border-bottom:1px solid var(--line);font-size:12px}.detail dt{color:var(--muted)}.detail dd{margin:0;text-align:right;overflow-wrap:anywhere}.small-action{color:var(--muted);border:0;background:transparent;text-decoration:underline;font-size:12px;min-height:44px;padding:8px 0}.field{display:block;margin:16px 0;color:var(--muted);font-size:12px}.field>input,.field>select{width:100%;margin-top:7px;min-height:48px;padding:11px;border:1px solid #d3d8d1;border-radius:9px;background:white;color:var(--ink);font-size:16px}.checkbox{display:flex;align-items:flex-start;gap:10px;font-size:12px;line-height:1.6;margin:16px 0}.checkbox input{accent-color:var(--accent);width:18px;height:18px;flex:none;margin-top:1px}.sample-buttons{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.sample-buttons button{border:1px solid var(--line);background:white;border-radius:6px;padding:8px 10px;font-size:11px;min-height:38px}.samples-label{font-size:10px;color:var(--muted);margin-top:18px}.banner{border-left:2px solid #b9c2b6;background:var(--wash);padding:12px 14px;font-size:12px;line-height:1.7;margin:14px 0}.banner.error{border-left-color:var(--warning);color:var(--warning);background:#fbf4ef}.form-progress{display:flex;gap:5px;margin:20px 0}.form-progress span{height:3px;flex:1;background:var(--line)}.form-progress span.on{background:var(--ink)}.doc-row{padding:14px 0;border-bottom:1px solid var(--line)}.doc-row header{display:flex;justify-content:space-between;align-items:center;gap:6px;font-size:12px}.doc-row button{font-size:11px;border:1px solid var(--line);background:white;border-radius:6px;padding:9px;min-height:40px}.doc-row label{display:flex;gap:10px;align-items:center;color:var(--muted);font-size:11px;margin-top:9px}.doc-row input{min-height:40px;min-width:0;max-width:190px;border:1px solid var(--line);border-radius:5px;font-size:14px;padding:5px;background:white}.actions{display:flex;gap:8px;margin-top:20px}.actions>*{flex:1}.timeline{border-left:1px solid #d6ddd3;margin:20px 5px;padding-left:19px}.timeline div{position:relative;font-size:13px;margin-bottom:22px;line-height:1.6}.timeline div:before{content:'';position:absolute;left:-24px;top:5px;width:8px;height:8px;border:1px solid #879183;border-radius:50%;background:#fff}.timeline div:first-child:before{background:var(--ink)}dialog{border:1px solid var(--line);border-radius:18px;width:min(92%,420px);max-height:85svh;padding:22px;color:var(--ink)}dialog::backdrop{background:#0005}#toast{position:fixed;bottom:86px;left:50%;transform:translateX(-50%);width:min(90%,420px);background:#262a27;color:#fff;padding:12px 16px;border-radius:9px;font-size:12px;line-height:1.6;z-index:100}.spacer{height:12px}gmp-place-autocomplete{width:100%;color-scheme:light}#google-search{margin:16px 0}.map-setting{position:absolute;bottom:48px;left:14px;border:1px solid var(--line);background:white;border-radius:5px;padding:7px 9px;font-size:10px;min-height:36px}#live-summary{position:absolute;right:14px;top:74px;background:white;padding:6px 9px;border-radius:5px;font-size:12px}@media(min-width:700px){body{padding:22px}.screen{border:1px solid #dde1da;border-radius:20px;overflow:hidden}}@media(prefers-reduced-motion:no-preference){button{transition:background .12s ease}button:hover{filter:brightness(.97)}}
+
+/* Role-specific navigation and onboarding. */
+.text-control{background:white;border:0;font-size:11px;color:var(--muted);min-height:44px;padding:6px}.welcome{padding:28px 0 14px}.welcome h1{font-size:31px;letter-spacing:-1px;line-height:1.45;margin:10px 0}.flow-steps{display:flex;gap:18px;font-size:10px;color:var(--muted);padding:10px 0 25px}.flow-steps b{font-size:10px;font-weight:500;margin-right:3px;color:#313b34}.role-card{display:flex;gap:14px;align-items:center;width:100%;padding:23px 16px;border:1px solid #d8ddd6;border-radius:12px;background:white;text-align:left;color:var(--ink);margin-bottom:14px;min-height:138px}.role-card:hover{border-color:#7b887a}.role-icon{width:42px;height:42px;display:grid;place-items:center;background:var(--wash);border-radius:10px;flex:none}.role-copy{flex:1;min-width:0}.role-copy small{display:block;letter-spacing:.12em;font-size:9px;color:var(--muted);margin-bottom:7px}.role-copy strong{display:block;font-size:18px;font-weight:600;line-height:1.5}.role-copy span{display:block;font-size:11px;color:var(--muted);margin-top:4px;line-height:1.6}.role-copy em{display:block;font-style:normal;font-size:11px;margin-top:12px;color:#4e6155}.role-card>.icon{width:16px}.demo-note{font-size:11px;color:var(--muted);padding:12px 0;line-height:1.7}.demo-note p{margin-bottom:7px}.test-tools{border-top:1px solid var(--line);padding:16px 0;font-size:12px}.test-tools summary{padding:8px 0;cursor:pointer;min-height:44px}.test-tools .secondary{font-size:12px}.role-nav{grid-template-columns:repeat(4,1fr)}.role-nav .icon{width:21px;height:21px}.preference-line{display:flex;gap:8px;font-size:11px;color:var(--muted);margin-bottom:10px}.dashboard-header{display:flex;gap:14px;align-items:center;margin-bottom:15px}.status-dot{width:7px;height:7px;background:#747c75;border-radius:50%;display:inline-block;margin-right:5px}.status-dot.online{background:var(--accent)}.driver-stats{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--line);border-radius:12px;margin:15px 0}.driver-stats>div{padding:16px}.driver-stats>div+div{border-left:1px solid var(--line)}.driver-stats b{font-size:24px;font-weight:600;display:block}.driver-stats span{font-size:11px;color:var(--muted)}.small-title{font-size:13px;font-weight:600;margin:22px 0 12px}.trip-route{border-left:1px solid #aab5a9;margin:16px 0 16px 5px;padding-left:14px;font-size:14px;line-height:1.6;overflow-wrap:anywhere}.trip-route span{font-size:10px;color:var(--muted);display:block}.trip-route>div+div{margin-top:15px}.offer-form{border-top:1px solid var(--line);margin-top:15px;padding-top:2px}.two-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}.two-fields .field{margin:10px 0}.offer-status{font-size:12px;color:var(--accent);margin:12px 0}.review-step{display:flex;gap:10px;align-items:baseline;padding:10px 0;border-bottom:1px solid var(--line);font-size:12px}.review-step small{color:var(--muted);font-size:10px;min-width:20px}.review-step strong{font-size:11px;margin-left:auto;font-weight:400;color:var(--muted)}.trip-status{font-size:11px;margin-bottom:12px;color:var(--muted)}.empty{padding:24px 16px;border:1px dashed var(--line);border-radius:12px;color:var(--muted);font-size:12px;line-height:1.8}.evidence-summary{font-size:11px;color:var(--muted);margin:15px 0}.inline-list{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:10px 0}.profile-info{overflow-wrap:anywhere}#passenger-preferences:empty{display:none}.booking-banner{margin-bottom:15px}.card h2{overflow-wrap:anywhere}.field textarea{width:100%;border:1px solid var(--line);border-radius:8px;font:inherit}#current-role{white-space:nowrap}@media(max-width:370px){.role-card{padding:20px 12px;gap:10px}.role-copy strong{font-size:17px}.brand{font-size:15px}.topbar{padding-left:16px;padding-right:12px}.top-actions{gap:3px}.panel{padding-left:16px;padding-right:16px}}
+
+#passenger-greeting{text-transform:none;letter-spacing:.02em}
+</style></head>
+<body>
+<svg style="display:none" aria-hidden="true"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+<symbol id="i-car" viewBox="0 0 24 24"><path d="m4 10 2-5h12l2 5M3 11l1-1h16l1 1v7H3zM5 18v2m14-2v2M7 14h1m8 0h1"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 4-5 8-8 9-3-1-8-5-8-9V6zM8 12l3 3 5-6"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2c0-4 3-6 8-6s8 2 8 6v2"/></symbol>
+<symbol id="i-pin" viewBox="0 0 24 24"><path d="M19 10c0 5-7 11-7 11S5 15 5 10a7 7 0 1 1 14 0Z"/><circle cx="12" cy="10" r="2.5"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+<symbol id="i-back" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></symbol>
+<symbol id="i-cross" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/><circle cx="12" cy="12" r="1"/></symbol>
+<symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+</defs></svg>
+<main class="screen">
+<header class="topbar"><span class="brand">Taxi Protection</span><div class="top-actions"><span id="current-role" class="demo-tag">DEMO</span><button class="text-control" id="role-switch" hidden>役割選択</button><button class="icon-btn" id="settings-open" aria-label="設定"><svg class="icon"><use href="#i-menu"/></svg></button></div></header>
+
+<section id="role-page" class="page panel" hidden>
+ <div class="welcome"><p class="eyebrow">TAXI PROTECTION</p><h1>どちらで<br>利用しますか？</h1><p class="muted">登録する情報と、その後の画面を分けています。</p></div>
+ <div class="flow-steps"><span><b>01</b> 役割選択</span><span><b>02</b> 登録</span><span><b>03</b> 専用ホーム</span></div>
+ <button class="role-card" id="choose-passenger"><span class="role-icon"><svg class="icon"><use href="#i-user"/></svg></span><span class="role-copy"><small>PASSENGER</small><strong>利用者として使う</strong><span>配車・料金比較・車両の確認</span><em id="passenger-resume">利用者登録へ進む</em></span><svg class="icon"><use href="#i-arrow"/></svg></button>
+ <button class="role-card" id="choose-driver"><span class="role-icon"><svg class="icon"><use href="#i-car"/></svg></span><span class="role-copy"><small>DRIVER</small><strong>運転手として使う</strong><span>営業資格の申請・依頼確認・料金提示</span><em id="driver-resume">運転手登録へ進む</em></span><svg class="icon"><use href="#i-arrow"/></svg></button>
+ <div class="demo-note"><p>画面操作のテスト版です。実名・電話番号・免許情報は入力せず、各登録画面のサンプルを使ってください。</p><p>登録内容はこの画面を開いている間だけ保持します。再読込すると消えます。</p></div>
+ <details class="test-tools"><summary>審査後の画面も試す</summary><p class="muted">下のボタンは審査済みの架空アカウントを開きます。あなたの申請を承認するものではありません。</p><button class="secondary" id="open-reviewed-driver">審査済み運転手の見本を開く</button></details>
+</section>
+<section id="passenger-register-page" class="page panel" hidden>
+ <div class="backline"><button class="icon-btn" data-nav="role" aria-label="役割選択に戻る"><svg class="icon"><use href="#i-back"/></svg></button>役割選択</div>
+ <p class="eyebrow">PASSENGER REGISTRATION</p><h1>利用者の登録</h1><p class="muted">ここで入力した内容を配車画面へ引き継ぎます。運転免許や営業許可は求めません。</p>
+ <button class="small-action" id="fill-passenger">サンプル情報を入力する</button>
+ <form id="passenger-form">
+ <label class="field">表示名<input name="name" required maxlength="80" autocomplete="off" placeholder="例：Sample Guest"></label>
+ <label class="field">連絡先（国番号付き）<input name="phone" required type="tel" maxlength="24" placeholder="例：+819000000000" autocomplete="off"></label>
+ <label class="field">メールアドレス（任意）<input name="email" type="email" maxlength="160" autocomplete="off" placeholder="guest@example.com"></label>
+ <label class="field">連絡に使う言語<select name="language"><option value="ja">日本語</option><option value="en">English</option></select></label>
+ <label class="field">滞在先・よく使う乗車地点（任意）<input name="pickup" maxlength="160" placeholder="ホテル名など" autocomplete="off"></label>
+ <label class="field">希望する支払い方法<select name="payment"><option value="cash">現金</option><option value="card">カード（対応車両の確認が必要）</option></select></label>
+ <label class="checkbox"><input name="consent" type="checkbox" required>架空の情報でテストします。電話・メール認証や実際の会員登録は行われません。</label>
+ <p class="banner error" id="passenger-error" role="alert" hidden></p><button class="primary" type="submit" id="passenger-submit">登録して利用者画面へ</button>
+ </form>
+</section>
+
+<section id="home-page" class="page" hidden>
+<div class="map-stage" aria-label="乗車地点と降車地点の地図">
+<svg id="demo-map" viewBox="0 0 430 290" preserveAspectRatio="xMidYMid slice" aria-label="位置関係のみを示すデモ図。実際の地図ではありません。"><rect width="430" height="290" fill="#eceeea"/><path d="M0 0h130l-8 34 28 29-50 27 35 38-27 28-8 40-100 67z" fill="#e1e6e1"/><g fill="none" stroke="#fff" stroke-width="8"><path d="m90 310 94-180L235-5M165 305l52-85 88-95L368-5M265 315l-6-53 107-107L445 69M104 184l299 81M146 106l190 62M205 31l184 69"/></g><g fill="none" stroke="#d1d6d0" stroke-width="1.2"><path d="m90 310 94-180L235-5M165 305l52-85 88-95L368-5M265 315l-6-53 107-107L445 69M104 184l299 81M146 106l190 62M205 31l184 69"/></g><path id="demo-route" d="M187 171l30 49 74 21" fill="none" stroke="#555f58" stroke-width="3" stroke-linecap="round" hidden/><circle cx="187" cy="171" r="20" fill="#53655510" stroke="#7d8c7e40"/><circle cx="187" cy="171" r="6" fill="#365e51" stroke="#fff" stroke-width="3"/><circle id="demo-end" cx="291" cy="241" r="5" fill="#242a25" stroke="#fff" stroke-width="2" hidden/></svg>
+<div id="map" class="map" hidden></div><div class="pickup-pill"><svg class="icon"><use href="#i-pin"/></svg><span id="pickup-label">Nadi · デモ乗車地点</span><button class="icon-btn" id="pickup-open" aria-label="乗車地点の設定"><svg class="icon" style="width:16px"><use href="#i-arrow"/></svg></button></div>
+<button class="map-setting" id="maps-open">Google Maps を接続</button><span id="live-summary" hidden></span><span class="map-caption" id="map-caption">デモ図 · 実際の道路・現在地ではありません</span><button class="icon-btn location-btn" id="locate" aria-label="現在地を取得"><svg class="icon"><use href="#i-target"/></svg></button></div>
+<div class="sheet"><p class="eyebrow" id="passenger-greeting">YOUR NEXT RIDE</p><h1>どこへ行きますか？</h1><p class="muted">乗る前に、料金と車両情報を確認。</p><div id="passenger-preferences" class="preference-line"></div>
+<div class="search-box" id="offline-search"><svg class="icon"><use href="#i-search"/></svg><input id="destination" placeholder="目的地を入力" aria-label="目的地" maxlength="160"><button class="time-btn" id="schedule-open">今すぐ</button></div><div id="google-search" hidden></div><p class="muted" id="route-status" aria-live="polite"></p>
+<button class="primary" id="find-offers">料金を比較する <span style="font-size:10px;font-weight:400">/ デモ</span></button>
+<div class="quick-grid"><button class="quick" data-nav="verify"><svg class="icon"><use href="#i-shield"/></svg><span><b>車両を照合</b><small>ナンバー・許可情報</small></span></button><button class="quick" data-nav="passenger-history"><svg class="icon"><use href="#i-clock"/></svg><span><b>乗車履歴</b><small>依頼・提示額の記録</small></span></button></div>
+<div class="section-title">よく使う行き先 · サンプル</div><button class="place-row" data-destination="Nadi Town, Fiji"><svg class="icon"><use href="#i-clock"/></svg><span>Nadi Town<small>街の中心へ</small></span><svg class="icon"><use href="#i-arrow"/></svg></button><button class="place-row" data-destination="Nadi International Airport, Fiji"><svg class="icon"><use href="#i-clock"/></svg><span>Nadi Airport<small>空港へ</small></span><svg class="icon"><use href="#i-arrow"/></svg></button>
+<div class="notice-line"><svg class="icon"><use href="#i-shield"/></svg><span>アプリへの登録と、営業許可の確認は別です。確認元・日時・有効期限を表示します。</span></div></div></section>
+<section id="offers-page" class="page panel" hidden><div class="backline"><button class="icon-btn" data-nav="home" aria-label="戻る"><svg class="icon"><use href="#i-back"/></svg></button>ルートに戻る</div><p class="eyebrow">COMPARE OFFERS</p><h1>料金と車両で選ぶ</h1><p id="offer-destination" class="muted"></p><p class="banner">車両・金額・到着時間は架空のサンプルです。実際の配車・固定運賃の確約は行いません。</p><div id="offers"></div></section>
+<section id="verify-page" class="page panel" hidden><p class="eyebrow">BEFORE YOU BOARD</p><h1>この車で、合っていますか？</h1><p class="muted">許可情報に加えて、目の前の車両も照合。</p><form id="lookup-form"><label class="field">ナンバープレート<input id="plate-input" placeholder="例：DEMO 001" maxlength="20" autocomplete="off" autocapitalize="characters" required></label><label class="checkbox"><input id="airport-check" type="checkbox">空港から乗車（空港側の確認も必要）</label><button class="primary" type="submit">登録情報を照合する</button></form><p class="samples-label">テスト用ナンバー</p><div class="sample-buttons"><button data-plate="DEMO 001">確認済みの見本</button><button data-plate="DEMO 003">期限切れ</button><button data-plate="DEMO 004">申請中</button><button data-plate="DEMO 999">未登録</button></div><div id="lookup-result" aria-live="polite"></div><p class="muted">照合先はこのプレビュー内の架空台帳です。LTAの公的登録簿とは接続していません。</p></section>
+<section id="register-page" class="page panel" hidden><div class="backline"><button class="icon-btn" data-nav="role" aria-label="役割選択に戻る"><svg class="icon"><use href="#i-back"/></svg></button>運転手として登録</div><p class="eyebrow">DRIVER ONBOARDING</p><h1>タクシー登録申請</h1><p class="muted">申請後、発行元の情報と照合してから掲載。</p><div class="banner">テスト専用です。実名・実際の免許番号や書類は入れないでください。入力内容は送信・永続保存されません。</div><button class="small-action" id="fill-sample">サンプル情報を入力する</button><div class="form-progress" id="progress"><span class="on"></span><span></span><span></span></div>
+<form id="registration-form"><div id="reg-step-0"><label class="field">運転手氏名<input name="name" maxlength="160" required></label><label class="field">連絡先（国番号を含む）<input name="phone" type="tel" maxlength="22" required></label><label class="field">運転免許番号<input name="driverLicence" maxlength="160" required></label><label class="field">PSV運転手許可番号<input name="psvPermit" maxlength="160" required></label></div>
+<div id="reg-step-1" hidden><label class="field">車両ナンバー<input name="plate" maxlength="20" required></label><label class="field">車種・色<input name="vehicle" maxlength="160" required></label><label class="field">Taxi Permit番号<input name="taxiPermit" maxlength="160" required></label><label class="field">営業許可の名義人<input name="holder" maxlength="160" required></label><label class="field">Base / Stand・営業範囲<input name="base" maxlength="160" required></label><label class="checkbox"><input name="airport" id="register-airport" type="checkbox">空港での迎車も申請する</label></div>
+<div id="reg-step-2" hidden><h2>確認書類と有効期限</h2><p class="muted">この見本では「デモ書類」を添付します。本番では原本確認・対象車両との照合が必要です。</p><div id="doc-fields"></div><label class="checkbox"><input name="consent" type="checkbox">名義人の同意・運転権限・発行元への照会同意を取得する設計を確認しました（デモ）。</label></div><p id="registration-error" class="banner error" role="alert" hidden></p><div class="actions"><button class="secondary" id="reg-back" type="button" hidden>戻る</button><button class="primary" id="reg-next" type="button">次へ</button><button class="primary" id="reg-submit" type="submit" hidden>申請を試す</button></div></form><div id="application-result" hidden aria-live="polite"></div></section>
+
+<section id="passenger-account-page" class="page panel" hidden><p class="eyebrow">PASSENGER ACCOUNT</p><h1>利用者の登録情報</h1><div id="passenger-profile"></div><button class="secondary" id="edit-passenger">登録情報を編集する</button></section>
+<section id="passenger-history-page" class="page panel" hidden><p class="eyebrow">YOUR RIDES</p><h1>依頼・乗車履歴</h1><p class="muted">この画面内で作成した依頼だけを表示します。</p><div id="passenger-history"></div></section>
+<section id="driver-home-page" class="page panel" hidden><p class="eyebrow">DRIVER HOME</p><h1 id="driver-name">運転手ホーム</h1><p class="muted">自分の車両・審査状況・受付状態を確認。</p><div id="driver-dashboard"></div></section>
+<section id="driver-requests-page" class="page panel" hidden><p class="eyebrow">RIDE REQUESTS</p><h1>依頼と料金提示</h1><p class="muted">乗降地を確認し、提示額と到着予定を入力。利用者が選ぶまでは迎車しません。</p><div id="driver-request-list"></div></section>
+<section id="driver-trips-page" class="page panel" hidden><p class="eyebrow">YOUR ASSIGNMENTS</p><h1>担当する運行</h1><p class="muted">利用者が選択した依頼だけを表示します。</p><div id="driver-trip-list"></div></section>
+<section id="driver-account-page" class="page panel" hidden><p class="eyebrow">DRIVER ACCOUNT</p><h1>運転手の登録情報</h1><div id="driver-profile"></div><button class="secondary" id="edit-driver">申請内容を修正する</button></section>
+<nav class="nav role-nav" id="main-nav" aria-label="役割別メニュー" hidden></nav>
+
+</main>
+<dialog id="settings-dialog"><div class="row"><h2>プレビュー設定</h2><button class="icon-btn" data-close="settings-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><p class="muted">実配車・審査・決済は未接続。入力はこの画面内だけで扱います。</p><label class="field">制限付き Google Maps ブラウザキー<input id="maps-key" type="password" autocomplete="off" placeholder="APIキー（任意）"></label><p class="muted">キーは保存しません。公開サイト用キーを設定してHTTPSで接続テストしてください。地図のAPI利用料が生じる場合があります。</p><button class="primary" id="connect-maps">Google Maps に接続</button><p id="maps-message" class="muted" aria-live="polite"></p><button class="small-action" id="reset-demo">入力を消してやり直す</button></dialog>
+<dialog id="pickup-dialog"><div class="row"><h2>乗車地点</h2><button class="icon-btn" data-close="pickup-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><label class="field">乗車地点・施設名<input id="pickup-text" value="Nadi, Fiji" maxlength="160"></label><label class="checkbox"><input id="airport-pickup" type="checkbox">空港内での迎車（テスト条件）</label><p class="muted">GPSだけでは空港の営業資格を判定しません。</p><button class="primary" id="save-pickup">乗車地点を設定</button></dialog>
+<dialog id="schedule-dialog"><div class="row"><h2>乗車予定 · デモ</h2><button class="icon-btn" data-close="schedule-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><label class="field">日時（端末のタイムゾーン）<input id="schedule-time" type="datetime-local"></label><button class="primary" id="save-schedule">テスト日時を設定</button><p class="muted">実際の予約は送信されません。</p></dialog>
+<div id="toast" role="status" hidden></div><script>/* Reference model for UI testing, NOT a regulator connection or authorization API.
+ * In production, load this model only from authenticated server-owned records.
+ * A browser-side result must never authorize dispatch or certify a taxi. */
+(function (root) {
+  'use strict';
+  const REQUIRED = ['taxi_permit', 'vehicle_licence', 'driver_licence', 'psv_driver_permit', 'fitness', 'insurance', 'operator_assignment'];
+  const METHODS = new Set(['issuer_written', 'issuer_portal_witnessed', 'issuer_api']);
+  const normalizePlate = v => String(v || '').normalize('NFKC').toUpperCase().replace(/[\s-]/g, '');
+  const time = v => typeof v === 'string' && v.trim() ? Date.parse(v) : NaN;
+
+  function assess(record, options = {}) {
+    const now = options.now === undefined ? Date.now() : time(options.now);
+    const fail = (code, reasons) => ({ eligible: false, code, reasons });
+    if (!Number.isFinite(now)) return fail('unavailable', ['確認日時が無効です']);
+    if (!record) return fail('not_found', ['当アプリの登録情報に見つかりません。無許可と断定するものではありません。']);
+    if (record.status !== 'reviewed') return fail(record.status === 'suspended' ? 'suspended' : 'pending', ['審査が完了していないか、利用を停止しています']);
+    if (!record.id || !record.vehicleId || !record.driverId || !record.holderId || !normalizePlate(record.plate)) return fail('incomplete', ['車両・運転手・許可名義人の紐付けが不完全です']);
+    const reasons = [];
+    const types = options.airport ? [...REQUIRED, 'airport_authorization'] : REQUIRED;
+    for (const type of types) {
+      const d = record.documents?.[type];
+      if (!d || d.status !== 'confirmed' || !METHODS.has(d.method) || !d.evidenceRef || !d.reviewerId) {
+        reasons.push(type + ': 確認根拠が不足'); continue;
+      }
+      if (d.reviewerId === record.driverId || d.reviewerId === record.holderId) reasons.push(type + ': 自己承認は禁止');
+      if (normalizePlate(d.plate) !== normalizePlate(record.plate)) reasons.push(type + ': 車両番号が確認記録と不一致');
+      if (d.binding !== `${record.holderId}/${record.vehicleId}/${record.driverId}`) reasons.push(type + ': 対象の組み合わせが不一致');
+      const checked = time(d.checkedAt), expiry = time(d.expiresAt), recheck = time(d.recheckAt);
+      if (![checked, expiry, recheck].every(Number.isFinite)) reasons.push(type + ': 日付不明');
+      else {
+        if (checked > now) reasons.push(type + ': 確認日時が未来');
+        if (expiry <= now) reasons.push(type + ': 有効期限切れ');
+        if (recheck <= now || recheck <= checked) reasons.push(type + ': 再確認が必要');
+      }
+    }
+    return reasons.length ? fail('recheck', reasons) : { eligible: true, code: 'reviewed', reasons: [] };
+  }
+
+  function matchVehicle(record, enteredPlate, options = {}) {
+    const a = assess(record, options);
+    if (!a.eligible) return a;
+    if (options.expectedId && options.expectedId !== record.id) return { eligible: false, code: 'wrong_vehicle', reasons: ['予約した車両とは別の車両です'] };
+    if (!normalizePlate(enteredPlate) || normalizePlate(enteredPlate) !== normalizePlate(record.plate)) return { eligible: false, code: 'plate_mismatch', reasons: ['目の前の車のナンバーと一致しません'] };
+    return a;
+  }
+
+  function submitApplication(input, now = new Date().toISOString()) {
+    const errors = [];
+    const required = ['name','phone','plate','holder','vehicle','taxiPermit','driverLicence','psvPermit','base'];
+    required.forEach(k => { if (typeof input[k] !== 'string' || !input[k].trim() || input[k].length > 160) errors.push(k); });
+    if (!/^\+?[0-9\s()-]{7,22}$/.test(input.phone || '')) errors.push('phone');
+    if (!/^[A-Z0-9]{3,14}$/.test(normalizePlate(input.plate))) errors.push('plate');
+    if (input.consent !== true) errors.push('consent');
+    const kinds = input.airport === true ? [...REQUIRED, 'airport_authorization'] : REQUIRED;
+    kinds.forEach(k => {
+      const d = input.documents?.[k];
+      if (!d?.attachment || !(time(d.expiresAt) > time(now))) errors.push(k);
+    });
+    if (errors.length) return { ok: false, errors: [...new Set(errors)] };
+    // Whitelist data; never accept a client-supplied reviewed/approved flag.
+    return { ok: true, application: {
+      name: input.name.trim(), plate: normalizePlate(input.plate), status: 'submitted',
+      airportRequested: input.airport === true, submittedAt: now, eligible: false
+    }};
+  }
+
+  function samples() {
+    const now = Date.now();
+    const iso = delta => new Date(now + delta * 86400000).toISOString();
+    const make = (id, plate, airport) => {
+      const r = { id, plate, name: 'Sample Driver ' + id.slice(-1), holderId: 'demo-holder', vehicleId: 'v-' + id, driverId: 'd-' + id, vehicle: 'Toyota Prius', color: 'シルバー', status: 'reviewed', demo: true, documents: {} };
+      for (const type of [...REQUIRED, ...(airport ? ['airport_authorization'] : [])]) {
+        r.documents[type] = { status: 'confirmed', plate: r.plate, method: 'issuer_written', reviewerId: 'demo-reviewer', evidenceRef: 'DEMO-NOT-REAL/' + type, binding: `${r.holderId}/${r.vehicleId}/${r.driverId}`, checkedAt: iso(-1), recheckAt: iso(6), expiresAt: iso(180) };
+      }
+      return r;
+    };
+    const a = make('demo-1', 'DEMO 001', true), b = make('demo-2', 'DEMO 002', false), c = make('demo-3', 'DEMO 003', true), d = make('demo-4', 'DEMO 004', false);
+    b.vehicle = 'Toyota Fielder'; b.color = 'ホワイト';
+    c.documents.taxi_permit.expiresAt = iso(-1);
+    d.status = 'submitted'; d.documents = {};
+    return [a,b,c,d];
+  }
+  const api = { REQUIRED, normalizePlate, assess, matchVehicle, submitApplication, samples };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else root.TaxiVerification = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+</script><script>/* In-memory UX reference only. Not authentication, permissions or an official registry.
+ * GDP designs/tests this prototype; production implementation is handed to Claude. */
+(function(root){
+  'use strict';
+  const V = typeof module !== 'undefined' && module.exports ? require('./verification.js') : root.TaxiVerification;
+  const pages={passenger:['home','offers','verify','passenger-history','passenger-account','passenger-register'],driver:['driver-home','driver-requests','driver-trips','driver-account','register']};
+  function route(role,profile,target){
+    if(target==='role'||!pages[role])return 'role';
+    const onboarding=role==='passenger'?'passenger-register':'register';
+    if(!profile)return onboarding;
+    return pages[role].includes(target)?target:(role==='passenger'?'home':'driver-home');
+  }
+  const text=(v,max=160)=>typeof v==='string'?v.trim().slice(0,max):'';
+  const phone=v=>/^\+[1-9]\d{6,14}$/.test(String(v||'').replace(/[\s()-]/g,''));
+  function fareInput(input){
+    const value=String(input.fare??'').trim(),eta=String(input.eta??'').trim();
+    if(!/^(?:0|[1-9]\d{0,4})(?:\.\d{1,2})?$/.test(value)||Number(value)<=0)throw Error('提示額は0より大きい金額を小数2桁までで入力してください。');
+    if(!/^\d{1,3}$/.test(eta)||Number(eta)<1||Number(eta)>180)throw Error('到着予定は1〜180分で入力してください。');
+    return {fareCents:Math.round(Number(value)*100),eta:Number(eta)};
+  }
+  function create(){
+    let seq=10;
+    const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
+    const need=role=>{if(state.activeRole!==role||!state.profile)throw Error('この操作には該当する役割での登録が必要です。');return state.profile;};
+    const ownRecord=()=>state.records.find(r=>r.id===state.profile?.recordId);
+    const gate=(airport=false)=>state.activeRole==='driver'&&state.profile?V.assess(ownRecord(),{airport}):{eligible:false,code:'unregistered',reasons:['運転手の登録が必要です']};
+    function chooseRole(role){if(!pages[role])throw Error('役割を選択してください。');state.activeRole=role;state.profile=state.profiles[role];return route(role,state.profile,'');}
+    function leave(){state.activeRole=null;state.profile=null;}
+    function registerPassenger(input){
+      if(state.activeRole!=='passenger')throw Error('利用者として登録してください。');
+      if(!text(input.name,80)||!phone(input.phone)||input.consent!==true)throw Error('表示名・国番号付き電話番号・テスト利用の確認が必要です。');
+      if(input.email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email))throw Error('メールアドレスを確認してください。');
+      const p={id:state.profiles.passenger?.id||'passenger-'+(++seq),role:'passenger',name:text(input.name,80),phone:text(input.phone,24),email:text(input.email),language:['ja','en'].includes(input.language)?input.language:'ja',pickup:text(input.pickup),payment:['cash','card'].includes(input.payment)?input.payment:'cash',contactVerified:false,registeredAt:state.profiles.passenger?.registeredAt||new Date().toISOString()};
+      state.profiles.passenger=p;state.profile=p;return p;
+    }
+    function registerDriver(input){
+      if(state.activeRole!=='driver')throw Error('運転手として登録してください。');
+      const result=V.submitApplication(input);
+      if(!result.ok)throw Error('入力・書類・有効期限・同意を確認してください：'+result.errors.join('、'));
+      const previous=state.profile?.fixture?null:state.profiles.driver;
+      if(state.records.some(r=>V.normalizePlate(r.plate)===V.normalizePlate(input.plate)&&r.id!==previous?.recordId))throw Error('このナンバーはテスト台帳に登録済みです。');
+      const recordId=previous?.recordId||'applicant-'+(++seq);
+      const r={id:recordId,plate:result.application.plate,name:result.application.name,vehicle:text(input.vehicle),status:'submitted',documents:{},demo:true};
+      state.records=state.records.filter(r=>r.id!==recordId).concat(r);
+      const p={id:previous?.id||'driver-'+(++seq),role:'driver',recordId,name:r.name,phone:text(input.phone,24),plate:r.plate,vehicle:r.vehicle,taxiPermit:text(input.taxiPermit),driverLicence:text(input.driverLicence),psvPermit:text(input.psvPermit),holder:text(input.holder),base:text(input.base),airportRequested:input.airport===true,documents:JSON.parse(JSON.stringify(input.documents)),status:'submitted',fixture:false,registeredAt:new Date().toISOString()};
+      state.profiles.driver=p;state.profile=p;state.online[recordId]=false;return p;
+    }
+    function useReviewedFixture(){
+      const r=state.records.find(r=>r.id==='demo-1');
+      state.activeRole='driver';state.profile={id:'fixture-driver',role:'driver',recordId:r.id,name:r.name,phone:'+6790000000',plate:r.plate,vehicle:r.vehicle+' / '+r.color,taxiPermit:'DEMO-TAXI-001',driverLicence:'DEMO-LIC-001',psvPermit:'DEMO-PSV-001',holder:'Sample Permit Holder',base:'Nadi · サンプル営業範囲',airportRequested:true,status:'reviewed',fixture:true,registeredAt:new Date().toISOString()};
+      // Deliberately does NOT approve/replace state.profiles.driver or its application.
+      return state.profile;
+    }
+    function setOnline(value){
+      need('driver');if(value&&!gate().eligible)throw Error('審査・有効期限の確認が終わるまで受付できません。');
+      if(value&&state.requests.some(r=>r.driverId===state.profile.recordId&&['assigned','arriving','on_trip'].includes(r.status)))throw Error('進行中の運行を完了してください。');
+      state.online[state.profile.recordId]=!!value;
+    }
+    function eligibleRecord(recordId,request){return V.assess(state.records.find(r=>r.id===recordId),{airport:request.airport}).eligible;}
+    function seedOffers(request){
+      state.records.filter(r=>V.assess(r,{airport:request.airport}).eligible).forEach((r,i)=>state.offers.push({id:'offer-'+(++seq),requestId:request.id,driverId:r.id,fareCents:i?1800:2000,eta:i?8:4,status:'active',source:'fixture',expiresAt:Date.now()+900000,basis:'estimate'}));
+    }
+    function requestRide(input){
+      const p=need('passenger');const pickup=text(input.pickup),destination=text(input.destination);
+      if(!pickup||!destination)throw Error('乗車地点と目的地を入力してください。');
+      if(state.requests.some(r=>r.passengerId===p.id&&['assigned','arriving','on_trip'].includes(r.status)))throw Error('進行中の乗車があります。履歴から確認してください。');
+      const existing=state.requests.find(r=>r.passengerId===p.id&&r.status==='collecting'&&r.pickup===pickup&&r.destination===destination&&r.airport===!!input.airport);
+      if(existing)return existing;
+      // Only one open request per test passenger; changing route invalidates old offers.
+      state.requests.filter(r=>r.passengerId===p.id&&r.status==='collecting').forEach(r=>{r.status='cancelled';state.offers.filter(o=>o.requestId===r.id).forEach(o=>o.status='expired');});
+      const request={id:'ride-'+(++seq),passengerId:p.id,passengerName:p.name,pickup,destination,airport:!!input.airport,passengers:Math.max(1,Math.min(4,Number(input.passengers)||1)),language:p.language,payment:p.payment,status:'collecting',createdAt:new Date().toISOString()};
+      state.requests.push(request);seedOffers(request);return request;
+    }
+    function myRequests(){const p=need('passenger');return state.requests.filter(r=>r.passengerId===p.id);}
+    function getOffers(id){const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);if(!r)throw Error('この依頼を閲覧できません。');return state.offers.filter(o=>o.requestId===id&&o.status==='active'&&o.expiresAt>Date.now()&&eligibleRecord(o.driverId,r));}
+    function driverRequests(){need('driver');if(!gate().eligible||!state.online[state.profile.recordId])return [];return state.requests.filter(r=>r.status==='collecting'&&eligibleRecord(state.profile.recordId,r));}
+    function submitOffer(id,input){
+      const p=need('driver'),r=driverRequests().find(r=>r.id===id);if(!r)throw Error('受付状態・依頼・営業資格を再確認してください。');
+      const values=fareInput(input);const old=state.offers.filter(o=>o.requestId===id&&o.driverId===p.recordId);old.forEach(o=>o.status='superseded');
+      const offer={id:'offer-'+(++seq),requestId:id,driverId:p.recordId,...values,status:'active',source:'driver-input',expiresAt:Date.now()+900000,basis:'estimate'};
+      state.offers.push(offer);return offer;
+    }
+    function selectOffer(id){
+      const p=need('passenger'),o=state.offers.find(o=>o.id===id),r=state.requests.find(r=>r.id===o?.requestId);
+      if(!o||!r||r.passengerId!==p.id||r.status!=='collecting'||o.status!=='active'||o.expiresAt<=Date.now()||!eligibleRecord(o.driverId,r))throw Error('提示は選択できません。依頼と確認状態を更新してください。');
+      if(state.requests.some(x=>x.id!==r.id&&x.driverId===o.driverId&&['assigned','arriving','on_trip'].includes(x.status)))throw Error('この運転手は別の運行中です。');
+      r.status='assigned';r.driverId=o.driverId;r.selectedOfferId=o.id;r.quoteSnapshot=Object.freeze({fareCents:o.fareCents,eta:o.eta,basis:o.basis,selectedAt:new Date().toISOString()});
+      state.offers.filter(x=>x.requestId===r.id).forEach(x=>x.status=x.id===o.id?'selected':'expired');state.online[o.driverId]=false;return r;
+    }
+    function driverTrips(){const p=need('driver');return state.requests.filter(r=>r.driverId===p.recordId);}
+    function confirmVehicle(id,plate,samePerson,sameCar){
+      const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);
+      if(!r||!['assigned','arriving'].includes(r.status))throw Error('予約車両がありません。');
+      const rec=state.records.find(x=>V.normalizePlate(x.plate)===V.normalizePlate(plate));
+      if(!samePerson||!sameCar||!V.matchVehicle(rec,plate,{airport:r.airport,expectedId:r.driverId}).eligible)throw Error('予約車両・運転手を再確認してください。');
+      r.vehicleConfirmed=true;return r;
+    }
+    function advanceTrip(id){
+      const p=need('driver'),r=driverTrips().find(r=>r.id===id);if(!r||!eligibleRecord(p.recordId,r))throw Error('担当車両・営業資格を確認してください。');
+      if(r.status==='assigned')r.status='arriving';
+      else if(r.status==='arriving'&&r.vehicleConfirmed)r.status='on_trip';
+      else if(r.status==='on_trip')r.status='completed';
+      else throw Error('利用者の車両確認が完了していません。');
+      return r;
+    }
+    function seedRequests(){
+      state.requests.push({id:'sample-city',passengerId:'sample-p-1',passengerName:'Sample Passenger',pickup:'Nadi Town · 見本',destination:'Wailoaloa Beach · 見本',airport:false,passengers:2,language:'en',payment:'cash',status:'collecting',createdAt:new Date().toISOString()}, {id:'sample-airport',passengerId:'sample-p-2',passengerName:'Sample Guest',pickup:'Nadi Airport · 見本',destination:'Denarau · 見本',airport:true,passengers:2,language:'ja',payment:'card',status:'collecting',createdAt:new Date().toISOString()});
+    }
+    seedRequests();
+    return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,myRequests,getOffers,driverRequests,submitOffer,selectOffer,driverTrips,confirmVehicle,advanceTrip,ownRecord};
+  }
+  const api={pages,route,fareInput,create};
+  if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
+})(typeof globalThis!=='undefined'?globalThis:this);
+</script>
+<script>/* GDP-authored interaction prototype. Production coding/review handoff: CLAUDE.md.
+ * No live dispatch, official registry access, identity certification or uploads. */
+'use strict';
+const V = window.TaxiVerification;
+const $ = id => document.getElementById(id);
+const R = window.TaxiRoles;
+const model = R.create();
+let records = model.state.records;
+const names = {taxi_permit:'Taxi Permit（営業許可）',vehicle_licence:'車両登録・PSV車両資格',driver_licence:'運転免許',psv_driver_permit:'PSV運転手許可',fitness:'車両検査・適合証明',insurance:'営業利用を含む保険',operator_assignment:'名義人の同意・運転権限',airport_authorization:'空港側の営業承認'};
+const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', map:null, routeLib:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let toastTimer;
+function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(()=> $('toast').hidden = true, 5000); }
+function show(target) {
+  if(target==='role')model.leave();
+  const page=R.route(model.state.activeRole,model.state.profile,target);
+  state.page=page;
+  document.querySelectorAll('.page').forEach(el=>el.hidden=el.id!==page+'-page');
+  $('current-role').textContent=model.state.activeRole==='passenger'?'利用者 · DEMO':model.state.activeRole==='driver'?'運転手 · DEMO':'DEMO';
+  $('role-switch').hidden=page==='role';
+  renderNavigation(page);
+  if(page==='role')renderRoleChooser();
+  if(page==='home')renderPassengerHome();
+  if(page==='offers')renderPassengerOffers();
+  if(page==='passenger-account')renderPassengerProfile();
+  if(page==='passenger-history')renderPassengerHistory();
+  if(page==='driver-home')renderDriverHome();
+  if(page==='driver-requests')renderDriverRequests();
+  if(page==='driver-trips')renderDriverTrips();
+  if(page==='driver-account')renderDriverProfile();
+  try{history.replaceState(null,'','#'+page);}catch{}
+  window.scrollTo({top:0,behavior:'instant'});
+}
+function openDialog(id) { if (!$(id).open) $(id).showModal(); }
+document.querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click',()=>show(b.dataset.nav)));
+document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click',()=>$(b.dataset.close).close()));
+$('settings-open').onclick = $('maps-open').onclick = () => openDialog('settings-dialog');
+$('pickup-open').onclick = () => openDialog('pickup-dialog');
+$('schedule-open').onclick = () => openDialog('schedule-dialog');
+$('reset-demo').onclick = () => location.reload();
+$('save-schedule').onclick = () => {
+  const d = new Date($('schedule-time').value);
+  if (!Number.isFinite(d.getTime()) || d.getTime() <= Date.now()) return toast('現在より後の日時を選んでください。');
+  $('schedule-open').textContent = '予約（デモ）'; $('schedule-dialog').close();
+  toast(d.toLocaleString('ja-JP') + ' を仮設定しました。予約は送信されません。');
+};
+$('save-pickup').onclick = () => {
+  const name = $('pickup-text').value.trim();
+  if (!name) return toast('乗車地点を入力してください。');
+  state.pickup = name; state.airport = $('airport-pickup').checked;
+  $('pickup-label').textContent = name + (state.mapReady ? '' : ' · デモ');
+  $('airport-check').checked = state.airport;
+  $('pickup-dialog').close(); if (state.mapReady && state.destination) drawRoute();
+};
+$('destination').addEventListener('input', () => { state.destination = $('destination').value.trim(); state.routeSeq++; $('live-summary').hidden = true; clearLines(); });
+document.querySelectorAll('[data-destination]').forEach(b => b.onclick = () => {
+  state.destination = b.dataset.destination; $('destination').value = state.destination;
+  if (state.mapReady) drawRoute(); else { $('demo-route').hidden = false; $('demo-end').hidden = false; }
+  toast('行き先を選びました。料金比較はサンプルです。');
+});
+$('find-offers').onclick = () => {
+  try {
+    if (!state.destination) { $('destination').focus();return toast('先に目的地を入力してください。'); }
+    const r=model.requestRide({pickup:typeof state.pickup==='string'?state.pickup:'現在地',destination:$('destination').value,airport:state.airport});
+    state.currentRequest=r.id;state.expectedId=null;state.selected=null;
+    if(state.mapReady)drawRoute();show('offers');
+  }catch(e){toast(e.message);}
+};
+function renderPassengerOffers(){
+  try{
+    const request=model.myRequests().find(r=>r.id===state.currentRequest);
+    if(!request){$('offers').innerHTML='<div class="empty">先に目的地を入力してください。</div>';return;}
+    $('offer-destination').textContent=request.pickup+' → '+request.destination;
+    if(request.status!=='collecting'){
+      $('offers').innerHTML='<div class="banner">この依頼は '+esc(statusLabel(request.status))+' です。</div><button class="secondary" id="open-my-ride">乗車履歴を見る</button>';
+      $('open-my-ride').onclick=()=>show('passenger-history');return;
+    }
+    const offers=model.getOffers(request.id).sort((a,b)=>a.fareCents-b.fareCents);
+    $('offers').innerHTML=offers.map(o=>{const r=records.find(r=>r.id===o.driverId);return `<article class="card"><div class="row"><span class="price">FJ$${money(o.fareCents)} <small>提示・概算</small></span><span class="badge good">確認記録の見本</span></div><p class="muted">到着 ${o.eta}分（デモ） · ${o.source==='driver-input'?'運転手側の入力から反映':'サンプル提示'}</p><h3>${esc(r.name)}</h3><p class="muted">${esc(r.vehicle)} / ${esc(r.color)} · ${esc(r.plate)}</p><p class="evidence-summary">提示額を記録します。実際の最終運賃はメーター等との適法な関係を確認して確定する設計です。</p><button class="primary" data-select="${esc(o.id)}">この提示を選ぶ（デモ）</button></article>`;}).join('')||'<div class="empty">条件を満たす有効な提示がありません。運転手の入力を待ちます。</div>';
+    $('offers').querySelectorAll('[data-select]').forEach(b=>b.onclick=()=>{
+      try{const req=model.selectOffer(b.dataset.select);openVehicleCheck(req);toast('提示額をこの画面内に記録しました。実配車は行いません。');}catch(e){toast(e.message);renderPassengerOffers();}
+    });
+  }catch(e){$('offers').innerHTML='<div class="banner error">'+esc(e.message)+'</div>';}
+}
+function openVehicleCheck(req){
+  state.currentRequest=req.id;state.expectedId=req.driverId;state.airport=req.airport;
+  const r=records.find(x=>x.id===req.driverId);
+  state.selected={id:r.id,plate:r.plate,selectedAt:req.quoteSnapshot.selectedAt};
+  $('plate-input').value='';$('airport-check').checked=req.airport;
+  $('lookup-result').innerHTML=`<div class="banner">選択した車：<strong>${esc(r.plate)}</strong><br>記録した提示額：FJ$${money(req.quoteSnapshot.fareCents)}（概算・デモ）<br>目の前の車・運転手を確認してください。</div>`;
+  show('verify');
+}
+function lookup() {
+  const entered = $('plate-input').value;
+  const r = records.find(x => V.normalizePlate(x.plate) === V.normalizePlate(entered));
+  const a = V.matchVehicle(r, entered, {airport:$('airport-check').checked,expectedId:state.expectedId});
+  const title = {not_found:'登録情報を確認できません',pending:'申請受付・未確認',suspended:'利用停止中',recheck:'再確認が必要です',wrong_vehicle:'予約した車と違います',plate_mismatch:'ナンバーが一致しません',incomplete:'情報が不足しています',unavailable:'現在は確認できません'};
+  if (!a.eligible) {
+    $('lookup-result').innerHTML = `<div class="banner error"><strong>${esc(title[a.code] || '確認できません')}</strong><br>${a.code==='not_found' ? '当アプリ内の台帳にありません。無許可という意味ではありません。' : esc(a.reasons[0])}<br>アプリ経由の乗車開始はできません。</div><p class="muted">不一致のまま乗らず、安全な場所で配車担当者へ確認する設計です。実際の許可の有無は発行元への照会が必要です。</p>${state.expectedId ? '<button class="secondary" id="clear-selected">選択を解除して調べ直す</button>' : ''}`;
+    if ($('clear-selected')) $('clear-selected').onclick = () => { state.expectedId = null; lookup(); };
+    return;
+  }
+  const d = r.documents.taxi_permit;
+  const date = x => new Date(x).toLocaleDateString('ja-JP');
+  $('lookup-result').innerHTML = `<article class="card"><p class="eyebrow">SAMPLE RECORD · 実在の認証ではありません</p><div class="row"><span class="plate">${esc(r.plate)}</span><span class="badge good">照会記録あり（見本）</span></div><h2 style="margin-top:18px">${esc(r.name)}</h2><p class="muted">${esc(r.vehicle)} / ${esc(r.color)}</p><dl class="details"><div class="detail"><dt>営業許可・運転資格</dt><dd>確認済みの見本</dd></div><div class="detail"><dt>確認方法</dt><dd>発行元の書面回答（架空）</dd></div><div class="detail"><dt>最終確認</dt><dd>${date(d.checkedAt)}</dd></div><div class="detail"><dt>営業許可の有効期限</dt><dd>${date(d.expiresAt)}</dd></div><div class="detail"><dt>次回確認期限</dt><dd>${date(d.recheckAt)}</dd></div><div class="detail"><dt>空港からの迎車</dt><dd>${r.documents.airport_authorization ? '承認確認の見本' : '空港承認は未確認'}</dd></div></dl><p class="muted">番号だけの一致では不十分です。本番では登録写真と本人・実車も比較します。</p><label class="checkbox"><input id="same-driver" type="checkbox">運転手本人と登録写真が一致（デモ操作）</label><label class="checkbox"><input id="same-car" type="checkbox">車種・色・実車が一致（デモ操作）</label><button class="primary" id="board-demo" disabled>確認を完了する（デモ）</button><div id="boarding-status" aria-live="polite"></div></article>${state.expectedId ? '<button class="small-action" id="clear-selected">選択を解除する</button>' : ''}`;
+  const gate = () => $('board-demo').disabled = !($('same-driver').checked && $('same-car').checked);
+  $('same-driver').onchange = $('same-car').onchange = gate;
+  $('board-demo').onclick = () => {
+    const latest = V.matchVehicle(r, $('plate-input').value,{airport:$('airport-check').checked,expectedId:state.expectedId});
+    if (!latest.eligible || !$('same-driver').checked || !$('same-car').checked) return lookup();
+    if(state.currentRequest){try{model.confirmVehicle(state.currentRequest,$('plate-input').value,$('same-driver').checked,$('same-car').checked);}catch(e){toast(e.message);return;}}
+    $('boarding-status').innerHTML = '<div class="banner">照合操作のテストが完了しました。実車の正当性を認証した結果ではなく、実配車・乗車開始も行っていません。</div>';
+  };
+  if ($('clear-selected')) $('clear-selected').onclick = () => { state.expectedId = null; lookup(); };
+}
+$('lookup-form').onsubmit = e => {e.preventDefault();lookup();};
+$('plate-input').oninput = () => $('lookup-result').replaceChildren();
+$('airport-check').onchange = () => $('lookup-result').replaceChildren();
+document.querySelectorAll('[data-plate]').forEach(b => b.onclick = () => { $('plate-input').value = b.dataset.plate; lookup(); });
+
+function currentTypes() { return $('register-airport').checked ? [...V.REQUIRED,'airport_authorization'] : V.REQUIRED; }
+function renderDocs() {
+  $('doc-fields').innerHTML = currentTypes().map(k => `<div class="doc-row"><header><span>${esc(names[k])}</span><button type="button" data-doc="${k}">${state.documents[k]?.attachment ? '見本を添付済み' : 'デモ書類を添付'}</button></header><label>有効期限<input type="date" data-expiry="${k}" value="${esc(state.documents[k]?.expiresAt?.slice(0,10)||'')}"></label></div>`).join('');
+  document.querySelectorAll('[data-doc]').forEach(b => b.onclick = () => { const k = b.dataset.doc; state.documents[k] = {...state.documents[k],attachment:'DEMO-'+k+'.pdf'}; b.textContent = '見本を添付済み'; });
+  document.querySelectorAll('[data-expiry]').forEach(el => el.onchange = () => { const k = el.dataset.expiry; state.documents[k] = {...state.documents[k],expiresAt:el.value ? el.value+'T00:00:00+12:00' : ''}; });
+}
+function setStep(step) {
+  state.regStep = step;
+  for(let i=0;i<3;i++){ $('reg-step-'+i).hidden = i!==step; $('progress').children[i].classList.toggle('on',i<=step); }
+  $('reg-back').hidden = step===0; $('reg-next').hidden = step===2; $('reg-submit').hidden = step!==2;
+  $('registration-error').hidden = true; if(step===2) renderDocs();
+}
+$('reg-next').onclick = () => {
+  for(const el of $('reg-step-'+state.regStep).querySelectorAll('input[required]')) if(!el.reportValidity()) return;
+  setStep(Math.min(2,state.regStep+1));
+};
+$('reg-back').onclick = () => setStep(Math.max(0,state.regStep-1));
+$('register-airport').onchange = renderDocs;
+$('fill-sample').onclick = () => {
+  const f = $('registration-form').elements;
+  const values = {name:'Sample Applicant',phone:'+6790000000',driverLicence:'DEMO-LIC-001',psvPermit:'DEMO-PSV-001',plate:'DEMO 005',vehicle:'Toyota Prius / シルバー',taxiPermit:'DEMO-TAXI-005',holder:'Sample Permit Holder',base:'Nadi / サンプル営業範囲'};
+  Object.entries(values).forEach(([k,v])=>f[k].value=v); f.consent.checked=true;
+  const expiry = new Date(Date.now()+180*86400000).toISOString().slice(0,10)+'T00:00:00+12:00';
+  [...V.REQUIRED,'airport_authorization'].forEach(k=>state.documents[k]={attachment:'DEMO-'+k+'.pdf',expiresAt:expiry});
+  renderDocs(); toast('架空の申請情報を入力しました。次へ進んで確認できます。');
+};
+$('registration-form').noValidate = true;
+$('registration-form').onsubmit = e => {
+  e.preventDefault();
+  const input=Object.fromEntries(new FormData(e.currentTarget).entries());
+  input.airport=$('register-airport').checked;input.consent=e.currentTarget.elements.consent.checked;input.documents=state.documents;
+  try{
+    model.registerDriver(input);records=model.state.records;show('driver-home');
+    toast('申請内容を引き継ぎました。審査待ちのため、まだ受付できません。');
+  }catch(e){$('registration-error').hidden=false;$('registration-error').textContent=e.message;}
+};
+
+// Optional live map. Browser key stays in memory, not URL or local/session storage.
+function clearLines(){state.mapLines.forEach(l=>l.setMap(null));state.mapLines=[];state.mapMarks.forEach(m=>m.setMap(null));state.mapMarks=[];}
+function mapFail(text){state.mapReady=false;state.loadingMap=false;$('connect-maps').disabled=false;$('maps-message').textContent=text;$('map-caption').textContent='地図未接続 · デモ図';$('map').hidden=true;$('demo-map').hidden=false;}
+$('connect-maps').onclick = async () => {
+  const key = $('maps-key').value.trim();
+  if (!key) return $('maps-message').textContent='制限付きブラウザキーを入力してください。';
+  if (!/^https?:$/.test(location.protocol)) return $('maps-message').textContent='このHTMLの直接表示ではなく、HTTPSサイトまたはlocalhost上で接続してください。';
+  if (state.loadingMap || state.mapReady) return toast('既に接続中か接続済みです。変更時は再読み込みしてください。');
+  state.loadingMap=true; $('connect-maps').disabled=true; $('maps-message').textContent='接続中…';
+  const fail = ()=>mapFail('地図を接続できません。API有効化・キーの制限・課金設定・ネットワークを確認してください。');
+  const timer = setTimeout(fail,15000);
+  window.gm_authFailure = ()=>{clearTimeout(timer);fail();};
+  window.taxiInitMap = async () => {
+    clearTimeout(timer);
+    try {
+      const {Map} = await google.maps.importLibrary('maps');
+      const {PlaceAutocompleteElement} = await google.maps.importLibrary('places');
+      const {Route} = await google.maps.importLibrary('routes'); state.routeLib=Route;
+      $('map').hidden=false;
+      state.map = new Map($('map'), {center:{lat:-17.773,lng:177.428},zoom:14,disableDefaultUI:true,zoomControl:true,gestureHandling:'cooperative',styles:[{stylers:[{saturation:-100}]},{featureType:'poi',stylers:[{visibility:'off'}]},{featureType:'transit',stylers:[{visibility:'off'}]}]});
+      $('demo-map').hidden=true;$('maps-open').hidden=true;$('map-caption').textContent='Google Maps · 現在地は未取得';
+      const ac = new PlaceAutocompleteElement({includedRegionCodes:['fj']});
+      ac.addEventListener('gmp-select',async e=>{
+        try { const p=e.placePrediction.toPlace(); await p.fetchFields({fields:['displayName','formattedAddress','location']});
+          if(!p.location)return; state.destination={lat:p.location.lat(),lng:p.location.lng()};$('destination').value=p.displayName||p.formattedAddress||'選択した地点';
+          await drawRoute();
+        }catch{toast('目的地を取得できません。再選択してください。');}
+      });
+      $('google-search').replaceChildren(ac);$('google-search').hidden=false;
+      $('offline-search').hidden=true;
+      state.mapReady=true;state.loadingMap=false;$('maps-key').value='';$('maps-message').textContent='接続しました。配車・車両情報は引き続きデモです。';$('settings-dialog').close();
+    }catch{fail();}
+  };
+  const script=document.createElement('script');
+  script.src='https://maps.googleapis.com/maps/api/js?key='+encodeURIComponent(key)+'&loading=async&v=weekly&callback=taxiInitMap';script.async=true;script.onerror=()=>{clearTimeout(timer);fail();};document.head.appendChild(script);
+};
+async function drawRoute(){
+  if(!state.mapReady || !state.destination)return;
+  const seq=++state.routeSeq;clearLines();$('live-summary').hidden=true;$('route-status').textContent='ルートを取得中…';
+  try{
+    const {routes}=await state.routeLib.computeRoutes({origin:state.pickup,destination:state.destination,travelMode:'DRIVING',fields:['path','distanceMeters','durationMillis']});
+    if(seq!==state.routeSeq)return;
+    const r=routes?.[0];if(!r?.path?.length)throw Error('No route');
+    const line=new google.maps.Polyline({map:state.map,path:r.path,strokeColor:'#364d40',strokeWeight:4});state.mapLines=[line];
+    // Circle endpoint markers require no deprecated Marker or map ID.
+    state.mapMarks=[r.path[0],r.path[r.path.length-1]].map((p,i)=>new google.maps.Circle({map:state.map,center:p,radius:15,fillColor:i?'#232524':'#365e51',fillOpacity:1,strokeColor:'#fff',strokeWeight:2}));
+    const bounds=new google.maps.LatLngBounds();r.path.forEach(p=>bounds.extend(p));state.map.fitBounds(bounds,{top:80,bottom:50,left:30,right:30});
+    $('live-summary').textContent=(r.distanceMeters/1000).toFixed(1)+' km · '+Math.ceil(r.durationMillis/60000)+'分';$('live-summary').hidden=false;$('route-status').textContent='ルートは参考情報です。配車はデモのままです。';
+  }catch{if(seq===state.routeSeq){$('route-status').textContent='ルート取得失敗。目的地・API設定を確認してください。';}}
+}
+$('locate').onclick=()=>{
+  if(!state.mapReady)return toast('現在地表示には設定からGoogle Mapsを接続してください。');
+  if(!navigator.geolocation)return toast('位置情報を利用できません。乗車地点を手入力してください。');
+  navigator.geolocation.getCurrentPosition(p=>{state.pickup={lat:p.coords.latitude,lng:p.coords.longitude};state.map.setCenter(state.pickup);$('pickup-label').textContent='現在地（取得済み）';$('map-caption').textContent='Google Maps · 位置精度 約'+Math.round(p.coords.accuracy)+'m';if(state.destination)drawRoute();},()=>toast('現在地を取得できません。乗車地点を手入力してください。'),{timeout:10000,maximumAge:30000,enableHighAccuracy:true});
+};
+// Role-specific UI; all registrations/offers remain in this tab's memory.
+const money=cents=>(cents/100).toFixed(2);
+const statusLabel=s=>({collecting:'提示待ち',assigned:'配車確定の見本',arriving:'迎車中',on_trip:'乗車中',completed:'完了',cancelled:'取消済み'}[s]||s);
+function icon(name){return `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;}
+function details(items){return `<dl class="details">${items.map(([k,v])=>`<div class="detail"><dt>${esc(k)}</dt><dd>${esc(v??'—')}</dd></div>`).join('')}</dl>`;}
+function routeMarkup(r){return `<div class="trip-route"><div><span>乗車地点</span>${esc(r.pickup)}</div><div><span>降車地点</span>${esc(r.destination)}</div></div>`;}
+function renderRoleChooser(){
+  $('passenger-resume').textContent=model.state.profiles.passenger?model.state.profiles.passenger.name+' さんの画面を開く':'利用者登録へ進む';
+  $('driver-resume').textContent=model.state.profiles.driver?model.state.profiles.driver.name+' さんの審査状況を開く':'運転手登録へ進む';
+}
+function renderNavigation(page){
+  const nav=$('main-nav'),role=model.state.activeRole;
+  if(!role||!model.state.profile||['register','passenger-register'].includes(page)){nav.hidden=true;return;}
+  const tabs=role==='passenger'?[['home','car','配車'],['verify','shield','車両確認'],['passenger-history','clock','履歴'],['passenger-account','user','登録情報']]:[['driver-home','car','ホーム'],['driver-requests','pin','依頼'],['driver-trips','clock','運行'],['driver-account','user','登録情報']];
+  nav.hidden=false;nav.innerHTML=tabs.map(([id,ic,label])=>`<button data-page="${id}" class="${page===id||(page==='offers'&&id==='home')?'active':''}">${icon(ic)}${label}</button>`).join('');
+  nav.querySelectorAll('button').forEach(b=>b.onclick=()=>show(b.dataset.page));
+}
+$('role-switch').onclick=()=>show('role');
+$('choose-passenger').onclick=()=>show(model.chooseRole('passenger'));
+$('choose-driver').onclick=()=>show(model.chooseRole('driver'));
+$('open-reviewed-driver').onclick=()=>{model.useReviewedFixture();show('driver-home');toast('審査済みの別の見本を開きました。申請中の情報は変わりません。');};
+window.addEventListener('hashchange',()=>show(location.hash.slice(1)||'role'));
+$('fill-passenger').onclick=()=>{
+  const form=$('passenger-form').elements;
+  const sample={name:'Sample Guest',phone:'+819000000000',email:'guest@example.com',language:'ja',pickup:'Ramada Wailoaloa · デモ',payment:'cash'};
+  Object.entries(sample).forEach(([k,v])=>form[k].value=v);form.consent.checked=true;
+};
+$('passenger-form').onsubmit=e=>{
+  e.preventDefault();const input=Object.fromEntries(new FormData(e.currentTarget).entries());input.consent=e.currentTarget.elements.consent.checked;
+  try{
+    const p=model.registerPassenger(input);state.pickup=p.pickup||'Nadi, Fiji';
+    $('pickup-text').value=state.pickup;$('pickup-label').textContent=state.pickup+' · デモ';
+    $('passenger-error').hidden=true;show('home');toast('登録情報を利用者画面へ引き継ぎました。');
+  }catch(e){$('passenger-error').hidden=false;$('passenger-error').textContent=e.message;}
+};
+function renderPassengerHome(){
+  const p=model.state.profile;if(!p)return;
+  $('passenger-greeting').textContent=p.name+' さん';
+  $('passenger-preferences').textContent=(p.language==='ja'?'連絡：日本語':'連絡：English')+'　/　'+(p.payment==='card'?'カード希望':'現金希望');
+}
+function renderPassengerProfile(){
+  const p=model.state.profile;
+  $('passenger-profile').innerHTML=`<article class="card profile-info"><div class="row"><h2>${esc(p.name)}</h2><span class="badge">利用者</span></div>${details([['連絡先',p.phone],['メール',p.email||'未入力'],['連絡言語',p.language==='ja'?'日本語':'English'],['既定の乗車地点',p.pickup||'未設定'],['支払い希望',p.payment==='card'?'カード（利用可否の確認が必要）':'現金']])}<p class="muted">連絡先認証：未接続（デモ）。名前・連絡言語・支払い希望を配車画面に反映しています。</p></article>`;
+}
+$('edit-passenger').onclick=()=>{
+  const p=model.state.profile,f=$('passenger-form').elements;
+  ['name','phone','email','language','pickup','payment'].forEach(k=>f[k].value=p[k]||'');f.consent.checked=true;show('passenger-register');
+};
+function renderPassengerHistory(){
+  const trips=model.myRequests().slice().reverse();
+  $('passenger-history').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge">${esc(statusLabel(r.status))}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}${r.quoteSnapshot?`<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong> <span class="muted">/ 概算・デモ</span></p>`:''}${r.status==='collecting'?`<button class="secondary" data-view-offers="${esc(r.id)}">提示額を見る</button>`:['assigned','arriving'].includes(r.status)?`<button class="secondary" data-view-car="${esc(r.id)}">予約車両を確認</button>`:''}</article>`).join(''):'<div class="empty">まだ依頼はありません。配車画面から行き先を入力してください。</div>';
+  $('passenger-history').querySelectorAll('[data-view-offers]').forEach(b=>b.onclick=()=>{state.currentRequest=b.dataset.viewOffers;show('offers');});
+  $('passenger-history').querySelectorAll('[data-view-car]').forEach(b=>b.onclick=()=>openVehicleCheck(trips.find(r=>r.id===b.dataset.viewCar)));
+}
+function renderDriverHome(){
+  const p=model.state.profile,g=model.gate(),online=!!model.state.online[p.recordId];
+  $('driver-name').textContent=p.name+' さん';
+  const active=model.driverTrips().filter(r=>r.status!=='completed');
+  $('driver-dashboard').innerHTML=`<div class="card"><div class="row"><span class="plate">${esc(p.plate)}</span><span class="badge ${g.eligible?'good':''}">${g.eligible?'審査済みの見本':'審査待ち'}</span></div><p class="muted" style="margin-top:12px">${esc(p.vehicle)}<br>${esc(p.base)}</p></div>`+(g.eligible?`
+    <div class="card"><div class="row"><h2>依頼の受付</h2><span class="badge"><i class="status-dot ${online?'online':''}"></i>${online?'受付中':'受付停止'}</span></div><p class="muted">${p.fixture?'審査済みの架空アカウントです。実際の営業資格を認証していません。':''}</p><button class="${online?'secondary':'primary'}" id="toggle-duty">${online?'受付を停止する':'受付を開始する（デモ）'}</button></div>
+    <div class="driver-stats"><div><b>${model.driverRequests().length}</b><span>確認できる依頼</span></div><div><b>${active.length}</b><span>担当の運行</span></div></div><button class="secondary" id="open-requests">依頼一覧へ</button>${active.length?'<div class="spacer"></div><button class="primary" id="open-driver-trips">選ばれた依頼を確認</button>':''}
+  `:`<div class="card"><h2>登録申請を受け付けました</h2><p class="muted">入力内容を運転手画面へ引き継ぎました。審査が終わるまで料金提示・迎車はできません。</p><div class="review-step"><small>01</small><span>申請情報の受付</span><strong>デモ受付済み</strong></div><div class="review-step"><small>02</small><span>本人・車両・書類の確認</span><strong>未実施</strong></div><div class="review-step"><small>03</small><span>発行元照会・営業範囲の確認</span><strong>未実施</strong></div><div class="review-step"><small>04</small><span>運営の審査</span><strong>未実施</strong></div><div class="spacer"></div><button class="primary" id="toggle-duty" disabled>審査待ちのため受付できません</button></div><button class="secondary" id="open-driver-profile">申請内容を確認する</button>`)+`<p class="evidence-summary">利用者の連絡先や免許書類の公開一覧は表示しません。運転手は担当依頼と自分の登録情報を確認する設計です。</p>`;
+  if(g.eligible){$('toggle-duty').onclick=()=>{try{model.setOnline(!online);renderDriverHome();}catch(e){toast(e.message);}};$('open-requests').onclick=()=>show('driver-requests');}
+  if($('open-driver-trips'))$('open-driver-trips').onclick=()=>show('driver-trips');
+  if($('open-driver-profile'))$('open-driver-profile').onclick=()=>show('driver-account');
+}
+function renderDriverRequests(){
+  const p=model.state.profile,g=model.gate(),online=!!model.state.online[p.recordId];
+  if(!g.eligible||!online){$('driver-request-list').innerHTML=`<div class="empty">${g.eligible?'現在は受付停止中です。ホームで受付を開始してください。':'審査待ちです。営業資格の確認が終わるまで依頼の詳細や料金入力は表示されません。'}</div>`;return;}
+  const requests=model.driverRequests().slice().reverse();
+  $('driver-request-list').innerHTML=requests.map(r=>{
+    const own=model.state.offers.find(o=>o.requestId===r.id&&o.driverId===p.recordId&&o.status==='active'&&o.source==='driver-input');
+    return `<article class="card"><div class="row"><span class="badge">${r.airport?'空港からの迎車':'一般の乗車'}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<div class="inline-list"><span>${r.passengers}名</span><span>連絡：${r.language==='ja'?'日本語':'English'}</span><span>${r.payment==='card'?'カード希望':'現金希望'}</span></div><p class="muted">電話番号などの詳細は、予約確定後に必要な範囲だけ共有する設計です。</p>${own?`<p class="offer-status">FJ$${money(own.fareCents)} を提示済み · 利用者の承諾待ち</p>`:''}<form class="offer-form" data-request="${esc(r.id)}"><div class="two-fields"><label class="field">提示額（FJD）<input name="fare" inputmode="decimal" placeholder="20.00" value="${own?money(own.fareCents):''}" required></label><label class="field">到着予定（分）<input name="eta" inputmode="numeric" placeholder="5" value="${own?own.eta:''}" required></label></div><p class="muted">概算の提示として記録。法定運賃との関係は本番導入前に確認します。</p><button class="primary" type="submit">${own?'提示額を更新する':'料金を提示する'}（デモ）</button><p class="banner error form-error" role="alert" hidden></p></form></article>`;
+  }).join('')||'<div class="empty">現在、対象となる依頼はありません。</div>';
+  $('driver-request-list').querySelectorAll('form').forEach(f=>f.onsubmit=e=>{e.preventDefault();try{model.submitOffer(f.dataset.request,{fare:f.elements.fare.value,eta:f.elements.eta.value});renderDriverRequests();toast('利用者側の比較画面に反映しました。まだ迎車せず、選択を待ちます。');}catch(e){const el=f.querySelector('.form-error');el.hidden=false;el.textContent=e.message;}});
+}
+function renderDriverTrips(){
+  const trips=model.driverTrips().slice().reverse();
+  $('driver-trip-list').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge good">${esc(statusLabel(r.status))} · デモ</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong></p><p class="muted">利用者：${esc(r.passengerName)} · ${r.passengers}名<br>提示を承諾した依頼です。実際の配車は行っていません。</p>${r.status==='assigned'?`<button class="primary" data-advance="${r.id}">迎車に向かう（デモ）</button>`:r.status==='arriving'?`<p class="banner">${r.vehicleConfirmed?'利用者が車両照合を完了しました（デモ）。':'利用者の車両照合を待っています。役割選択から利用者画面に戻って照合を試せます。'}</p><button class="primary" data-advance="${r.id}" ${r.vehicleConfirmed?'':'disabled'}>乗車開始（デモ）</button>`:r.status==='on_trip'?`<button class="secondary" data-advance="${r.id}">運行を完了する（デモ）</button>`:'<p class="muted">決済は未接続です。金額は入金済み売上ではありません。</p>'}</article>`).join(''):'<div class="empty">まだ利用者が選択した依頼はありません。料金提示後、利用者の承諾を待ってください。</div>';
+  $('driver-trip-list').querySelectorAll('[data-advance]').forEach(b=>b.onclick=()=>{try{model.advanceTrip(b.dataset.advance);renderDriverTrips();}catch(e){toast(e.message);}});
+}
+function renderDriverProfile(){
+  const p=model.state.profile,g=model.gate();
+  $('driver-profile').innerHTML=`<div class="card profile-info"><div class="row"><h2>${esc(p.name)}</h2><span class="badge ${g.eligible?'good':''}">${g.eligible?'審査済みの見本':'審査待ち'}</span></div>${details([['連絡先',p.phone],['車両ナンバー',p.plate],['車種・色',p.vehicle],['Taxi Permit',p.taxiPermit],['運転免許',p.driverLicence],['PSV運転手許可',p.psvPermit],['許可名義人',p.holder],['営業範囲',p.base],['空港迎車の申請',p.airportRequested?'あり':'なし']])}<p class="muted">これは運転手本人の画面です。利用者側には免許番号の全桁や提出書類を表示しません。</p></div>`;
+  $('edit-driver').hidden=!!p.fixture;
+  if(p.fixture)$('driver-profile').insertAdjacentHTML('beforeend','<div class="banner">別の審査済みサンプルです。申請中アカウントは承認されていません。新規申請は役割選択から戻れます。</div>');
+}
+$('edit-driver').onclick=()=>{
+  const p=model.state.profile,f=$('registration-form').elements;
+  ['name','phone','driverLicence','psvPermit','plate','vehicle','taxiPermit','holder','base'].forEach(k=>f[k].value=p[k]||'');
+  f.airport.checked=p.airportRequested;f.consent.checked=true;state.documents=JSON.parse(JSON.stringify(p.documents||{}));setStep(0);show('register');
+};
+renderDocs();show('role');
+</script></body></html>

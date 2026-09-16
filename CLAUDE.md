@@ -1,5 +1,8 @@
 # Claude implementation brief — role-separated onboarding, minimalist UI, taxi verification
 
+## Intake update — 2026-09-16
+Read `docs/HANDOVER_REVIEW_2026-09-16.md` before implementation. The user's complete supplied HTML is now preserved byte-for-byte at `prototypes/role-split/index.html`; it is still an in-memory demo. `prototypes/tests/role-handover.test.cjs` tests that embedded model directly. Current reproducible results are 28 passes (20 verification + 8 role acceptance) and one explicit TODO regression, HANDOVER-01: a later vehicle mismatch does not invalidate an earlier successful confirmation and ride start remains possible. Fix that defect and remove the TODO before accepting the ride-start flow. This intake update does not invoke Claude, integrate the root app or deploy anything.
+
 ## Role split and actual status
 - GDP / ChatGPT: product design, interaction prototype and acceptance criteria.
 - Claude: requested production implementer. No Claude agent has been invoked by this update.
@@ -11,7 +14,7 @@ Read `docs/ROLE_SPLIT_AND_ONBOARDING.md` FIRST. It supersedes the earlier mixed-
 
 First choose Passenger or Driver -> collect that role's registration fields -> route using its profile to its own home. Passenger tabs: Ride / Vehicle Check / History / Profile. Driver tabs: Home / Requests / Trips / Profile. Driver registration remains pending until reviewer/issuer confirmation; it must not grant operational privileges. A separate reviewed-driver fixture exists only for the demo and must never approve an applicant or ship in production.
 
-The conversation's `taxi_protection_role_test.html` and `taxi_protection_role_source.zip` include the working UI/reference model. These UI files have not been uploaded into the root app; the repository contains the implementation specification. Local state propagates driver-entered quotes to passenger comparison and accepted offers back to driver assignments in one open document, not across real users or devices.
+The conversation's `taxi_protection_role_test.html` and `taxi_protection_role_source.zip` were the original handoff. The supplied standalone HTML is now at `prototypes/role-split/index.html`; the ZIP and its original role/browser test suite were not included in this intake. The root app remains separate. Local state propagates driver-entered quotes to passenger comparison and accepted offers back to driver assignments in one open document, not across real users or devices.
 
 Production must use authenticated server-owned roles/profile completeness/review status, ownership checks on every API, private documents and transactional offer selection. Do not treat a URL, local role selector, uploaded document or browser-approved flag as authority. Preserve both user groups' separate data and review states.
 
@@ -38,7 +41,8 @@ Read `docs/MINIMAL_UI_AND_VERIFICATION.md`.
 - No public LTA integration/API was established. Arrange authorized/manual issuer confirmation; do not invent endpoints or request passwords/OTPs.
 - Actual authorization is enforced by the authenticated server, not a browser predicate.
 
-## Actual prototype validation
+## Previously reported prototype validation (prior session)
+The following is the earlier handoff report, not this intake's rerun. See `docs/HANDOVER_REVIEW_2026-09-16.md` for the 28 current passes, one known regression and the blocked browser revalidation.
 44 Node reference-model tests passed (20 verification + 24 role/quote/lifecycle). 18 Chromium browser scenarios passed, including separate onboarding, profile propagation, role route guards, pending-driver restrictions, driver quote -> passenger selection -> driver assignment, vehicle matching, editing and 360/390/430px layout checks.
 
 Tests rendered local HTML using Chromium set_content. They are NOT Android-device, published-URL, backend-security or regulator/Google-API integration tests. New document load clears the in-memory demo; no persisted account/login is claimed.
