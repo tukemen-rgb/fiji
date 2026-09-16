@@ -279,3 +279,46 @@ test('cancelling a scheduled assignment retains its pickup time for both histori
   assert.equal(m.myRequests().find(r=>r.id===ride.id).pickupAt,pickupAt);
   m.useReviewedFixture(); assert.equal(m.driverTrips().find(r=>r.id===ride.id).pickupAt,pickupAt);
 });
+
+test('offer refresh records time expiry and explains why no quote is selectable', () => {
+  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+  m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);
+  assert.equal(m.getOffers(ride.id).length,0);
+  const summary=m.offerSummary(ride.id);
+  assert.equal(summary.active,0); assert.ok(summary.expired>0); assert.equal(summary.unavailable,0);
+  assert.ok(m.state.offers.filter(o=>o.requestId===ride.id).every(o=>o.status==='expired'&&o.statusReason==='time'));
+});
+test('one expired offer does not hide another current offer', () => {
+  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+  const before=m.getOffers(ride.id); assert.ok(before.length>1);
+  before[0].expiresAt=Date.now()-1;
+  const after=m.getOffers(ride.id),summary=m.offerSummary(ride.id);
+  assert.equal(after.length,before.length-1); assert.equal(summary.active,after.length); assert.equal(summary.expired,1);
+  assert.ok(!after.some(o=>o.id===before[0].id));
+});
+test('an eligible driver can re-quote after expiry without reviving the old offer', () => {
+  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+  m.useReviewedFixture(); m.setOnline(true); const old=m.submitOffer(ride.id,{fare:'23.50',eta:'7'});
+  old.expiresAt=Date.now()-1; m.driverRequests();
+  assert.equal(old.status,'expired');
+  const fresh=m.submitOffer(ride.id,{fare:'24.00',eta:'6'});
+  assert.notEqual(fresh.id,old.id); assert.equal(old.status,'expired'); assert.equal(fresh.status,'active');
+  m.chooseRole('passenger'); const visible=m.getOffers(ride.id);
+  assert.ok(visible.some(o=>o.id===fresh.id)); assert.ok(!visible.some(o=>o.id===old.id));
+  m.selectOffer(fresh.id); assert.equal(ride.quoteSnapshot.fareCents,2400);
+});
+test('an offer made unavailable by eligibility cannot silently revive', () => {
+  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+  const offer=m.getOffers(ride.id)[0],record=m.state.records.find(r=>r.id===offer.driverId);
+  record.status='suspended'; assert.ok(!m.getOffers(ride.id).some(o=>o.id===offer.id));
+  assert.equal(offer.status,'unavailable'); assert.equal(offer.statusReason,'eligibility');
+  record.status='reviewed'; assert.ok(!m.getOffers(ride.id).some(o=>o.id===offer.id));
+  assert.throws(()=>m.selectOffer(offer.id));
+});
+test('offer-state guidance is limited to the owning passenger', () => {
+  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),owner=m.state.profile;
+  m.useReviewedFixture(); assert.throws(()=>m.offerSummary(ride.id),/この操作/);
+  m.chooseRole('passenger'); m.state.profile={...owner,id:'unrelated-passenger'};
+  assert.throws(()=>m.offerSummary(ride.id),/閲覧できません/);
+  m.state.profile=owner; assert.throws(()=>m.offerSummary('missing-ride'),/閲覧できません/);
+});

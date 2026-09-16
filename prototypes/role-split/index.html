@@ -253,7 +253,19 @@
       state.requests.push(request);seedOffers(request);return request;
     }
     function myRequests(){const p=need('passenger');return state.requests.filter(r=>r.passengerId===p.id);}
-    function getOffers(id){const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);if(!r)throw Error('この依頼を閲覧できません。');if(r.status!=='collecting')return [];return state.offers.filter(o=>o.requestId===id&&o.status==='active'&&o.expiresAt>Date.now()&&eligibleRecord(o.driverId,r));}
+    function refreshOffers(request){
+      state.offers.filter(o=>o.requestId===request.id&&o.status==='active').forEach(o=>{
+        if(o.expiresAt<=Date.now()){o.status='expired';o.statusReason='time';}
+        else if(!eligibleRecord(o.driverId,request)){o.status='unavailable';o.statusReason='eligibility';}
+      });
+    }
+    function getOffers(id){const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);if(!r)throw Error('この依頼を閲覧できません。');if(r.status!=='collecting')return [];refreshOffers(r);return state.offers.filter(o=>o.requestId===id&&o.status==='active');}
+    function offerSummary(id){
+      const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);if(!r)throw Error('この依頼を閲覧できません。');
+      if(r.status==='collecting')refreshOffers(r);
+      const list=state.offers.filter(o=>o.requestId===id);
+      return Object.freeze({active:list.filter(o=>o.status==='active').length,expired:list.filter(o=>o.status==='expired').length,unavailable:list.filter(o=>o.status==='unavailable').length,total:list.length});
+    }
     function markCancelled(request,reason){
       request.cancelledFrom=request.status;request.cancelledAt=new Date().toISOString();
       request.cancelledBy='passenger';request.cancelReason=reason;request.status='cancelled';
@@ -269,16 +281,17 @@
       if(!['collecting','assigned','arriving'].includes(r.status))throw Error('乗車開始後・完了後の依頼は取り消せません。');
       return markCancelled(r,'passenger_requested');
     }
-    function driverRequests(){need('driver');if(!gate().eligible||!state.online[state.profile.recordId])return [];return state.requests.filter(r=>r.status==='collecting'&&eligibleRecord(state.profile.recordId,r));}
+    function driverRequests(){need('driver');if(!gate().eligible||!state.online[state.profile.recordId])return [];const requests=state.requests.filter(r=>r.status==='collecting'&&eligibleRecord(state.profile.recordId,r));requests.forEach(refreshOffers);return requests;}
     function submitOffer(id,input){
       const p=need('driver'),r=driverRequests().find(r=>r.id===id);if(!r)throw Error('受付状態・依頼・営業資格を再確認してください。');
-      const values=fareInput(input);const old=state.offers.filter(o=>o.requestId===id&&o.driverId===p.recordId);old.forEach(o=>o.status='superseded');
+      const values=fareInput(input);const old=state.offers.filter(o=>o.requestId===id&&o.driverId===p.recordId&&o.status==='active');old.forEach(o=>o.status='superseded');
       const offer={id:'offer-'+(++seq),requestId:id,driverId:p.recordId,...values,status:'active',source:'driver-input',expiresAt:Date.now()+900000,basis:'estimate'};
       state.offers.push(offer);return offer;
     }
     function selectOffer(id){
       const p=need('passenger'),o=state.offers.find(o=>o.id===id),r=state.requests.find(r=>r.id===o?.requestId);
-      if(!o||!r||r.passengerId!==p.id||r.status!=='collecting'||o.status!=='active'||o.expiresAt<=Date.now()||!eligibleRecord(o.driverId,r))throw Error('提示は選択できません。依頼と確認状態を更新してください。');
+      if(r)refreshOffers(r);
+      if(!o||!r||r.passengerId!==p.id||r.status!=='collecting'||o.status!=='active')throw Error('提示は選択できません。依頼と確認状態を更新してください。');
       if(state.requests.some(x=>x.id!==r.id&&x.driverId===o.driverId&&['assigned','arriving','on_trip'].includes(x.status)))throw Error('この運転手は別の運行中です。');
       r.status='assigned';r.driverId=o.driverId;r.selectedOfferId=o.id;r.quoteSnapshot=Object.freeze({fareCents:o.fareCents,eta:o.eta,basis:o.basis,pickupAt:r.pickupAt,selectedAt:new Date().toISOString()});
       r.assignmentRevision=(r.assignmentRevision||0)+1;clearVehicleConfirmation(r);
@@ -325,7 +338,7 @@
       state.requests.push({id:'sample-city',passengerId:'sample-p-1',passengerName:'Sample Passenger',pickup:'Nadi Town · 見本',destination:'Wailoaloa Beach · 見本',airport:false,passengers:2,language:'en',payment:'cash',status:'collecting',createdAt:new Date().toISOString()}, {id:'sample-airport',passengerId:'sample-p-2',passengerName:'Sample Guest',pickup:'Nadi Airport · 見本',destination:'Denarau · 見本',airport:true,passengers:2,language:'ja',payment:'card',status:'collecting',createdAt:new Date().toISOString()});
     }
     seedRequests();
-    return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
+    return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
   const api={pages,route,fareInput,create};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
@@ -426,11 +439,14 @@ function renderPassengerOffers(){
       $('offers').innerHTML='<div class="banner">この依頼は '+esc(statusLabel(request.status))+' です。</div><button class="secondary" id="open-my-ride">乗車履歴を見る</button>';
       $('open-my-ride').onclick=()=>show('passenger-history');return;
     }
-    const offers=model.getOffers(request.id).sort((a,b)=>a.fareCents-b.fareCents);
-    $('offers').innerHTML=offers.map(o=>{const r=records.find(r=>r.id===o.driverId);return `<article class="card"><div class="row"><span class="price">FJ$${money(o.fareCents)} <small>提示・概算</small></span><span class="badge good">確認記録の見本</span></div><p class="muted">${request.pickupAt?'予約時刻への到着目安':'到着'} ${o.eta}分（デモ） · ${o.source==='driver-input'?'運転手側の入力から反映':'サンプル提示'}</p><h3>${esc(r.name)}</h3><p class="muted">${esc(r.vehicle)} / ${esc(r.color)} · ${esc(r.plate)}</p><p class="evidence-summary">提示額を記録します。実際の最終運賃はメーター等との適法な関係を確認して確定する設計です。</p><button class="primary" data-select="${esc(o.id)}">この提示を選ぶ（デモ）</button></article>`;}).join('')||'<div class="empty">条件を満たす有効な提示がありません。運転手の入力を待ちます。</div>';
+    const offers=model.getOffers(request.id).sort((a,b)=>a.fareCents-b.fareCents),summary=model.offerSummary(request.id);
+    const cards=offers.map(o=>{const r=records.find(r=>r.id===o.driverId),minutes=Math.max(1,Math.ceil((o.expiresAt-Date.now())/60000));return `<article class="card"><div class="row"><span class="price">FJ$${money(o.fareCents)} <small>提示・概算</small></span><span class="badge good">あと約${minutes}分</span></div><p class="muted">${request.pickupAt?'予約時刻への到着目安':'到着'} ${o.eta}分（デモ） · ${o.source==='driver-input'?'運転手側の入力から反映':'サンプル提示'}</p><h3>${esc(r.name)}</h3><p class="muted">${esc(r.vehicle)} / ${esc(r.color)} · ${esc(r.plate)}</p><p class="evidence-summary">期限内でも選択時に車両の営業資格を再確認します。提示額は概算の記録です。</p><button class="primary" data-select="${esc(o.id)}">この提示を選ぶ（デモ）</button></article>`;}).join('');
+    const guidance=summary.expired?`<div class="banner"><strong>提示の有効期限が切れました</strong><br>古い金額は選べません。運転手からの再提示を待ち、下のボタンで更新してください。</div>`:summary.unavailable?`<div class="banner"><strong>現在選べる対象車両がありません</strong><br>営業資格・営業範囲を満たす新しい提示を待ってください。</div>`:`<div class="empty">まだ有効な提示がありません。運転手の入力を待ちます。</div>`;
+    $('offers').innerHTML=cards+(offers.length?'':guidance)+`<button class="secondary" id="refresh-offers">最新の提示を確認する</button><p class="muted">自動通知・別端末同期は未接続のデモです。</p>`;
     $('offers').querySelectorAll('[data-select]').forEach(b=>b.onclick=()=>{
       try{const req=model.selectOffer(b.dataset.select);openVehicleCheck(req);toast('提示額をこの画面内に記録しました。実配車は行いません。');}catch(e){toast(e.message);renderPassengerOffers();}
     });
+    $('refresh-offers').onclick=()=>{renderPassengerOffers();toast('この画面内の最新状態を確認しました。');};
   }catch(e){$('offers').innerHTML='<div class="banner error">'+esc(e.message)+'</div>';}
 }
 function openVehicleCheck(req){
@@ -673,8 +689,10 @@ function renderDriverRequests(){
   if(!g.eligible||!online){$('driver-request-list').innerHTML=`<div class="empty">${g.eligible?'現在は受付停止中です。ホームで受付を開始してください。':'審査待ちです。営業資格の確認が終わるまで依頼の詳細や料金入力は表示されません。'}</div>`;return;}
   const requests=model.driverRequests().slice().reverse();
   $('driver-request-list').innerHTML=requests.map(r=>{
-    const own=model.state.offers.find(o=>o.requestId===r.id&&o.driverId===p.recordId&&o.status==='active'&&o.source==='driver-input');
-    return `<article class="card"><div class="row"><span class="badge">${r.airport?'空港からの迎車':'一般の乗車'}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<div class="inline-list"><span>${r.passengers}名</span><span>連絡：${r.language==='ja'?'日本語':'English'}</span><span>${r.payment==='card'?'カード希望':'現金希望'}</span></div><p class="muted">電話番号などの詳細は、予約確定後に必要な範囲だけ共有する設計です。</p>${own?`<p class="offer-status">FJ$${money(own.fareCents)} を提示済み · 利用者の承諾待ち</p>`:''}<form class="offer-form" data-request="${esc(r.id)}"><div class="two-fields"><label class="field">提示額（FJD）<input name="fare" inputmode="decimal" placeholder="20.00" value="${own?money(own.fareCents):''}" required></label><label class="field">${r.pickupAt?'予約時刻への到着目安':'到着予定'}（分）<input name="eta" inputmode="numeric" placeholder="5" value="${own?own.eta:''}" required></label></div><p class="muted">概算の提示として記録。法定運賃との関係は本番導入前に確認します。</p><button class="primary" type="submit">${own?'提示額を更新する':'料金を提示する'}（デモ）</button><p class="banner error form-error" role="alert" hidden></p></form></article>`;
+    const ownActive=model.state.offers.find(o=>o.requestId===r.id&&o.driverId===p.recordId&&o.status==='active'&&o.source==='driver-input');
+    const ownStale=[...model.state.offers].reverse().find(o=>o.requestId===r.id&&o.driverId===p.recordId&&['expired','unavailable'].includes(o.status)&&o.source==='driver-input'),own=ownActive||ownStale;
+    const offerState=ownActive?`<p class="offer-status">FJ$${money(ownActive.fareCents)} を提示済み · 利用者の承諾待ち</p>`:ownStale?`<p class="banner"><strong>${ownStale.status==='expired'?'提示期限切れ':'現在の資格条件では提示不可'}</strong><br>古い提示は利用者が選べません。現在の条件で再提示してください。</p>`:'';
+    return `<article class="card"><div class="row"><span class="badge">${r.airport?'空港からの迎車':'一般の乗車'}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<div class="inline-list"><span>${r.passengers}名</span><span>連絡：${r.language==='ja'?'日本語':'English'}</span><span>${r.payment==='card'?'カード希望':'現金希望'}</span></div><p class="muted">電話番号などの詳細は、予約確定後に必要な範囲だけ共有する設計です。</p>${offerState}<form class="offer-form" data-request="${esc(r.id)}"><div class="two-fields"><label class="field">提示額（FJD）<input name="fare" inputmode="decimal" placeholder="20.00" value="${own?money(own.fareCents):''}" required></label><label class="field">${r.pickupAt?'予約時刻への到着目安':'到着予定'}（分）<input name="eta" inputmode="numeric" placeholder="5" value="${own?own.eta:''}" required></label></div><p class="muted">概算の提示として15分間記録。期限切れ後の再提示は新しい記録になります。</p><button class="primary" type="submit">${ownActive?'提示額を更新する':ownStale?'料金を再提示する':'料金を提示する'}（デモ）</button><p class="banner error form-error" role="alert" hidden></p></form></article>`;
   }).join('')||'<div class="empty">現在、対象となる依頼はありません。</div>';
   $('driver-request-list').querySelectorAll('form').forEach(f=>f.onsubmit=e=>{e.preventDefault();try{model.submitOffer(f.dataset.request,{fare:f.elements.fare.value,eta:f.elements.eta.value});renderDriverRequests();toast('利用者側の比較画面に反映しました。まだ迎車せず、選択を待ちます。');}catch(e){const el=f.querySelector('.form-error');el.hidden=false;el.textContent=e.message;}});
 }

@@ -4,7 +4,7 @@
 Select Passenger or Driver FIRST. Register the information required for that role. Route to the corresponding home using that registered information. Each role must see different information and input controls, not a shared mixed-role menu.
 
 ## Status and ownership
-Current update: the standalone HTML at `prototypes/role-split/index.html` now carries scheduled pickup time through both role-specific interfaces, alongside pre-boarding cancellation and the vehicle-confirmation fix. All 49 reference tests pass; see `PROGRESS.md`. The original user-supplied bytes remain in the intake commit, and `HANDOVER_REVIEW_2026-09-16.md` preserves that earlier review. The prototype has not been integrated into the root application.
+Current update: the standalone HTML at `prototypes/role-split/index.html` now carries scheduled pickup time through both role-specific interfaces and handles offer expiry/re-quote, alongside pre-boarding cancellation and the vehicle-confirmation fix. All 54 reference tests pass; see `PROGRESS.md`. The original user-supplied bytes remain in the intake commit, and `HANDOVER_REVIEW_2026-09-16.md` preserves that earlier review. The prototype has not been integrated into the root application.
 GDP / ChatGPT created and locally tested an interaction prototype, delivered in the conversation as `taxi_protection_role_test.html` and `taxi_protection_role_source.zip`. The complete UI source is in that downloadable archive, NOT in this repository's root application. This commit records the production implementation contract; it does not deploy the prototype or invoke Claude. Claude remains the requested production implementer.
 
 All accounts, permits, fares, vehicles, matches and approval records in the preview are fictional. State is in memory in one open document. No authentication, OTP, database persistence, cross-device synchronization, issuer verification, upload, notification, payment or real dispatch is connected. Existing optional Maps adapters were retained, but live Google Maps requests were not tested in this update.
@@ -80,6 +80,20 @@ The model equivalents are covered by the eight added Node tests; dialog clicks, 
 3. Before acceptance, change the time and compare again; the previous request must be cancelled with no usable offer. Switch back to “Now” and verify it creates an immediate request.
 4. Try a past time and malformed value; no request may be created or replaced. Recheck behavior in different device time zones and at 360/390/430px when browser access is available.
 The six added Node tests cover the model rules, not dialog events, locale formatting, background execution or real notifications.
+
+## Offer expiry and re-quote — prototype contract (2026-09-17 Fiji)
+- Each prototype offer is valid for 15 minutes. Reading or selecting offers refreshes active records against the current time and driver eligibility. Time expiry becomes `expired/time`; failed current eligibility becomes `unavailable/eligibility`.
+- The passenger comparison shows an approximate remaining time. When no selectable offer remains, it distinguishes expired quotes from no currently eligible vehicle and offers a refresh action. It never makes an expired amount selectable again.
+- The driver's Requests view detects their stale input, explains the state, prefills the prior fare/ETA for convenience and submits a new offer record. The stale record remains expired/unavailable for audit; it is not overwritten or revived.
+- A new active offer can be selected after refresh. If only one of several offers expires, the others remain comparable. A passenger can read the summary only for their own request.
+- Production must use a trusted server clock, persist status transitions/audit events, enforce ownership and current eligibility transactionally at selection, and deliver notifications or polling across devices. This in-memory prototype refreshes only on a relevant screen/model action.
+
+### Manual offer-expiry acceptance steps — NOT executed in this update
+1. Create a request with multiple offers; expire one test record and refresh. The expired card must disappear while other current offers remain.
+2. Expire every offer and refresh. The passenger must see that old prices cannot be selected plus a “check latest offers” action.
+3. As the reviewed driver, reopen Requests. The stale fare/ETA should be shown with a re-quote action; submit a new amount, return as passenger and refresh to see only the new selectable offer.
+4. Suspend a quoted driver in the fictional record. The offer must become unavailable and must not revive merely by editing the record back; a fresh quote is required after eligibility is restored.
+The five added Node tests cover status transitions, re-quote and ownership. Countdown updates, focus behavior, real waiting, notifications and multi-device refresh remain unverified.
 
 ## Production authorization acceptance criteria
 - Separate account/membership, passenger_profile, driver_profile and reviewer permissions.
