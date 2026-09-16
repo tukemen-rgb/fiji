@@ -1,7 +1,10 @@
 # Claude implementation brief — role-separated onboarding, minimalist UI, taxi verification
 
 ## Intake update — 2026-09-16
-Read `docs/HANDOVER_REVIEW_2026-09-16.md` before implementation. The user's complete supplied HTML is now preserved byte-for-byte at `prototypes/role-split/index.html`; it is still an in-memory demo. `prototypes/tests/role-handover.test.cjs` tests that embedded model directly. Current reproducible results are 28 passes (20 verification + 8 role acceptance) and one explicit TODO regression, HANDOVER-01: a later vehicle mismatch does not invalidate an earlier successful confirmation and ride start remains possible. Fix that defect and remove the TODO before accepting the ride-start flow. This intake update does not invoke Claude, integrate the root app or deploy anything.
+Read `docs/PROGRESS.md` for current status and `docs/HANDOVER_REVIEW_2026-09-16.md` for the historical intake. The original supplied HTML is preserved in commit `dcad5dcaa376729e1c77626d9c47cb49b22cb9aa`; the working prototype at `prototypes/role-split/index.html` now fixes HANDOVER-01. Rechecking/editing the observed vehicle or withdrawing an identity check invalidates the prior confirmation. Ride start also requires a confirmation bound to the current trip, selected offer, assignment revision, driver, vehicle, holder and appearance. All 35 reference tests pass (20 verification + 15 role/lifecycle), with no TODOs. This remains a browser-memory prototype, not production authorization. Claude must implement the equivalent server-owned rules and integration. Cloud-browser visual revalidation is still unperformed due to the prior URL-policy block.
+
+## Continuing development
+The user asked to continue building in a loop. GDP may continue design prototypes, acceptance tests and review work, committing bounded changes to the existing draft PR. Production implementation remains assigned to Claude; record actual connection and execution state without claiming it has been started. Read the latest remote head and `docs/PROGRESS.md` before each iteration, complete one meaningful item, verify it and update the progress record. Do not recreate completed fixes or generate empty progress commits.
 
 ## Role split and actual status
 - GDP / ChatGPT: product design, interaction prototype and acceptance criteria.

@@ -95,11 +95,64 @@ test('changing a collecting route invalidates earlier quotes', () => {
   m.requestRide({pickup:'Demo Hotel',destination:'Demo Town'});
   assert.equal(first.status,'cancelled'); assert.throws(()=>m.selectOffer(old.id));
 });
-test('a later vehicle mismatch revokes an earlier confirmation', {todo:'HANDOVER-01: supplied prototype retains vehicleConfirmed=true after a later mismatch; Claude must invalidate the confirmation and UI edits'}, () => {
+test('a later vehicle mismatch revokes an earlier confirmation', () => {
   const {m,ride}=selected();
   m.useReviewedFixture(); m.advanceTrip(ride.id);
   m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
   assert.throws(()=>m.confirmVehicle(ride.id,'DEMO 002',true,true));
   m.useReviewedFixture();
   assert.throws(()=>m.advanceTrip(ride.id),'Start must remain blocked after the new mismatch');
+});
+
+test('withdrawing either identity check requires a fresh successful confirmation', () => {
+  for(const checks of [[false,true],[true,false]]) {
+    const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
+    m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
+    assert.throws(()=>m.confirmVehicle(ride.id,'DEMO 001',...checks));
+    m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
+    m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
+    m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),true);
+    m.advanceTrip(ride.id); assert.equal(ride.status,'on_trip');
+  }
+});
+test('editing observed vehicle information clears confirmation before another lookup', () => {
+  const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
+  m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
+  m.invalidateVehicleConfirmation(ride.id);
+  m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
+});
+test('drivers and unrelated passengers cannot clear another passenger confirmation', () => {
+  const {m,ride}=selected(); m.confirmVehicle(ride.id,'DEMO 001',true,true);
+  m.useReviewedFixture(); assert.throws(()=>m.invalidateVehicleConfirmation(ride.id),/この操作/);
+  m.chooseRole('passenger');
+  const owner=m.state.profile; m.state.profile={...owner,id:'unrelated-passenger'};
+  assert.throws(()=>m.invalidateVehicleConfirmation(ride.id),/この依頼/);
+  m.state.profile=owner; assert.equal(ride.vehicleConfirmed,true);
+});
+test('an approved replacement vehicle, driver, or changed assignment needs a new confirmation', () => {
+  for(const kind of ['vehicle','driver','holder','appearance','assignment','offer']) {
+    const {m,V,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
+    m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
+    const record=m.state.records.find(x=>x.id===ride.driverId);
+    if(kind==='vehicle') record.vehicleId='replacement-vehicle';
+    if(kind==='driver') record.driverId='replacement-driver';
+    if(kind==='holder') record.holderId='replacement-holder';
+    if(kind==='appearance') record.color='different-color';
+    if(kind==='assignment') ride.assignmentRevision++;
+    if(kind==='offer') ride.selectedOfferId='replacement-offer';
+    for(const doc of Object.values(record.documents)) doc.binding=record.holderId+'/'+record.vehicleId+'/'+record.driverId;
+    assert.equal(V.assess(record).eligible,true,'test replacement retains valid current evidence');
+    m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false,kind); assert.throws(()=>m.advanceTrip(ride.id));
+  }
+});
+test('a boolean flag without a matching confirmation record cannot start a ride', () => {
+  const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
+  ride.vehicleConfirmed=true;
+  assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
+});
+test('revocation after a successful check still blocks ride start', () => {
+  const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
+  m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
+  m.state.records.find(x=>x.id===ride.driverId).status='suspended';
+  m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
 });

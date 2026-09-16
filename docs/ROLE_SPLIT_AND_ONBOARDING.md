@@ -4,7 +4,7 @@
 Select Passenger or Driver FIRST. Register the information required for that role. Route to the corresponding home using that registered information. Each role must see different information and input controls, not a shared mixed-role menu.
 
 ## Status and ownership
-Intake update: the user-supplied standalone HTML is now available at `prototypes/role-split/index.html`, with reproducible acceptance tests and an unresolved vehicle-confirmation regression documented in `HANDOVER_REVIEW_2026-09-16.md`. It has not been integrated into the root application.
+Current update: the standalone HTML at `prototypes/role-split/index.html` now fixes the vehicle-confirmation regression found at intake. All 35 reference tests pass; see `PROGRESS.md`. The original user-supplied bytes remain in the intake commit, and `HANDOVER_REVIEW_2026-09-16.md` preserves that earlier review. The prototype has not been integrated into the root application.
 GDP / ChatGPT created and locally tested an interaction prototype, delivered in the conversation as `taxi_protection_role_test.html` and `taxi_protection_role_source.zip`. The complete UI source is in that downloadable archive, NOT in this repository's root application. This commit records the production implementation contract; it does not deploy the prototype or invoke Claude. Claude remains the requested production implementer.
 
 All accounts, permits, fares, vehicles, matches and approval records in the preview are fictional. State is in memory in one open document. No authentication, OTP, database persistence, cross-device synchronization, issuer verification, upload, notification, payment or real dispatch is connected. Existing optional Maps adapters were retained, but live Google Maps requests were not tested in this update.
@@ -35,6 +35,8 @@ Eligible drivers can toggle on-duty status. Request detail shows pickup/dropoff,
 After quoting, show 'Waiting for passenger acceptance'. Do not show 'Go to pickup' until the passenger actually chooses that offer. A driver's new quote supersedes that driver's old active quote, not an already selected snapshot.
 
 Trips shows only assignments selected for that driver: assigned -> arriving -> passenger vehicle check -> on_trip -> completed. Completion is not proof of payment. Profile shows that driver's own application details and permits, with edits remaining pending.
+
+Any new vehicle lookup, observed-plate edit or withdrawal of the person/car match invalidates earlier confirmation. A failed recheck must leave ride start blocked. The confirmation belongs to the current trip, selected quote, assignment revision and observed driver/vehicle binding; a replacement or changed appearance requires fresh confirmation. The driver button and transition use the same current confirmation rule. Retrying plate input preserves the booked assignment instead of silently clearing it. These prototype rules must be enforced on the authenticated server in production.
 
 ## Separate approved-driver fixture
 The role chooser has an explicitly labelled test-only entry for a different already-reviewed fictional driver (DEMO 001). It does NOT approve the applicant or mutate the applicant's submitted evidence. Returning to the applicant still shows pending. Remove this fixture switch from production.

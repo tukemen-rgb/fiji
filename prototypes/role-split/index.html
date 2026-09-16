@@ -251,20 +251,42 @@
       if(!o||!r||r.passengerId!==p.id||r.status!=='collecting'||o.status!=='active'||o.expiresAt<=Date.now()||!eligibleRecord(o.driverId,r))throw Error('提示は選択できません。依頼と確認状態を更新してください。');
       if(state.requests.some(x=>x.id!==r.id&&x.driverId===o.driverId&&['assigned','arriving','on_trip'].includes(x.status)))throw Error('この運転手は別の運行中です。');
       r.status='assigned';r.driverId=o.driverId;r.selectedOfferId=o.id;r.quoteSnapshot=Object.freeze({fareCents:o.fareCents,eta:o.eta,basis:o.basis,selectedAt:new Date().toISOString()});
+      r.assignmentRevision=(r.assignmentRevision||0)+1;clearVehicleConfirmation(r);
       state.offers.filter(x=>x.requestId===r.id).forEach(x=>x.status=x.id===o.id?'selected':'expired');state.online[o.driverId]=false;return r;
     }
     function driverTrips(){const p=need('driver');return state.requests.filter(r=>r.driverId===p.recordId);}
+    function clearVehicleConfirmation(request){request.vehicleConfirmed=false;request.vehicleConfirmation=null;}
+    function confirmationBinding(request,record){
+      return JSON.stringify([request.id,request.driverId,request.selectedOfferId,request.assignmentRevision,record.driverId,record.vehicleId,record.holderId,V.normalizePlate(record.plate),record.vehicle,record.color,record.reviewRevision??0]);
+    }
+    function invalidateVehicleConfirmation(id){
+      const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);
+      if(!r)throw Error('この依頼の車両確認を変更できません。');
+      if(!['assigned','arriving'].includes(r.status))return false;
+      clearVehicleConfirmation(r);return true;
+    }
+    function canStartTrip(id){
+      const p=need('driver'),r=state.requests.find(r=>r.id===id&&r.driverId===p.recordId);
+      const record=state.records.find(x=>x.id===p.recordId);
+      return !!(r&&record&&r.status==='arriving'&&eligibleRecord(p.recordId,r)&&r.vehicleConfirmed&&r.vehicleConfirmation?.binding===confirmationBinding(r,record));
+    }
     function confirmVehicle(id,plate,samePerson,sameCar){
       const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);
       if(!r||!['assigned','arriving'].includes(r.status))throw Error('予約車両がありません。');
+      clearVehicleConfirmation(r);
       const rec=state.records.find(x=>V.normalizePlate(x.plate)===V.normalizePlate(plate));
       if(!samePerson||!sameCar||!V.matchVehicle(rec,plate,{airport:r.airport,expectedId:r.driverId}).eligible)throw Error('予約車両・運転手を再確認してください。');
-      r.vehicleConfirmed=true;return r;
+      r.vehicleConfirmation=Object.freeze({binding:confirmationBinding(r,rec),confirmedAt:new Date().toISOString()});r.vehicleConfirmed=true;return r;
     }
     function advanceTrip(id){
-      const p=need('driver'),r=driverTrips().find(r=>r.id===id);if(!r||!eligibleRecord(p.recordId,r))throw Error('担当車両・営業資格を確認してください。');
+      const p=need('driver'),r=driverTrips().find(r=>r.id===id);
+      if(!r)throw Error('担当車両・営業資格を確認してください。');
+      if(!eligibleRecord(p.recordId,r)){clearVehicleConfirmation(r);throw Error('担当車両・営業資格を確認してください。');}
       if(r.status==='assigned')r.status='arriving';
-      else if(r.status==='arriving'&&r.vehicleConfirmed)r.status='on_trip';
+      else if(r.status==='arriving'){
+        if(!canStartTrip(id)){clearVehicleConfirmation(r);throw Error('利用者の車両確認が完了していません。再確認してください。');}
+        r.status='on_trip';
+      }
       else if(r.status==='on_trip')r.status='completed';
       else throw Error('利用者の車両確認が完了していません。');
       return r;
@@ -273,7 +295,7 @@
       state.requests.push({id:'sample-city',passengerId:'sample-p-1',passengerName:'Sample Passenger',pickup:'Nadi Town · 見本',destination:'Wailoaloa Beach · 見本',airport:false,passengers:2,language:'en',payment:'cash',status:'collecting',createdAt:new Date().toISOString()}, {id:'sample-airport',passengerId:'sample-p-2',passengerName:'Sample Guest',pickup:'Nadi Airport · 見本',destination:'Denarau · 見本',airport:true,passengers:2,language:'ja',payment:'card',status:'collecting',createdAt:new Date().toISOString()});
     }
     seedRequests();
-    return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,myRequests,getOffers,driverRequests,submitOffer,selectOffer,driverTrips,confirmVehicle,advanceTrip,ownRecord};
+    return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,myRequests,getOffers,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
   const api={pages,route,fareInput,create};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
@@ -364,6 +386,7 @@ function renderPassengerOffers(){
   }catch(e){$('offers').innerHTML='<div class="banner error">'+esc(e.message)+'</div>';}
 }
 function openVehicleCheck(req){
+  model.invalidateVehicleConfirmation(req.id);
   state.currentRequest=req.id;state.expectedId=req.driverId;state.airport=req.airport;
   const r=records.find(x=>x.id===req.driverId);
   state.selected={id:r.id,plate:r.plate,selectedAt:req.quoteSnapshot.selectedAt};
@@ -371,20 +394,32 @@ function openVehicleCheck(req){
   $('lookup-result').innerHTML=`<div class="banner">選択した車：<strong>${esc(r.plate)}</strong><br>記録した提示額：FJ$${money(req.quoteSnapshot.fareCents)}（概算・デモ）<br>目の前の車・運転手を確認してください。</div>`;
   show('verify');
 }
+function invalidateVehicleCheck(){
+  if(model.state.activeRole==='passenger'&&state.currentRequest){
+    try{model.invalidateVehicleConfirmation(state.currentRequest);}catch(e){toast(e.message);}
+  }
+}
+function resetVehicleCheckInput(){
+  invalidateVehicleCheck();$('plate-input').value='';$('lookup-result').replaceChildren();$('plate-input').focus();
+}
 function lookup() {
+  invalidateVehicleCheck();
   const entered = $('plate-input').value;
   const r = records.find(x => V.normalizePlate(x.plate) === V.normalizePlate(entered));
   const a = V.matchVehicle(r, entered, {airport:$('airport-check').checked,expectedId:state.expectedId});
   const title = {not_found:'登録情報を確認できません',pending:'申請受付・未確認',suspended:'利用停止中',recheck:'再確認が必要です',wrong_vehicle:'予約した車と違います',plate_mismatch:'ナンバーが一致しません',incomplete:'情報が不足しています',unavailable:'現在は確認できません'};
   if (!a.eligible) {
-    $('lookup-result').innerHTML = `<div class="banner error"><strong>${esc(title[a.code] || '確認できません')}</strong><br>${a.code==='not_found' ? '当アプリ内の台帳にありません。無許可という意味ではありません。' : esc(a.reasons[0])}<br>アプリ経由の乗車開始はできません。</div><p class="muted">不一致のまま乗らず、安全な場所で配車担当者へ確認する設計です。実際の許可の有無は発行元への照会が必要です。</p>${state.expectedId ? '<button class="secondary" id="clear-selected">選択を解除して調べ直す</button>' : ''}`;
-    if ($('clear-selected')) $('clear-selected').onclick = () => { state.expectedId = null; lookup(); };
+    $('lookup-result').innerHTML = `<div class="banner error"><strong>${esc(title[a.code] || '確認できません')}</strong><br>${a.code==='not_found' ? '当アプリ内の台帳にありません。無許可という意味ではありません。' : esc(a.reasons[0])}<br>アプリ経由の乗車開始はできません。</div><p class="muted">不一致のまま乗らず、安全な場所で配車担当者へ確認する設計です。実際の許可の有無は発行元への照会が必要です。</p>${state.expectedId ? '<button class="secondary" id="clear-selected">ナンバーを入力し直す</button>' : ''}`;
+    if ($('clear-selected')) $('clear-selected').onclick = resetVehicleCheckInput;
     return;
   }
   const d = r.documents.taxi_permit;
   const date = x => new Date(x).toLocaleDateString('ja-JP');
-  $('lookup-result').innerHTML = `<article class="card"><p class="eyebrow">SAMPLE RECORD · 実在の認証ではありません</p><div class="row"><span class="plate">${esc(r.plate)}</span><span class="badge good">照会記録あり（見本）</span></div><h2 style="margin-top:18px">${esc(r.name)}</h2><p class="muted">${esc(r.vehicle)} / ${esc(r.color)}</p><dl class="details"><div class="detail"><dt>営業許可・運転資格</dt><dd>確認済みの見本</dd></div><div class="detail"><dt>確認方法</dt><dd>発行元の書面回答（架空）</dd></div><div class="detail"><dt>最終確認</dt><dd>${date(d.checkedAt)}</dd></div><div class="detail"><dt>営業許可の有効期限</dt><dd>${date(d.expiresAt)}</dd></div><div class="detail"><dt>次回確認期限</dt><dd>${date(d.recheckAt)}</dd></div><div class="detail"><dt>空港からの迎車</dt><dd>${r.documents.airport_authorization ? '承認確認の見本' : '空港承認は未確認'}</dd></div></dl><p class="muted">番号だけの一致では不十分です。本番では登録写真と本人・実車も比較します。</p><label class="checkbox"><input id="same-driver" type="checkbox">運転手本人と登録写真が一致（デモ操作）</label><label class="checkbox"><input id="same-car" type="checkbox">車種・色・実車が一致（デモ操作）</label><button class="primary" id="board-demo" disabled>確認を完了する（デモ）</button><div id="boarding-status" aria-live="polite"></div></article>${state.expectedId ? '<button class="small-action" id="clear-selected">選択を解除する</button>' : ''}`;
-  const gate = () => $('board-demo').disabled = !($('same-driver').checked && $('same-car').checked);
+  $('lookup-result').innerHTML = `<article class="card"><p class="eyebrow">SAMPLE RECORD · 実在の認証ではありません</p><div class="row"><span class="plate">${esc(r.plate)}</span><span class="badge good">照会記録あり（見本）</span></div><h2 style="margin-top:18px">${esc(r.name)}</h2><p class="muted">${esc(r.vehicle)} / ${esc(r.color)}</p><dl class="details"><div class="detail"><dt>営業許可・運転資格</dt><dd>確認済みの見本</dd></div><div class="detail"><dt>確認方法</dt><dd>発行元の書面回答（架空）</dd></div><div class="detail"><dt>最終確認</dt><dd>${date(d.checkedAt)}</dd></div><div class="detail"><dt>営業許可の有効期限</dt><dd>${date(d.expiresAt)}</dd></div><div class="detail"><dt>次回確認期限</dt><dd>${date(d.recheckAt)}</dd></div><div class="detail"><dt>空港からの迎車</dt><dd>${r.documents.airport_authorization ? '承認確認の見本' : '空港承認は未確認'}</dd></div></dl><p class="muted">番号だけの一致では不十分です。本番では登録写真と本人・実車も比較します。</p><label class="checkbox"><input id="same-driver" type="checkbox">運転手本人と登録写真が一致（デモ操作）</label><label class="checkbox"><input id="same-car" type="checkbox">車種・色・実車が一致（デモ操作）</label><button class="primary" id="board-demo" disabled>確認を完了する（デモ）</button><div id="boarding-status" aria-live="polite"></div></article>${state.expectedId ? '<button class="small-action" id="clear-selected">ナンバーを入力し直す</button>' : ''}`;
+  const gate = () => {
+    invalidateVehicleCheck();$('boarding-status').replaceChildren();
+    $('board-demo').disabled = !($('same-driver').checked && $('same-car').checked);
+  };
   $('same-driver').onchange = $('same-car').onchange = gate;
   $('board-demo').onclick = () => {
     const latest = V.matchVehicle(r, $('plate-input').value,{airport:$('airport-check').checked,expectedId:state.expectedId});
@@ -392,11 +427,11 @@ function lookup() {
     if(state.currentRequest){try{model.confirmVehicle(state.currentRequest,$('plate-input').value,$('same-driver').checked,$('same-car').checked);}catch(e){toast(e.message);return;}}
     $('boarding-status').innerHTML = '<div class="banner">照合操作のテストが完了しました。実車の正当性を認証した結果ではなく、実配車・乗車開始も行っていません。</div>';
   };
-  if ($('clear-selected')) $('clear-selected').onclick = () => { state.expectedId = null; lookup(); };
+  if ($('clear-selected')) $('clear-selected').onclick = resetVehicleCheckInput;
 }
 $('lookup-form').onsubmit = e => {e.preventDefault();lookup();};
-$('plate-input').oninput = () => $('lookup-result').replaceChildren();
-$('airport-check').onchange = () => $('lookup-result').replaceChildren();
+$('plate-input').oninput = () => {invalidateVehicleCheck();$('lookup-result').replaceChildren();};
+$('airport-check').onchange = () => {invalidateVehicleCheck();$('lookup-result').replaceChildren();};
 document.querySelectorAll('[data-plate]').forEach(b => b.onclick = () => { $('plate-input').value = b.dataset.plate; lookup(); });
 
 function currentTypes() { return $('register-airport').checked ? [...V.REQUIRED,'airport_authorization'] : V.REQUIRED; }
@@ -569,7 +604,7 @@ function renderDriverRequests(){
 }
 function renderDriverTrips(){
   const trips=model.driverTrips().slice().reverse();
-  $('driver-trip-list').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge good">${esc(statusLabel(r.status))} · デモ</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong></p><p class="muted">利用者：${esc(r.passengerName)} · ${r.passengers}名<br>提示を承諾した依頼です。実際の配車は行っていません。</p>${r.status==='assigned'?`<button class="primary" data-advance="${r.id}">迎車に向かう（デモ）</button>`:r.status==='arriving'?`<p class="banner">${r.vehicleConfirmed?'利用者が車両照合を完了しました（デモ）。':'利用者の車両照合を待っています。役割選択から利用者画面に戻って照合を試せます。'}</p><button class="primary" data-advance="${r.id}" ${r.vehicleConfirmed?'':'disabled'}>乗車開始（デモ）</button>`:r.status==='on_trip'?`<button class="secondary" data-advance="${r.id}">運行を完了する（デモ）</button>`:'<p class="muted">決済は未接続です。金額は入金済み売上ではありません。</p>'}</article>`).join(''):'<div class="empty">まだ利用者が選択した依頼はありません。料金提示後、利用者の承諾を待ってください。</div>';
+  $('driver-trip-list').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge good">${esc(statusLabel(r.status))} · デモ</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong></p><p class="muted">利用者：${esc(r.passengerName)} · ${r.passengers}名<br>提示を承諾した依頼です。実際の配車は行っていません。</p>${r.status==='assigned'?`<button class="primary" data-advance="${r.id}">迎車に向かう（デモ）</button>`:r.status==='arriving'?`<p class="banner">${model.canStartTrip(r.id)?'利用者が車両照合を完了しました（デモ）。':'利用者の車両照合を待っています。役割選択から利用者画面に戻って照合を試せます。'}</p><button class="primary" data-advance="${r.id}" ${model.canStartTrip(r.id)?'':'disabled'}>乗車開始（デモ）</button>`:r.status==='on_trip'?`<button class="secondary" data-advance="${r.id}">運行を完了する（デモ）</button>`:'<p class="muted">決済は未接続です。金額は入金済み売上ではありません。</p>'}</article>`).join(''):'<div class="empty">まだ利用者が選択した依頼はありません。料金提示後、利用者の承諾を待ってください。</div>';
   $('driver-trip-list').querySelectorAll('[data-advance]').forEach(b=>b.onclick=()=>{try{model.advanceTrip(b.dataset.advance);renderDriverTrips();}catch(e){toast(e.message);}});
 }
 function renderDriverProfile(){

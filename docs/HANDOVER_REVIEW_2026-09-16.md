@@ -1,5 +1,7 @@
 # フィジー配車アプリ — 引き継ぎ受入・実装レビュー
 
+> 履歴文書です。以下は受入コミット `dcad5dcaa376729e1c77626d9c47cb49b22cb9aa` 時点の記録。継続開発でHANDOVER-01を試作側で修正し、現在は35件合格・TODOなしです。最新状態は [PROGRESS.md](PROGRESS.md) を参照してください。本番側への反映と画面操作の再検証は未完了です。
+
 関連: [役割別実装 #3](https://github.com/tukemen-rgb/fiji/issues/3)、[車両・許可照合 #2](https://github.com/tukemen-rgb/fiji/issues/2)。
 
 ## 採用する前提
