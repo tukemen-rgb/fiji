@@ -77,7 +77,7 @@
 </main>
 <dialog id="settings-dialog"><div class="row"><h2>プレビュー設定</h2><button class="icon-btn" data-close="settings-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><p class="muted">実配車・審査・決済は未接続。入力はこの画面内だけで扱います。</p><label class="field">制限付き Google Maps ブラウザキー<input id="maps-key" type="password" autocomplete="off" placeholder="APIキー（任意）"></label><p class="muted">キーは保存しません。公開サイト用キーを設定してHTTPSで接続テストしてください。地図のAPI利用料が生じる場合があります。</p><button class="primary" id="connect-maps">Google Maps に接続</button><p id="maps-message" class="muted" aria-live="polite"></p><button class="small-action" id="reset-demo">入力を消してやり直す</button></dialog>
 <dialog id="pickup-dialog"><div class="row"><h2>乗車地点</h2><button class="icon-btn" data-close="pickup-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><label class="field">乗車地点・施設名<input id="pickup-text" value="Nadi, Fiji" maxlength="160"></label><label class="checkbox"><input id="airport-pickup" type="checkbox">空港内での迎車（テスト条件）</label><p class="muted">GPSだけでは空港の営業資格を判定しません。</p><button class="primary" id="save-pickup">乗車地点を設定</button></dialog>
-<dialog id="schedule-dialog"><div class="row"><h2>乗車予定 · デモ</h2><button class="icon-btn" data-close="schedule-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><label class="field">日時（端末のタイムゾーン）<input id="schedule-time" type="datetime-local"></label><button class="primary" id="save-schedule">テスト日時を設定</button><p class="muted">実際の予約は送信されません。</p></dialog>
+<dialog id="schedule-dialog"><div class="row"><h2>乗車予定 · デモ</h2><button class="icon-btn" data-close="schedule-dialog" aria-label="閉じる"><svg class="icon"><use href="#i-cross"/></svg></button></div><label class="field">日時（この端末のタイムゾーン）<input id="schedule-time" type="datetime-local"></label><button class="primary" id="save-schedule">この日時を依頼に設定</button><div class="spacer"></div><button class="secondary" id="clear-schedule">今すぐの依頼に戻す</button><p class="muted">日時は依頼・比較・双方の履歴へ反映するテストです。実際の予約・通知は送信されません。</p></dialog>
 <dialog id="cancel-dialog" aria-labelledby="cancel-title">
   <h2 id="cancel-title">依頼を取り消しますか？</h2>
   <div id="cancel-summary"></div>
@@ -235,15 +235,21 @@
     function seedOffers(request){
       state.records.filter(r=>V.assess(r,{airport:request.airport}).eligible).forEach((r,i)=>state.offers.push({id:'offer-'+(++seq),requestId:request.id,driverId:r.id,fareCents:i?1800:2000,eta:i?8:4,status:'active',source:'fixture',expiresAt:Date.now()+900000,basis:'estimate'}));
     }
+    function normalizePickupAt(value){
+      if(value===undefined||value===null||value==='')return null;
+      const time=Date.parse(value);
+      if(!Number.isFinite(time)||time<=Date.now())throw Error('予約日時は現在より後を選んでください。');
+      return new Date(time).toISOString();
+    }
     function requestRide(input){
-      const p=need('passenger');const pickup=text(input.pickup),destination=text(input.destination);
+      const p=need('passenger');const pickup=text(input.pickup),destination=text(input.destination),pickupAt=normalizePickupAt(input.pickupAt);
       if(!pickup||!destination)throw Error('乗車地点と目的地を入力してください。');
       if(state.requests.some(r=>r.passengerId===p.id&&['assigned','arriving','on_trip'].includes(r.status)))throw Error('進行中の乗車があります。履歴から確認してください。');
-      const existing=state.requests.find(r=>r.passengerId===p.id&&r.status==='collecting'&&r.pickup===pickup&&r.destination===destination&&r.airport===!!input.airport);
+      const existing=state.requests.find(r=>r.passengerId===p.id&&r.status==='collecting'&&r.pickup===pickup&&r.destination===destination&&r.airport===!!input.airport&&r.pickupAt===pickupAt);
       if(existing)return existing;
       // Only one open request per test passenger; changing route invalidates old offers.
-      state.requests.filter(r=>r.passengerId===p.id&&r.status==='collecting').forEach(r=>markCancelled(r,'route_changed'));
-      const request={id:'ride-'+(++seq),passengerId:p.id,passengerName:p.name,pickup,destination,airport:!!input.airport,passengers:Math.max(1,Math.min(4,Number(input.passengers)||1)),language:p.language,payment:p.payment,status:'collecting',createdAt:new Date().toISOString()};
+      state.requests.filter(r=>r.passengerId===p.id&&r.status==='collecting').forEach(r=>markCancelled(r,r.pickup===pickup&&r.destination===destination&&r.airport===!!input.airport?'schedule_changed':'route_changed'));
+      const request={id:'ride-'+(++seq),passengerId:p.id,passengerName:p.name,pickup,destination,pickupAt,airport:!!input.airport,passengers:Math.max(1,Math.min(4,Number(input.passengers)||1)),language:p.language,payment:p.payment,status:'collecting',createdAt:new Date().toISOString()};
       state.requests.push(request);seedOffers(request);return request;
     }
     function myRequests(){const p=need('passenger');return state.requests.filter(r=>r.passengerId===p.id);}
@@ -274,14 +280,14 @@
       const p=need('passenger'),o=state.offers.find(o=>o.id===id),r=state.requests.find(r=>r.id===o?.requestId);
       if(!o||!r||r.passengerId!==p.id||r.status!=='collecting'||o.status!=='active'||o.expiresAt<=Date.now()||!eligibleRecord(o.driverId,r))throw Error('提示は選択できません。依頼と確認状態を更新してください。');
       if(state.requests.some(x=>x.id!==r.id&&x.driverId===o.driverId&&['assigned','arriving','on_trip'].includes(x.status)))throw Error('この運転手は別の運行中です。');
-      r.status='assigned';r.driverId=o.driverId;r.selectedOfferId=o.id;r.quoteSnapshot=Object.freeze({fareCents:o.fareCents,eta:o.eta,basis:o.basis,selectedAt:new Date().toISOString()});
+      r.status='assigned';r.driverId=o.driverId;r.selectedOfferId=o.id;r.quoteSnapshot=Object.freeze({fareCents:o.fareCents,eta:o.eta,basis:o.basis,pickupAt:r.pickupAt,selectedAt:new Date().toISOString()});
       r.assignmentRevision=(r.assignmentRevision||0)+1;clearVehicleConfirmation(r);
       state.offers.filter(x=>x.requestId===r.id).forEach(x=>x.status=x.id===o.id?'selected':'expired');state.online[o.driverId]=false;return r;
     }
     function driverTrips(){const p=need('driver');return state.requests.filter(r=>r.driverId===p.recordId);}
     function clearVehicleConfirmation(request){request.vehicleConfirmed=false;request.vehicleConfirmation=null;}
     function confirmationBinding(request,record){
-      return JSON.stringify([request.id,request.driverId,request.selectedOfferId,request.assignmentRevision,record.driverId,record.vehicleId,record.holderId,V.normalizePlate(record.plate),record.vehicle,record.color,record.reviewRevision??0]);
+      return JSON.stringify([request.id,request.driverId,request.selectedOfferId,request.assignmentRevision,request.pickupAt,record.driverId,record.vehicleId,record.holderId,V.normalizePlate(record.plate),record.vehicle,record.color,record.reviewRevision??0]);
     }
     function invalidateVehicleConfirmation(id){
       const p=need('passenger'),r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);
@@ -334,7 +340,7 @@ const R = window.TaxiRoles;
 const model = R.create();
 let records = model.state.records;
 const names = {taxi_permit:'Taxi Permit（営業許可）',vehicle_licence:'車両登録・PSV車両資格',driver_licence:'運転免許',psv_driver_permit:'PSV運転手許可',fitness:'車両検査・適合証明',insurance:'営業利用を含む保険',operator_assignment:'名義人の同意・運転権限',airport_authorization:'空港側の営業承認'};
-const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', map:null, routeLib:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
+const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let toastTimer;
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(()=> $('toast').hidden = true, 5000); }
@@ -363,13 +369,31 @@ document.querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click',
 document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click',()=>$(b.dataset.close).close()));
 $('settings-open').onclick = $('maps-open').onclick = () => openDialog('settings-dialog');
 $('pickup-open').onclick = () => openDialog('pickup-dialog');
-$('schedule-open').onclick = () => openDialog('schedule-dialog');
+$('schedule-open').onclick = () => {
+  const minimum=new Date(Date.now()+60000).toISOString();
+  $('schedule-time').min=localDateTimeValue(minimum);
+  $('schedule-time').value=state.pickupAt?localDateTimeValue(state.pickupAt):'';
+  openDialog('schedule-dialog');
+};
 $('reset-demo').onclick = () => location.reload();
+function localDateTimeValue(value){
+  const d=new Date(value);return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,16);
+}
+function pickupTimeLabel(value){
+  return value?new Date(value).toLocaleString('ja-JP',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}):'今すぐ';
+}
+function updateScheduleControl(){
+  $('schedule-open').textContent=state.pickupAt?pickupTimeLabel(state.pickupAt):'今すぐ';
+}
 $('save-schedule').onclick = () => {
   const d = new Date($('schedule-time').value);
   if (!Number.isFinite(d.getTime()) || d.getTime() <= Date.now()) return toast('現在より後の日時を選んでください。');
-  $('schedule-open').textContent = '予約（デモ）'; $('schedule-dialog').close();
-  toast(d.toLocaleString('ja-JP') + ' を仮設定しました。予約は送信されません。');
+  state.pickupAt=d.toISOString();updateScheduleControl();$('schedule-dialog').close();
+  toast(d.toLocaleString('ja-JP') + ' を次の依頼に設定しました。実際の予約は送信されません。');
+};
+$('clear-schedule').onclick=()=>{
+  state.pickupAt=null;$('schedule-time').value='';updateScheduleControl();$('schedule-dialog').close();
+  toast('次の依頼を「今すぐ」に戻しました。');
 };
 $('save-pickup').onclick = () => {
   const name = $('pickup-text').value.trim();
@@ -388,8 +412,8 @@ document.querySelectorAll('[data-destination]').forEach(b => b.onclick = () => {
 $('find-offers').onclick = () => {
   try {
     if (!state.destination) { $('destination').focus();return toast('先に目的地を入力してください。'); }
-    const r=model.requestRide({pickup:typeof state.pickup==='string'?state.pickup:'現在地',destination:$('destination').value,airport:state.airport});
-    state.currentRequest=r.id;state.expectedId=null;state.selected=null;
+    const r=model.requestRide({pickup:typeof state.pickup==='string'?state.pickup:'現在地',destination:$('destination').value,airport:state.airport,pickupAt:state.pickupAt});
+    state.currentRequest=r.id;state.expectedId=null;state.selected=null;state.pickupAt=r.pickupAt;updateScheduleControl();
     if(state.mapReady)drawRoute();show('offers');
   }catch(e){toast(e.message);}
 };
@@ -397,13 +421,13 @@ function renderPassengerOffers(){
   try{
     const request=model.myRequests().find(r=>r.id===state.currentRequest);
     if(!request){$('offers').innerHTML='<div class="empty">先に目的地を入力してください。</div>';return;}
-    $('offer-destination').textContent=request.pickup+' → '+request.destination;
+    $('offer-destination').textContent=request.pickup+' → '+request.destination+' · '+pickupTimeLabel(request.pickupAt);
     if(request.status!=='collecting'){
       $('offers').innerHTML='<div class="banner">この依頼は '+esc(statusLabel(request.status))+' です。</div><button class="secondary" id="open-my-ride">乗車履歴を見る</button>';
       $('open-my-ride').onclick=()=>show('passenger-history');return;
     }
     const offers=model.getOffers(request.id).sort((a,b)=>a.fareCents-b.fareCents);
-    $('offers').innerHTML=offers.map(o=>{const r=records.find(r=>r.id===o.driverId);return `<article class="card"><div class="row"><span class="price">FJ$${money(o.fareCents)} <small>提示・概算</small></span><span class="badge good">確認記録の見本</span></div><p class="muted">到着 ${o.eta}分（デモ） · ${o.source==='driver-input'?'運転手側の入力から反映':'サンプル提示'}</p><h3>${esc(r.name)}</h3><p class="muted">${esc(r.vehicle)} / ${esc(r.color)} · ${esc(r.plate)}</p><p class="evidence-summary">提示額を記録します。実際の最終運賃はメーター等との適法な関係を確認して確定する設計です。</p><button class="primary" data-select="${esc(o.id)}">この提示を選ぶ（デモ）</button></article>`;}).join('')||'<div class="empty">条件を満たす有効な提示がありません。運転手の入力を待ちます。</div>';
+    $('offers').innerHTML=offers.map(o=>{const r=records.find(r=>r.id===o.driverId);return `<article class="card"><div class="row"><span class="price">FJ$${money(o.fareCents)} <small>提示・概算</small></span><span class="badge good">確認記録の見本</span></div><p class="muted">${request.pickupAt?'予約時刻への到着目安':'到着'} ${o.eta}分（デモ） · ${o.source==='driver-input'?'運転手側の入力から反映':'サンプル提示'}</p><h3>${esc(r.name)}</h3><p class="muted">${esc(r.vehicle)} / ${esc(r.color)} · ${esc(r.plate)}</p><p class="evidence-summary">提示額を記録します。実際の最終運賃はメーター等との適法な関係を確認して確定する設計です。</p><button class="primary" data-select="${esc(o.id)}">この提示を選ぶ（デモ）</button></article>`;}).join('')||'<div class="empty">条件を満たす有効な提示がありません。運転手の入力を待ちます。</div>';
     $('offers').querySelectorAll('[data-select]').forEach(b=>b.onclick=()=>{
       try{const req=model.selectOffer(b.dataset.select);openVehicleCheck(req);toast('提示額をこの画面内に記録しました。実配車は行いません。');}catch(e){toast(e.message);renderPassengerOffers();}
     });
@@ -555,7 +579,8 @@ const money=cents=>(cents/100).toFixed(2);
 const statusLabel=s=>({collecting:'提示待ち',assigned:'配車確定の見本',arriving:'迎車中',on_trip:'乗車中',completed:'完了',cancelled:'取消済み'}[s]||s);
 function icon(name){return `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;}
 function details(items){return `<dl class="details">${items.map(([k,v])=>`<div class="detail"><dt>${esc(k)}</dt><dd>${esc(v??'—')}</dd></div>`).join('')}</dl>`;}
-function routeMarkup(r){return `<div class="trip-route"><div><span>乗車地点</span>${esc(r.pickup)}</div><div><span>降車地点</span>${esc(r.destination)}</div></div>`;}
+function scheduleMarkup(r){return r.pickupAt?`<p class="banner"><strong>予約日時（デモ）</strong><br>${esc(pickupTimeLabel(r.pickupAt))} · この端末の表示時刻</p>`:'<p class="muted">乗車予定：今すぐ</p>';}
+function routeMarkup(r){return `${scheduleMarkup(r)}<div class="trip-route"><div><span>乗車地点</span>${esc(r.pickup)}</div><div><span>降車地点</span>${esc(r.destination)}</div></div>`;}
 function renderRoleChooser(){
   $('passenger-resume').textContent=model.state.profiles.passenger?model.state.profiles.passenger.name+' さんの画面を開く':'利用者登録へ進む';
   $('driver-resume').textContent=model.state.profiles.driver?model.state.profiles.driver.name+' さんの審査状況を開く':'運転手登録へ進む';
@@ -606,7 +631,7 @@ function renderPassengerHistory(){
   $('passenger-history').querySelectorAll('[data-cancel-ride]').forEach(b=>b.onclick=()=>openCancellation(b.dataset.cancelRide));
 }
 function cancellationMarkup(r){
-  return `<p class="banner">${r.cancelReason==='route_changed'?'行き先の変更により、この依頼を取り消しました。':'利用者が依頼を取り消しました。'}迎車・乗車開始はできません。</p><p class="muted">取消日時：${esc(r.cancelledAt||'記録なし')}<br>記録した提示額は請求・キャンセル料ではありません。</p>`;
+  return `<p class="banner">${r.cancelReason==='route_changed'?'行き先の変更により、この依頼を取り消しました。':r.cancelReason==='schedule_changed'?'予約日時の変更により、この依頼を取り消しました。':'利用者が依頼を取り消しました。'}迎車・乗車開始はできません。</p><p class="muted">取消日時：${esc(r.cancelledAt||'記録なし')}<br>記録した提示額は請求・キャンセル料ではありません。</p>`;
 }
 let cancelRequestId=null;
 function openCancellation(id){
@@ -649,7 +674,7 @@ function renderDriverRequests(){
   const requests=model.driverRequests().slice().reverse();
   $('driver-request-list').innerHTML=requests.map(r=>{
     const own=model.state.offers.find(o=>o.requestId===r.id&&o.driverId===p.recordId&&o.status==='active'&&o.source==='driver-input');
-    return `<article class="card"><div class="row"><span class="badge">${r.airport?'空港からの迎車':'一般の乗車'}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<div class="inline-list"><span>${r.passengers}名</span><span>連絡：${r.language==='ja'?'日本語':'English'}</span><span>${r.payment==='card'?'カード希望':'現金希望'}</span></div><p class="muted">電話番号などの詳細は、予約確定後に必要な範囲だけ共有する設計です。</p>${own?`<p class="offer-status">FJ$${money(own.fareCents)} を提示済み · 利用者の承諾待ち</p>`:''}<form class="offer-form" data-request="${esc(r.id)}"><div class="two-fields"><label class="field">提示額（FJD）<input name="fare" inputmode="decimal" placeholder="20.00" value="${own?money(own.fareCents):''}" required></label><label class="field">到着予定（分）<input name="eta" inputmode="numeric" placeholder="5" value="${own?own.eta:''}" required></label></div><p class="muted">概算の提示として記録。法定運賃との関係は本番導入前に確認します。</p><button class="primary" type="submit">${own?'提示額を更新する':'料金を提示する'}（デモ）</button><p class="banner error form-error" role="alert" hidden></p></form></article>`;
+    return `<article class="card"><div class="row"><span class="badge">${r.airport?'空港からの迎車':'一般の乗車'}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<div class="inline-list"><span>${r.passengers}名</span><span>連絡：${r.language==='ja'?'日本語':'English'}</span><span>${r.payment==='card'?'カード希望':'現金希望'}</span></div><p class="muted">電話番号などの詳細は、予約確定後に必要な範囲だけ共有する設計です。</p>${own?`<p class="offer-status">FJ$${money(own.fareCents)} を提示済み · 利用者の承諾待ち</p>`:''}<form class="offer-form" data-request="${esc(r.id)}"><div class="two-fields"><label class="field">提示額（FJD）<input name="fare" inputmode="decimal" placeholder="20.00" value="${own?money(own.fareCents):''}" required></label><label class="field">${r.pickupAt?'予約時刻への到着目安':'到着予定'}（分）<input name="eta" inputmode="numeric" placeholder="5" value="${own?own.eta:''}" required></label></div><p class="muted">概算の提示として記録。法定運賃との関係は本番導入前に確認します。</p><button class="primary" type="submit">${own?'提示額を更新する':'料金を提示する'}（デモ）</button><p class="banner error form-error" role="alert" hidden></p></form></article>`;
   }).join('')||'<div class="empty">現在、対象となる依頼はありません。</div>';
   $('driver-request-list').querySelectorAll('form').forEach(f=>f.onsubmit=e=>{e.preventDefault();try{model.submitOffer(f.dataset.request,{fare:f.elements.fare.value,eta:f.elements.eta.value});renderDriverRequests();toast('利用者側の比較画面に反映しました。まだ迎車せず、選択を待ちます。');}catch(e){const el=f.querySelector('.form-error');el.hidden=false;el.textContent=e.message;}});
 }

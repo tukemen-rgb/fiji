@@ -4,7 +4,7 @@
 Select Passenger or Driver FIRST. Register the information required for that role. Route to the corresponding home using that registered information. Each role must see different information and input controls, not a shared mixed-role menu.
 
 ## Status and ownership
-Current update: the standalone HTML at `prototypes/role-split/index.html` now supports pre-boarding passenger cancellation as well as the vehicle-confirmation fix found at intake. All 43 reference tests pass; see `PROGRESS.md`. The original user-supplied bytes remain in the intake commit, and `HANDOVER_REVIEW_2026-09-16.md` preserves that earlier review. The prototype has not been integrated into the root application.
+Current update: the standalone HTML at `prototypes/role-split/index.html` now carries scheduled pickup time through both role-specific interfaces, alongside pre-boarding cancellation and the vehicle-confirmation fix. All 49 reference tests pass; see `PROGRESS.md`. The original user-supplied bytes remain in the intake commit, and `HANDOVER_REVIEW_2026-09-16.md` preserves that earlier review. The prototype has not been integrated into the root application.
 GDP / ChatGPT created and locally tested an interaction prototype, delivered in the conversation as `taxi_protection_role_test.html` and `taxi_protection_role_source.zip`. The complete UI source is in that downloadable archive, NOT in this repository's root application. This commit records the production implementation contract; it does not deploy the prototype or invoke Claude. Claude remains the requested production implementer.
 
 All accounts, permits, fares, vehicles, matches and approval records in the preview are fictional. State is in memory in one open document. No authentication, OTP, database persistence, cross-device synchronization, issuer verification, upload, notification, payment or real dispatch is connected. Existing optional Maps adapters were retained, but live Google Maps requests were not tested in this update.
@@ -65,6 +65,21 @@ This is one in-memory state observed through two interfaces, NOT real multi-user
 3. Explicitly resume driver duty and create a new passenger request. The new request can receive a quote, but the cancelled request cannot.
 4. Start a confirmed trip first; History must no longer offer cancellation. Recheck at 360/390/430px and on an Android device when authorized browser/device access is available.
 The model equivalents are covered by the eight added Node tests; dialog clicks, focus, mobile layout and real browser event dispatch remain unverified.
+
+## Scheduled pickup — prototype contract (2026-09-17 Fiji)
+- A passenger may choose immediate pickup (`pickupAt: null`) or a future local date/time. The browser converts a valid future selection to an ISO UTC timestamp before creating the request; invalid or past values are rejected without replacing an open request.
+- The request carries the same `pickupAt` through passenger comparison/history and driver request/trip views. The UI labels rendered values as this device's time. Production must store an absolute instant plus the intended IANA time zone and define daylight-saving behavior; this prototype does not test cross-time-zone devices.
+- The same route, airport condition and pickup time is idempotent. Changing only the time cancels the older collecting request with `schedule_changed`, expires its offers and creates a new request. Returning to immediate pickup is also a schedule change.
+- Offer selection copies `pickupAt` into the immutable quote snapshot with fare, ETA, basis and selection time. Vehicle confirmation is bound to the pickup time, so a changed assignment time needs fresh confirmation.
+- Driver ETA copy says “arrival estimate relative to the booked time” for scheduled requests. This does not define a legal dispatch window, driver reminder, no-show rule, cancellation fee or guaranteed arrival.
+- No scheduler, push notification, background job, database persistence or multi-device synchronization is connected. Production needs authenticated, transactional schedule/change/cancel operations and explicit Fiji/local-time handling.
+
+### Manual scheduled-pickup acceptance steps — NOT executed in this update
+1. Set a future time, create a request and verify the same local display in passenger Offers/History and driver Requests.
+2. Quote and accept the scheduled request; verify passenger History and driver Trips retain the time and quote snapshot.
+3. Before acceptance, change the time and compare again; the previous request must be cancelled with no usable offer. Switch back to “Now” and verify it creates an immediate request.
+4. Try a past time and malformed value; no request may be created or replaced. Recheck behavior in different device time zones and at 360/390/430px when browser access is available.
+The six added Node tests cover the model rules, not dialog events, locale formatting, background execution or real notifications.
 
 ## Production authorization acceptance criteria
 - Separate account/membership, passenger_profile, driver_profile and reviewer permissions.

@@ -130,7 +130,7 @@ test('drivers and unrelated passengers cannot clear another passenger confirmati
   m.state.profile=owner; assert.equal(ride.vehicleConfirmed,true);
 });
 test('an approved replacement vehicle, driver, or changed assignment needs a new confirmation', () => {
-  for(const kind of ['vehicle','driver','holder','appearance','assignment','offer']) {
+  for(const kind of ['vehicle','driver','holder','appearance','assignment','offer','schedule']) {
     const {m,V,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
     m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
     const record=m.state.records.find(x=>x.id===ride.driverId);
@@ -140,6 +140,7 @@ test('an approved replacement vehicle, driver, or changed assignment needs a new
     if(kind==='appearance') record.color='different-color';
     if(kind==='assignment') ride.assignmentRevision++;
     if(kind==='offer') ride.selectedOfferId='replacement-offer';
+    if(kind==='schedule') ride.pickupAt=new Date(Date.now()+3600000).toISOString();
     for(const doc of Object.values(record.documents)) doc.binding=record.holderId+'/'+record.vehicleId+'/'+record.driverId;
     assert.equal(V.assess(record).eligible,true,'test replacement retains valid current evidence');
     m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false,kind); assert.throws(()=>m.advanceTrip(ride.id));
@@ -228,4 +229,53 @@ test('route replacement records a distinct cancellation reason and invalidates t
   m.requestRide({pickup:'Demo Hotel',destination:'Demo Town'});
   assert.equal(first.cancelReason,'route_changed'); assert.equal(first.cancelledFrom,'collecting');
   const at=first.cancelledAt; m.cancelRide(first.id); assert.equal(first.cancelReason,'route_changed'); assert.equal(first.cancelledAt,at);
+});
+
+test('a future pickup time is normalized and shared with an eligible driver', () => {
+  const {m}=setup(); passenger(m);
+  const pickupAt=new Date(Date.now()+3600000).toISOString();
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt});
+  assert.equal(ride.pickupAt,pickupAt);
+  m.useReviewedFixture(); m.setOnline(true);
+  assert.equal(m.driverRequests().find(r=>r.id===ride.id).pickupAt,pickupAt);
+});
+test('immediate rides remain explicit and do not inherit an earlier schedule', () => {
+  const {m}=setup(); passenger(m);
+  const scheduled=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:new Date(Date.now()+3600000).toISOString()});
+  const immediate=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+  assert.equal(immediate.pickupAt,null); assert.notEqual(immediate.id,scheduled.id);
+  assert.equal(scheduled.status,'cancelled'); assert.equal(scheduled.cancelReason,'schedule_changed');
+});
+test('invalid or past pickup times are rejected without creating or replacing a request', () => {
+  const {m}=setup(); passenger(m); const count=m.state.requests.length;
+  for(const pickupAt of ['not-a-date',new Date(Date.now()-60000).toISOString()]) {
+    assert.throws(()=>m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt}),/現在より後/);
+    assert.equal(m.state.requests.length,count);
+  }
+});
+test('the same scheduled request is idempotent while a changed time replaces it', () => {
+  const {m}=setup(); passenger(m);
+  const firstAt=new Date(Date.now()+3600000).toISOString();
+  const secondAt=new Date(Date.now()+7200000).toISOString();
+  const first=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:firstAt});
+  assert.equal(m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:firstAt}),first);
+  const second=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:secondAt});
+  assert.equal(first.status,'cancelled'); assert.equal(first.cancelReason,'schedule_changed');
+  assert.equal(second.pickupAt,secondAt); assert.equal(second.status,'collecting');
+});
+test('selection snapshots the scheduled pickup alongside the agreed quote', () => {
+  const {m}=setup(); passenger(m); const pickupAt=new Date(Date.now()+3600000).toISOString();
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt});
+  m.useReviewedFixture(); m.setOnline(true); const offer=m.submitOffer(ride.id,{fare:'23.50',eta:'7'});
+  m.chooseRole('passenger'); m.selectOffer(offer.id);
+  assert.equal(ride.pickupAt,pickupAt); assert.equal(ride.quoteSnapshot.pickupAt,pickupAt);
+  assert.ok(Object.isFrozen(ride.quoteSnapshot));
+});
+test('cancelling a scheduled assignment retains its pickup time for both histories', () => {
+  const {m}=setup(); passenger(m); const pickupAt=new Date(Date.now()+3600000).toISOString();
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt});
+  m.useReviewedFixture(); m.setOnline(true); const offer=m.submitOffer(ride.id,{fare:'23.50',eta:'7'});
+  m.chooseRole('passenger'); m.selectOffer(offer.id); m.cancelRide(ride.id);
+  assert.equal(m.myRequests().find(r=>r.id===ride.id).pickupAt,pickupAt);
+  m.useReviewedFixture(); assert.equal(m.driverTrips().find(r=>r.id===ride.id).pickupAt,pickupAt);
 });
