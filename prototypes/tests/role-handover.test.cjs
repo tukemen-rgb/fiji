@@ -478,6 +478,62 @@ test('a newly initialized driver session returns only to the driver home when no
   assert.equal(requests,1);
   assert.equal(guard.restore(),null);
 });
+function recoveryUi(R,role='passenger',generation=1) {
+  const pages=[],commandUi=R.createCommandUiController(role);
+  commandUi.finish('unresolved');
+  return {pages,commandUi,adapter:R.createStartupRecoveryUiAdapter({role,sessionGeneration:generation,navigate:page=>pages.push(page),commandUi})};
+}
+function recoveryResult(role,outcome,view,overrides={}) {
+  return {requested:true,state:{role,outcome,attempts:1,sessionGeneration:1,...overrides},view};
+}
+test('passenger startup recovery navigates and unlocks exactly once', () => {
+  const {R}=setup(),{pages,commandUi,adapter}=recoveryUi(R);
+  const view={kind:'ride',page:'passenger-history',ride:currentRideView('passenger'),reason:'current_ride'};
+  const first=adapter.apply(recoveryResult('passenger','confirmed',view));
+  const duplicate=adapter.apply(recoveryResult('passenger','confirmed',view));
+  assert.equal(first.applied,true);assert.equal(first.reason,'ride_restored');
+  assert.deepEqual(pages,['passenger-history']);
+  assert.equal(commandUi.snapshot().disableCommands,false);
+  assert.equal(duplicate.applied,false);assert.equal(duplicate.reason,'already_settled');
+});
+test('driver empty recovery returns only to driver home', () => {
+  const {R}=setup(),{pages,adapter}=recoveryUi(R,'driver');
+  const result=adapter.apply(recoveryResult('driver','empty',{kind:'empty',page:'driver-home',ride:null,reason:'no_current_ride'}));
+  assert.equal(result.applied,true);assert.equal(result.reason,'home_restored');
+  assert.deepEqual(pages,['driver-home']);assert.equal(result.state.command.role,'driver');
+});
+test('stale session recovery cannot navigate or unlock the current session', () => {
+  const {R}=setup(),{pages,commandUi,adapter}=recoveryUi(R,'passenger',2);
+  const stale=recoveryResult('passenger','confirmed',{kind:'ride',page:'passenger-history',ride:currentRideView('passenger')},{sessionGeneration:1});
+  assert.equal(adapter.apply(stale).applied,false);
+  assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().disableCommands,true);
+});
+test('a new UI session ignores an old completion and accepts its own result once', () => {
+  const {R}=setup(),{pages,adapter}=recoveryUi(R,'driver');
+  assert.equal(adapter.beginSession(2).started,true);
+  const old=recoveryResult('driver','empty',{kind:'empty',page:'driver-home',ride:null},{sessionGeneration:1});
+  assert.equal(adapter.apply(old).applied,false);
+  const fresh=recoveryResult('driver','empty',{kind:'empty',page:'driver-home',ride:null},{sessionGeneration:2});
+  assert.equal(adapter.apply(fresh).applied,true);assert.deepEqual(pages,['driver-home']);
+  assert.equal(adapter.beginSession(2).started,false);
+});
+test('reauthentication and unresolved results update the role lock without navigation', () => {
+  const {R}=setup(),{pages,commandUi,adapter}=recoveryUi(R,'driver');
+  const reauth=adapter.apply(recoveryResult('driver','reauth',null));
+  assert.equal(reauth.applied,true);assert.equal(commandUi.snapshot().action,'reauth');
+  const unresolved=adapter.apply(recoveryResult('driver','unresolved',null,{attempts:2}));
+  assert.equal(unresolved.applied,true);assert.equal(commandUi.snapshot().action,'refresh');
+  assert.deepEqual(pages,[]);
+});
+test('cross-role or unexpected recovery views fail closed', () => {
+  const {R}=setup(),{pages,commandUi,adapter}=recoveryUi(R,'passenger');
+  const wrongRole=recoveryResult('driver','confirmed',{kind:'ride',page:'driver-trips',ride:currentRideView('driver')});
+  assert.equal(adapter.apply(wrongRole).applied,false);
+  const wrongPage=recoveryResult('passenger','confirmed',{kind:'ride',page:'driver-trips',ride:currentRideView('passenger')});
+  const blocked=adapter.apply(wrongPage);
+  assert.equal(blocked.applied,true);assert.equal(blocked.reason,'invalid_view');
+  assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().outcome,'conflict');assert.equal(commandUi.snapshot().disableCommands,true);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');

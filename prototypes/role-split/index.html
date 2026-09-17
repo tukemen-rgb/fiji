@@ -319,6 +319,54 @@
     }
     return Object.freeze({snapshot,reconcile,replacePrincipal,beginSessionRecovery});
   }
+  function createStartupRecoveryUiAdapter({role,sessionGeneration=1,navigate,commandUi}){
+    const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
+    if(!normalized||!Number.isInteger(sessionGeneration)||sessionGeneration<1||typeof navigate!=='function'||!commandUi||typeof commandUi.finish!=='function'||typeof commandUi.snapshot!=='function'||typeof commandUi.setRole!=='function')throw Error('起動時復旧UIの設定が不正です。');
+    const target={
+      passenger:{ride:'passenger-history',empty:'home'},
+      driver:{ride:'driver-trips',empty:'driver-home'}
+    }[normalized];
+    let generation=sessionGeneration,settled=false;
+    const applied=new Set();
+    commandUi.setRole(normalized);
+    const snapshot=()=>Object.freeze({role:normalized,sessionGeneration:generation,settled,appliedCount:applied.size,command:commandUi.snapshot()});
+    const invalid=(key,reason)=>{
+      if(key)applied.add(key);
+      commandUi.finish('conflict');settled=true;
+      return {applied:true,reason,state:snapshot()};
+    };
+    const beginSession=nextGeneration=>{
+      if(!Number.isInteger(nextGeneration)||nextGeneration<=generation)return {started:false,reason:'invalid_generation',state:snapshot()};
+      generation=nextGeneration;settled=false;applied.clear();commandUi.setRole(normalized);commandUi.finish('unresolved');
+      return {started:true,reason:'session_started',state:snapshot()};
+    };
+    const apply=result=>{
+      const state=result?.state;
+      if(result?.requested!==true||!state||state.role!==normalized||state.sessionGeneration!==generation||!Number.isInteger(state.attempts)||state.attempts<1)return {applied:false,reason:'stale_or_invalid',state:snapshot()};
+      if(result.reason==='stale_session')return {applied:false,reason:'stale_session',state:snapshot()};
+      const view=result.view,key=[generation,state.attempts,state.outcome,view?.kind||'none'].join(':');
+      if(applied.has(key)||settled)return {applied:false,reason:settled?'already_settled':'duplicate_result',state:snapshot()};
+      if(state.outcome==='confirmed'){
+        if(view?.kind!=='ride'||view.page!==target.ride||view.ride?.viewerRole!==normalized)return invalid(key,'invalid_view');
+        try{navigate(target.ride);}catch{return invalid(key,'navigation_failed');}
+        applied.add(key);settled=true;commandUi.finish('confirmed');
+        return {applied:true,reason:'ride_restored',state:snapshot()};
+      }
+      if(state.outcome==='empty'){
+        if(view?.kind!=='empty'||view.page!==target.empty||view.ride!==null)return invalid(key,'invalid_view');
+        try{navigate(target.empty);}catch{return invalid(key,'navigation_failed');}
+        applied.add(key);settled=true;commandUi.finish('confirmed');
+        return {applied:true,reason:'home_restored',state:snapshot()};
+      }
+      if(['unresolved','reauth','conflict','rejected'].includes(state.outcome)){
+        if(state.outcome==='conflict'&&view?.kind!=='blocked')return invalid(key,'invalid_view');
+        applied.add(key);if(['conflict','rejected'].includes(state.outcome))settled=true;commandUi.finish(state.outcome);
+        return {applied:true,reason:'lock_updated',state:snapshot()};
+      }
+      return invalid(key,'invalid_outcome');
+    };
+    return Object.freeze({snapshot,beginSession,apply});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -476,7 +524,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
