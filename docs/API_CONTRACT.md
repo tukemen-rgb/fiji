@@ -10,6 +10,8 @@ The same command also sends offer selection and cancellation concurrently from r
 
 Offer-selection validity scenarios use an injected trusted server clock. A quote is rejected with `409 offer_expired` when server time is equal to or later than `expiresAt`; one millisecond before expiry is accepted. Current driver eligibility is rechecked inside the same serialized selection and returns `409 driver_unavailable` without assigning or incrementing the ride when eligibility has been lost. A caller-supplied `clientNow` is rejected as an unknown input rather than influencing the decision. This deterministic clock is a test fixture, not a live time service, background expiry worker or regulator check.
 
+The loopback runner also records allowlisted audit events for offer selection and ride cancellation inside the same serialized callback as their state decision. Committed commands and rejected `stale_revision`, `invalid_transition`, `offer_expired` and `driver_unavailable` decisions carry event type, outcome/reason, server-owned actor reference, request/offer reference, before/after revision and trusted server time. An exact idempotent replay returns the saved result without creating another event. The executable check rejects unexpected event fields and credentials or private request inputs such as bearer tokens, idempotency keys, contact details, observed plates and permit data. The mock array is neither durable nor tamper-evident and does not prove that a production database commits business state and audit outbox atomically.
+
 ## Common rules
 
 - Prefix examples with `/v1`. HTTPS and authenticated sessions are mandatory in production.
@@ -17,6 +19,7 @@ Offer-selection validity scenarios use an injected trusted server clock. A quote
 - Return only data allowed for the current participant. Use `404` where revealing another user's resource existence would leak information.
 - Each ride request has a monotonically increasing integer `revision`, beginning at `1`. State-changing commands carry `expectedRevision`; a mismatch returns `409 stale_revision` and must not partly update any record.
 - State transitions, eligibility recheck, selected-offer snapshot and audit event are one database transaction. Use a trusted server clock for `createdAt`, `expiresAt`, `selectedAt`, `cancelledAt` and transition timestamps.
+- Audit successful and rejected security-relevant commands with an allowlist. Store internal actor/resource references, outcome, stable reason code, before/after revision, correlation ID and server time; do not copy authorization headers, idempotency keys, contact data, observed plates, permit/document contents or free-form request bodies into audit payloads.
 - Require an `Idempotency-Key` for create, quote, cancel, select and transition commands. Repeating the same actor/key/body returns the original result; reusing a key with different content returns `409 idempotency_conflict`.
 - Prices use integer Fiji cents. Times use ISO 8601 UTC instants plus the intended IANA time zone (normally `Pacific/Fiji`). Documents and private identifiers are never returned in public passenger views.
 

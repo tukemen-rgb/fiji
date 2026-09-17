@@ -6,9 +6,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runAuditContract} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
+let auditContract;
+function auditedHttpResults() { return auditContract ||= runAuditContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -458,4 +460,38 @@ test('client cannot override the trusted offer-selection clock', async () => {
   assert.equal(validity.clientClock.result.body.code,'invalid_request');
   assert.equal(validity.clientClock.ride.status,'collecting');
   assert.equal(validity.clientClock.offer.status,'active');
+});
+test('successful offer selection records a minimal server-timestamped audit event', async () => {
+  const {validity}=await auditedHttpResults(),event=validity.valid.auditEvents[0];
+  assert.deepEqual(event,{
+    id:'audit-1',type:'offer.selection',outcome:'committed',reason:null,
+    actorRole:'passenger',actorRef:'passenger-owner',requestId:FIXTURE.requestId,
+    offerId:FIXTURE.offerId,fromRevision:2,toRevision:3,occurredAt:'2026-09-17T03:00:00.000Z'
+  });
+});
+test('expiry and eligibility selection rejections are audited without advancing the ride', async () => {
+  const {validity}=await auditedHttpResults();
+  for(const [result,reason] of [[validity.expired,'offer_expired'],[validity.ineligible,'driver_unavailable']]){
+    assert.equal(result.auditEvents.length,1);
+    assert.equal(result.auditEvents[0].outcome,'rejected');
+    assert.equal(result.auditEvents[0].reason,reason);
+    assert.equal(result.auditEvents[0].fromRevision,2);
+    assert.equal(result.auditEvents[0].toRevision,2);
+    assert.equal(result.ride.revision,2);
+  }
+});
+test('concurrent commands record one commit and one stale rejection without replay duplication', async () => {
+  const {race}=await auditedHttpResults();
+  assert.equal(race.auditEvents.length,2);
+  assert.equal(race.auditEvents.filter(event=>event.outcome==='committed').length,1);
+  assert.equal(race.auditEvents.filter(event=>event.reason==='stale_revision').length,1);
+  assert.deepEqual(race.auditEvents.map(event=>event.id),['audit-1','audit-2']);
+});
+test('audit events use only the allowlist and exclude credentials and private request inputs', async () => {
+  const {events}=await auditedHttpResults();
+  for(const event of events) assert.deepEqual(Object.keys(event),AUDIT_FIELDS);
+  const encoded=JSON.stringify(events).toLowerCase();
+  for(const forbidden of [...Object.values(FIXTURE.tokens),'idempotency-key','phone','email','observedplate','permit','+679','@']){
+    assert.ok(!encoded.includes(forbidden.toLowerCase()),forbidden);
+  }
 });
