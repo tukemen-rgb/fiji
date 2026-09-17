@@ -4,7 +4,7 @@ Status: GDP / ChatGPT acceptance contract for Claude's future production impleme
 
 Machine-readable companion: `docs/openapi.json`. Run `node prototypes/api-contract-check.cjs` to check its required operations, authentication, idempotency headers, optimistic revisions, safe input fields, money/time representations and error envelope. This is a static contract check, not an HTTP or backend integration test.
 
-HTTP acceptance runner: `node prototypes/http-contract-runner.cjs`. Its default mode starts ephemeral servers on `127.0.0.1`, sends real HTTP requests, then closes them. Fourteen scenarios cover unauthenticated access, passenger/driver role confusion, pending-driver denial, foreign passenger resources, unassigned-driver transitions, caller-supplied identity, missing idempotency keys and three positive controls. Additional flows cover selection/cancellation races, offer validity, vehicle confirmation and the assigned-to-completed ride path. `runHttpContract(baseUrl, tokens)` is transport-reusable for a future authorized test environment, but no remote base URL or real token is configured or contacted here.
+HTTP acceptance runner: `node prototypes/http-contract-runner.cjs`. Its default mode starts ephemeral servers on `127.0.0.1`, sends real HTTP requests, then closes them. Fourteen scenarios cover unauthenticated access, passenger/driver role confusion, pending-driver denial, foreign passenger resources, unassigned-driver transitions, caller-supplied identity, missing idempotency keys and three positive controls. Additional flows cover selection/cancellation races, offer validity, vehicle confirmation, the assigned-to-completed ride path and role-shaped recovery reads after a stale conflict. `runHttpContract(baseUrl, tokens)` is transport-reusable for a future authorized test environment, but no remote base URL or real token is configured or contacted here.
 
 The same command also sends offer selection and cancellation concurrently from revision 2 with different idempotency keys. Exactly one returns 200 and revision 3; the loser returns `409 stale_revision`. An exact retry of the winner returns the frozen original response without another state change, while the same key with changed content returns `409 idempotency_conflict`. This loopback mock serializes with an in-memory promise lock and stores replay records in a Map; it is executable acceptance behavior, not evidence of database locks, multi-process safety or persistent idempotency storage.
 
@@ -15,6 +15,8 @@ The loopback runner also records allowlisted audit events for offer selection an
 Vehicle confirmation and ride-transition scenarios use the same revision, idempotency and audit mechanism. The booked plate is normalized server-side; the raw observed plate is never copied into audit events. A later mismatch invalidates an existing confirmation and advances the revision so a stale ride-start command cannot reuse it. `arriving -> on_trip` requires both a confirmation current for that exact revision and a currently eligible assigned driver. Exact confirmation/transition replays do not advance state or duplicate audit records.
 
 The boarding race sends passenger cancellation and driver `arriving -> on_trip` from the same revision over concurrent loopback HTTP requests. Both deterministic orderings are exercised: cancellation-first clears vehicle proof and makes ride start return `409 stale_revision`; start-first enters `on_trip` and makes cancellation return the same safe conflict. Exactly one command returns 200 and revision 7, the loser receives current revision 7, and replaying the winner does not add a state or audit change. Small injected mock delays control which request reaches the serialized section first; they are test scaffolding, not evidence of production scheduling, database isolation or multi-server locking.
+
+After either race, both the owning passenger and the currently assigned driver read `GET /v1/rides/{requestId}`. Each receives the same current status and revision with a role-specific `nextAction`; unrelated passengers and drivers receive a concealed `404 resource_not_found`. The response uses a six-field allowlist and excludes assignment identifiers, vehicle-confirmation internals, plates, contact details and permit data. Reads do not consume idempotency keys, advance revision or append audit events. This is a recovery contract, not evidence of real authentication, caching, push delivery or cross-device synchronization.
 
 ## Common rules
 
@@ -74,6 +76,15 @@ Acceptance:
 - An exact retry with the same idempotency key returns the original cancellation even when the submitted expected revision is now old.
 - Do not automatically return an assigned driver to on-duty state. No fee is charged by this endpoint unless a separately approved policy and payment flow exists.
 
+### `GET /v1/rides/{requestId}` — owning passenger or assigned driver
+
+Acceptance:
+- Return the latest `id`, `status`, `revision`, trusted `updatedAt`, authenticated `viewerRole` and a role-specific `nextAction` after `stale_revision`, reconnect or foreground resume.
+- The owner may read the passenger view. Only the currently assigned driver may read the driver view, including a retained cancelled assignment needed to show cancellation history.
+- Return `404 resource_not_found` for another passenger or an unassigned driver so ownership and assignment are not disclosed.
+- Do not return actor IDs, contact details, permits, document references, raw or booked plates, confirmation evidence, internal assignment fields or server authorization decisions.
+- The read is side-effect free: it does not change revision, consume an idempotency key or create a command audit event.
+
 ### `POST /v1/rides/{requestId}/vehicle-confirmations` — owning passenger
 
 Input: observed plate, person/car comparison attestations, `expectedRevision`.
@@ -128,5 +139,6 @@ Error bodies contain a stable `code`, safe localized message, `requestId` for su
 9. missing proof or revoked eligibility blocks ride start without advancing state;
 10. fresh confirmation permits only the allowed `arriving -> on_trip -> completed` path.
 11. cancellation/start races in both commit orders have one winner, one stale loser, stable replay and two non-duplicated audit decisions.
+12. both race participants can recover current role-shaped state, while unrelated actors receive a concealed error and reads remain side-effect free.
 
 These are sequential reference-model tests, not proof of database locking, real concurrency, HTTP authentication or cross-device behavior. Claude's production PR must add integration tests that send concurrent commands to the real persistence layer and verify one winner, stable idempotent replay and complete audit events.

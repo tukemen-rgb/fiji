@@ -10,6 +10,7 @@ const OPERATIONS = [
   ['post', '/v1/ride-requests/{requestId}/offers', 'createRideOffer', 'expectedRequestRevision'],
   ['post', '/v1/offers/{offerId}/select', 'selectRideOffer', 'expectedRequestRevision'],
   ['post', '/v1/ride-requests/{requestId}/cancel', 'cancelRideRequest', 'expectedRevision'],
+  ['get', '/v1/rides/{requestId}', 'getRideState', null],
   ['post', '/v1/rides/{requestId}/vehicle-confirmations', 'confirmAssignedVehicle', 'expectedRevision'],
   ['post', '/v1/rides/{requestId}/transitions', 'transitionRide', 'expectedRevision']
 ];
@@ -93,6 +94,15 @@ function validateContract(spec) {
   if (quote?.readOnly !== true || quote?.properties?.selectedAt?.format !== 'date-time') add('selected quote must be a server-owned dated snapshot');
   const revision = spec.components?.schemas?.Revision;
   if (revision?.type !== 'integer' || revision?.minimum !== 1) add('revision must be an integer beginning at 1');
+  const rideState = spec.components?.schemas?.RideStateView;
+  const safeRideStateFields = new Set(['id', 'status', 'revision', 'viewerRole', 'nextAction', 'updatedAt']);
+  if (rideState?.additionalProperties !== false) add('RideStateView must reject unlisted response fields');
+  for (const field of safeRideStateFields) {
+    if (!rideState?.required?.includes(field) || !rideState?.properties?.[field]) add(`RideStateView requires safe field ${field}`);
+  }
+  for (const field of Object.keys(rideState?.properties || {})) {
+    if (!safeRideStateFields.has(field)) add(`RideStateView must not expose private field ${field}`);
+  }
   return errors;
 }
 
@@ -104,7 +114,7 @@ if (require.main === module) {
       console.error(`API contract failed (${errors.length})\n- ${errors.join('\n- ')}`);
       process.exitCode = 1;
     } else {
-      console.log(`API contract OK: ${OPERATIONS.length} operations, authentication, idempotency, revision and safe-input checks`);
+      console.log(`API contract OK: ${OPERATIONS.length} operations, authentication, idempotency, revision, safe-input and recovery-output checks`);
     }
   } catch (error) {
     console.error(`API contract could not be read: ${error.message}`);

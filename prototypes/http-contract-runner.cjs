@@ -60,6 +60,32 @@ function normalizePlate(value) {
   return String(value || '').normalize('NFKC').toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
+function rideStateView(state, actor) {
+  const passengerActions = {
+    collecting: 'compare_offers',
+    assigned: 'track_pickup',
+    arriving: 'confirm_vehicle',
+    on_trip: 'show_on_trip',
+    completed: 'show_completed',
+    cancelled: 'show_cancelled_history'
+  };
+  const driverActions = {
+    assigned: 'start_pickup',
+    arriving: 'wait_for_vehicle_confirmation',
+    on_trip: 'continue_trip',
+    completed: 'show_completed',
+    cancelled: 'show_cancelled_trip'
+  };
+  return {
+    id: state.ride.id,
+    status: state.ride.status,
+    revision: state.ride.revision,
+    viewerRole: actor.role,
+    nextAction: (actor.role === 'passenger' ? passengerActions : driverActions)[state.ride.status],
+    updatedAt: new Date(state.clockMs).toISOString()
+  };
+}
+
 function createMockState(options = {}) {
   const clockMs = options.clockMs ?? Date.parse('2026-09-17T03:00:00Z');
   const rideStatus = options.rideStatus ?? 'collecting';
@@ -154,8 +180,16 @@ function createMockHandler(state = createMockState()) {
     const offersPath = `/v1/ride-requests/${FIXTURE.requestId}/offers`;
     const selectPath = `/v1/offers/${FIXTURE.offerId}/select`;
     const cancelPath = `/v1/ride-requests/${FIXTURE.requestId}/cancel`;
+    const ridePath = `/v1/rides/${FIXTURE.requestId}`;
     const confirmationPath = `/v1/rides/${FIXTURE.requestId}/vehicle-confirmations`;
     const transitionPath = `/v1/rides/${FIXTURE.requestId}/transitions`;
+
+    if (req.method === 'GET' && url.pathname === ridePath) {
+      const ownsRide = actor.role === 'passenger' && actor.id === 'passenger-owner';
+      const isAssignedDriver = actor.role === 'driver' && actor.id === state.ride.assignedDriverId;
+      if (!ownsRide && !isAssignedDriver) return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
+      return send(res, 200, rideStateView(state, actor));
+    }
 
     if (req.method === 'GET' && url.pathname === offersPath) {
       if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
@@ -541,13 +575,34 @@ async function runBoardingRaceCase(winner) {
     if (replay.status !== 200 || JSON.stringify(replay.body) !== JSON.stringify(winningResult.body)) throw new Error(`${winner}-first exact replay was not stable`);
     if (mock.state.ride.revision !== 7 || mock.state.auditEvents.length !== 2) throw new Error(`${winner}-first race changed state or audit more than once`);
     if (winner === 'cancel' && mock.state.ride.vehicleConfirmation !== null) throw new Error('cancellation winner retained vehicle confirmation');
+    const read = token => requestJson(mock.baseUrl, {
+      method: 'GET', path: `/v1/rides/${FIXTURE.requestId}`, token
+    }, fetch);
+    const auditCount = mock.state.auditEvents.length;
+    const storedKeys = mock.state.idempotency.size;
+    const [passenger, driver, otherPassenger, otherDriver] = await Promise.all([
+      read(FIXTURE.tokens.owner),
+      read(FIXTURE.tokens.assignedDriver),
+      read(FIXTURE.tokens.otherPassenger),
+      read(FIXTURE.tokens.otherDriver)
+    ]);
+    if (passenger.status !== 200 || driver.status !== 200) throw new Error(`${winner}-first participants could not recover current ride state`);
+    if (passenger.body.status !== mock.state.ride.status || driver.body.status !== mock.state.ride.status || passenger.body.revision !== 7 || driver.body.revision !== 7) {
+      throw new Error(`${winner}-first recovery returned stale state`);
+    }
+    if (otherPassenger.status !== 404 || otherDriver.status !== 404) throw new Error(`${winner}-first recovery exposed the ride to a non-participant`);
+    if (mock.state.auditEvents.length !== auditCount || mock.state.idempotency.size !== storedKeys || mock.state.ride.revision !== 7) {
+      throw new Error(`${winner}-first recovery read mutated command state`);
+    }
     return {
       winner,
       cancel,
       start,
       replay,
+      recovery: {passenger, driver, otherPassenger, otherDriver},
       state: structuredClone(mock.state.ride),
-      auditEvents: structuredClone(mock.state.auditEvents)
+      auditEvents: structuredClone(mock.state.auditEvents),
+      storedKeys
     };
   } finally {
     await mock.close();
@@ -570,7 +625,7 @@ if (require.main === module) {
     console.log(`HTTP race OK: ${race.winner.command} won, ${race.loser.command} received stale_revision, exact replay was stable, changed replay was rejected`);
     console.log(`HTTP validity OK: ${validity.expired.result.body.code}, exact-boundary expiry, ${validity.ineligible.result.body.code}, client clock rejected, current offer selected`);
     console.log(`HTTP ride safety OK: vehicle mismatch invalidated confirmation, unconfirmed/revoked start blocked, allowed path completed at revision ${rideSafety.state.revision}`);
-    console.log(`HTTP boarding race OK: ${boardingRace.cancelFirst.winner} and ${boardingRace.startFirst.winner} each won their ordered race; every loser received stale_revision`);
+    console.log(`HTTP boarding race OK: ${boardingRace.cancelFirst.winner} and ${boardingRace.startFirst.winner} each won their ordered race; every loser received stale_revision and both participants recovered current state`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);

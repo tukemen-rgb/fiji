@@ -107,6 +107,20 @@
         }
       }
     },
+    "/v1/rides/{requestId}": {
+      "get": {
+        "operationId": "getRideState",
+        "summary": "Read the latest role-shaped ride state after a conflict or reconnect",
+        "tags": ["Passenger", "Driver"],
+        "parameters": [{ "$ref": "#/components/parameters/RequestId" }],
+        "responses": {
+          "200": { "description": "Current state and the viewer's safe next action", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RideStateView" } } } },
+          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/RoleDenied" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
     "/v1/rides/{requestId}/vehicle-confirmations": {
       "post": {
         "operationId": "confirmAssignedVehicle",
@@ -251,6 +265,19 @@
           "createdAt": { "type": "string", "format": "date-time", "readOnly": true },
           "selectedQuote": { "oneOf": [{ "$ref": "#/components/schemas/SelectedQuote" }, { "type": "null" }] },
           "cancelledAt": { "type": ["string", "null"], "format": "date-time", "readOnly": true }
+        }
+      },
+      "RideStateView": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "revision", "viewerRole", "nextAction", "updatedAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "$ref": "#/components/schemas/RideStatus" },
+          "revision": { "$ref": "#/components/schemas/Revision" },
+          "viewerRole": { "type": "string", "enum": ["passenger", "driver"] },
+          "nextAction": { "type": "string", "enum": ["compare_offers", "track_pickup", "confirm_vehicle", "show_on_trip", "show_completed", "show_cancelled_history", "start_pickup", "wait_for_vehicle_confirmation", "continue_trip", "show_cancelled_trip"] },
+          "updatedAt": { "type": "string", "format": "date-time", "readOnly": true }
         }
       },
       "Offer": {

@@ -398,6 +398,9 @@ test('API checker fails closed when safety requirements are removed', () => {
   const missingVehicleError=structuredClone(loadContract());
   missingVehicleError.components.schemas.Error.properties.code.enum=missingVehicleError.components.schemas.Error.properties.code.enum.filter(code=>code!=='vehicle_confirmation_required');
   assert.ok(validateContract(missingVehicleError).some(message=>message.includes('Error code enum requires vehicle_confirmation_required')));
+  const leakedRideState=structuredClone(loadContract());
+  leakedRideState.components.schemas.RideStateView.properties.assignedDriverId={type:'string'};
+  assert.ok(validateContract(leakedRideState).some(message=>message.includes('RideStateView must not expose private field assignedDriverId')));
 });
 test('HTTP contract runner enforces role, ownership, eligibility and safe errors over loopback', async () => {
   const results=await runMockContract();
@@ -573,6 +576,54 @@ test('boarding-race winner replay is stable without duplicate state or audit', a
     const winnerResult=race.winner==='cancel'?race.cancel:race.start;
     assert.deepEqual(race.replay,winnerResult);
     assert.equal(race.state.revision,7);
+    assert.equal(race.auditEvents.length,2);
+    assert.deepEqual(race.auditEvents.map(event=>event.id),['audit-1','audit-2']);
+  }
+});
+test('cancellation-race participants recover role-shaped cancelled state', async () => {
+  const {recovery}= (await boardingRaceResults()).cancelFirst;
+  assert.deepEqual(recovery.passenger,{status:200,body:{
+    id:FIXTURE.requestId,status:'cancelled',revision:7,viewerRole:'passenger',
+    nextAction:'show_cancelled_history',updatedAt:'2026-09-17T03:00:00.000Z'
+  }});
+  assert.deepEqual(recovery.driver,{status:200,body:{
+    id:FIXTURE.requestId,status:'cancelled',revision:7,viewerRole:'driver',
+    nextAction:'show_cancelled_trip',updatedAt:'2026-09-17T03:00:00.000Z'
+  }});
+});
+test('ride-start-race participants recover role-shaped on-trip state', async () => {
+  const {recovery}= (await boardingRaceResults()).startFirst;
+  assert.deepEqual([recovery.passenger.body.status,recovery.passenger.body.revision,recovery.passenger.body.nextAction],['on_trip',7,'show_on_trip']);
+  assert.deepEqual([recovery.driver.body.status,recovery.driver.body.revision,recovery.driver.body.nextAction],['on_trip',7,'continue_trip']);
+  assert.deepEqual([recovery.passenger.body.viewerRole,recovery.driver.body.viewerRole],['passenger','driver']);
+});
+test('recovery read conceals the ride from unrelated passengers and drivers', async () => {
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    for(const result of [race.recovery.otherPassenger,race.recovery.otherDriver]){
+      assert.equal(result.status,404);
+      assert.equal(result.body.code,'resource_not_found');
+      assert.match(result.body.requestId,/^trace-mock-/);
+      assert.ok(!JSON.stringify(result.body).includes('passenger-owner'));
+      assert.ok(!JSON.stringify(result.body).includes('driver-assigned'));
+    }
+  }
+});
+test('recovery response exposes only the documented safe field allowlist', async () => {
+  const safeFields=['id','status','revision','viewerRole','nextAction','updatedAt'];
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    assert.deepEqual(Object.keys(race.recovery.passenger.body),safeFields);
+    assert.deepEqual(Object.keys(race.recovery.driver.body),safeFields);
+    const encoded=JSON.stringify([race.recovery.passenger.body,race.recovery.driver.body]).toLowerCase();
+    for(const forbidden of ['assigneddriverid','vehicleconfirmation','selectedofferid','plate','phone','permit']) assert.ok(!encoded.includes(forbidden),forbidden);
+  }
+});
+test('recovery reads do not advance revision, consume idempotency keys or add audit events', async () => {
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    assert.equal(race.state.revision,7);
+    assert.equal(race.storedKeys,2);
     assert.equal(race.auditEvents.length,2);
     assert.deepEqual(race.auditEvents.map(event=>event.id),['audit-1','audit-2']);
   }
