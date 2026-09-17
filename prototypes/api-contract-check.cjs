@@ -82,6 +82,9 @@ function validateContract(spec) {
 
   const error = spec.components?.schemas?.Error;
   for (const field of ['code', 'message', 'requestId']) if (!error?.required?.includes(field)) add(`Error requires ${field}`);
+  for (const code of ['vehicle_mismatch', 'vehicle_confirmation_required']) {
+    if (!error?.properties?.code?.enum?.includes(code)) add(`Error code enum requires ${code}`);
+  }
   const fare = spec.components?.schemas?.CreateOfferInput?.properties?.fareCents;
   if (fare?.type !== 'integer' || fare?.minimum !== 0) add('fareCents must be a non-negative integer in Fiji cents');
   const zone = spec.components?.schemas?.CreateRideRequestInput?.properties?.pickupTimeZone;

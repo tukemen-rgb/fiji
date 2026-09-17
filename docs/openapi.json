@@ -311,7 +311,7 @@
         "additionalProperties": false,
         "required": ["code", "message", "requestId"],
         "properties": {
-          "code": { "type": "string", "enum": ["authentication_required", "role_or_eligibility_denied", "resource_not_found", "stale_revision", "invalid_transition", "offer_expired", "driver_unavailable", "idempotency_conflict", "invalid_request"] },
+          "code": { "type": "string", "enum": ["authentication_required", "role_or_eligibility_denied", "resource_not_found", "stale_revision", "invalid_transition", "offer_expired", "driver_unavailable", "vehicle_mismatch", "vehicle_confirmation_required", "idempotency_conflict", "invalid_request"] },
           "message": { "type": "string" },
           "requestId": { "type": "string" },
           "revision": { "$ref": "#/components/schemas/Revision" }
@@ -322,7 +322,7 @@
       "AuthenticationRequired": { "description": "No valid session", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "RoleDenied": { "description": "Role or current eligibility denied", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "NotFound": { "description": "Missing or concealed foreign resource", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "Conflict": { "description": "Stale revision, invalid transition, expired offer, unavailable driver or idempotency conflict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Conflict": { "description": "Stale revision, invalid transition, expired offer, unavailable driver, vehicle mismatch, missing current vehicle confirmation or idempotency conflict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "InvalidRequest": { "description": "Field validation failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
     }
   }

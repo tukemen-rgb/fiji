@@ -56,10 +56,21 @@ function actorFrom(req) {
   return match ? ACTORS.get(match[1]) : null;
 }
 
+function normalizePlate(value) {
+  return String(value || '').normalize('NFKC').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
 function createMockState(options = {}) {
   const clockMs = options.clockMs ?? Date.parse('2026-09-17T03:00:00Z');
+  const rideStatus = options.rideStatus ?? 'collecting';
   return {
-    ride: {id: FIXTURE.requestId, status: 'collecting', revision: FIXTURE.revision},
+    ride: {
+      id: FIXTURE.requestId,
+      status: rideStatus,
+      revision: options.rideRevision ?? FIXTURE.revision,
+      assignedDriverId: options.assignedDriverId ?? (rideStatus === 'collecting' ? null : 'driver-assigned'),
+      vehicleConfirmation: null
+    },
     offer: {
       id: FIXTURE.offerId,
       driverId: 'driver-reviewed',
@@ -68,7 +79,11 @@ function createMockState(options = {}) {
       etaMinutes: 7,
       expiresAtMs: options.offerExpiresAtMs ?? clockMs + 15 * 60 * 1000
     },
-    driverEligibility: {'driver-reviewed': options.offerDriverEligible ?? true},
+    driverEligibility: {
+      'driver-reviewed': options.offerDriverEligible ?? true,
+      'driver-assigned': options.assignedDriverEligible ?? true
+    },
+    bookedPlate: normalizePlate(options.bookedPlate ?? 'DEMO 001'),
     clockMs,
     auditEvents: [],
     auditSequence: 0,
@@ -203,12 +218,80 @@ function createMockHandler(state = createMockState()) {
     if (req.method === 'POST' && url.pathname === confirmationPath) {
       if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
       if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      return send(res, 201, {requestId: FIXTURE.requestId, assignmentRevision: FIXTURE.revision, confirmedAt: '2026-09-17T02:00:00Z'});
+      const confirmationFields = ['observedPlate', 'samePerson', 'sameVehicle', 'expectedRevision'];
+      if (Object.keys(body).some(key => !confirmationFields.includes(key)) ||
+          typeof body.observedPlate !== 'string' || !body.observedPlate.trim() ||
+          typeof body.samePerson !== 'boolean' || typeof body.sameVehicle !== 'boolean') {
+        return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
+      }
+      const response = await atomicCommand(state, actor, req, url, body, () => {
+        const fromRevision = state.ride.revision;
+        if (Number(body.expectedRevision) !== fromRevision) {
+          recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'rejected', reason: 'stale_revision', fromRevision, toRevision: fromRevision});
+          return {status: 409, body: {...errorBody('stale_revision', 'The ride changed. Refresh before retrying.', 'stale'), revision: fromRevision}};
+        }
+        if (state.ride.status !== 'arriving' || !state.ride.assignedDriverId) {
+          recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'rejected', reason: 'invalid_transition', fromRevision, toRevision: fromRevision});
+          return {status: 409, body: {...errorBody('invalid_transition', 'Vehicle confirmation is not available in this ride state.', 'transition'), revision: fromRevision}};
+        }
+        if (!state.driverEligibility[state.ride.assignedDriverId]) {
+          recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'rejected', reason: 'driver_unavailable', fromRevision, toRevision: fromRevision});
+          return {status: 409, body: {...errorBody('driver_unavailable', 'The assigned driver is no longer eligible.', 'eligibility'), revision: fromRevision}};
+        }
+        const matches = normalizePlate(body.observedPlate) === state.bookedPlate && body.samePerson && body.sameVehicle;
+        if (!matches) {
+          if (state.ride.vehicleConfirmation) {
+            state.ride.vehicleConfirmation = null;
+            state.ride.revision += 1;
+          }
+          recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'rejected', reason: 'vehicle_mismatch', fromRevision, toRevision: state.ride.revision});
+          return {status: 409, body: {...errorBody('vehicle_mismatch', 'The observed driver or vehicle does not match the booking.', 'vehicle-mismatch'), revision: state.ride.revision}};
+        }
+        const confirmation = {
+          requestId: FIXTURE.requestId,
+          assignmentRevision: fromRevision,
+          confirmedAt: new Date(state.clockMs).toISOString()
+        };
+        state.ride.revision += 1;
+        state.ride.vehicleConfirmation = {...confirmation, validForRevision: state.ride.revision};
+        recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'committed', fromRevision, toRevision: state.ride.revision});
+        return {status: 201, body: confirmation};
+      });
+      return send(res, response.status, response.body);
     }
     if (req.method === 'POST' && url.pathname === transitionPath) {
       if (actor.role !== 'driver') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
-      if (actor.id !== 'driver-assigned') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      return send(res, 200, {id: FIXTURE.requestId, status: body.to, revision: 3});
+      if (actor.id !== state.ride.assignedDriverId) return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
+      const transitionFields = ['from', 'to', 'expectedRevision'];
+      if (Object.keys(body).some(key => !transitionFields.includes(key)) ||
+          typeof body.from !== 'string' || typeof body.to !== 'string') {
+        return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
+      }
+      const response = await atomicCommand(state, actor, req, url, body, () => {
+        const fromRevision = state.ride.revision;
+        if (Number(body.expectedRevision) !== fromRevision) {
+          recordAudit(state, actor, {type: 'ride.transition', outcome: 'rejected', reason: 'stale_revision', fromRevision, toRevision: fromRevision});
+          return {status: 409, body: {...errorBody('stale_revision', 'The ride changed. Refresh before retrying.', 'stale'), revision: fromRevision}};
+        }
+        if (!state.driverEligibility[actor.id]) {
+          recordAudit(state, actor, {type: 'ride.transition', outcome: 'rejected', reason: 'driver_unavailable', fromRevision, toRevision: fromRevision});
+          return {status: 409, body: {...errorBody('driver_unavailable', 'The assigned driver is no longer eligible.', 'eligibility'), revision: fromRevision}};
+        }
+        const next = {assigned: 'arriving', arriving: 'on_trip', on_trip: 'completed'}[state.ride.status];
+        if (body.from !== state.ride.status || body.to !== next) {
+          recordAudit(state, actor, {type: 'ride.transition', outcome: 'rejected', reason: 'invalid_transition', fromRevision, toRevision: fromRevision});
+          return {status: 409, body: {...errorBody('invalid_transition', 'The requested ride transition is not allowed.', 'transition'), revision: fromRevision}};
+        }
+        if (body.to === 'on_trip' && state.ride.vehicleConfirmation?.validForRevision !== fromRevision) {
+          recordAudit(state, actor, {type: 'ride.transition', outcome: 'rejected', reason: 'vehicle_confirmation_required', fromRevision, toRevision: fromRevision});
+          return {status: 409, body: {...errorBody('vehicle_confirmation_required', 'A current vehicle confirmation is required before starting the ride.', 'vehicle-confirmation'), revision: fromRevision}};
+        }
+        state.ride.status = body.to;
+        state.ride.revision += 1;
+        recordAudit(state, actor, {type: 'ride.transition', outcome: 'committed', fromRevision, toRevision: state.ride.revision});
+        return {status: 200, body: {id: state.ride.id, status: state.ride.status, revision: state.ride.revision}};
+      });
+      return send(res, response.status, response.body);
     }
     return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'route'));
   };
@@ -310,7 +393,7 @@ async function runOfferValidityContract() {
 }
 
 async function runMockContract() {
-  const mock = await startMockServer();
+  const mock = await startMockServer({rideStatus: 'assigned', assignedDriverId: 'driver-assigned'});
   try {
     return await runHttpContract(mock.baseUrl);
   } finally {
@@ -354,35 +437,79 @@ async function runConcurrencyContract() {
 }
 
 async function runAuditContract() {
-  const [race, validity] = await Promise.all([runConcurrencyContract(), runOfferValidityContract()]);
+  const [race, validity, rideSafety] = await Promise.all([runConcurrencyContract(), runOfferValidityContract(), runRideSafetyContract()]);
   if (race.auditEvents.length !== 2) throw new Error('concurrent commands and exact replay did not produce exactly two audit events');
   if (race.auditEvents.filter(event => event.outcome === 'committed').length !== 1) throw new Error('race audit did not record exactly one committed command');
   if (race.auditEvents.filter(event => event.reason === 'stale_revision').length !== 1) throw new Error('race audit did not record the stale loser');
   if (validity.expired.auditEvents[0]?.reason !== 'offer_expired') throw new Error('expired selection rejection was not audited');
   if (validity.ineligible.auditEvents[0]?.reason !== 'driver_unavailable') throw new Error('eligibility rejection was not audited');
   if (validity.valid.auditEvents[0]?.outcome !== 'committed') throw new Error('successful selection was not audited');
-  const events = [...race.auditEvents, ...validity.expired.auditEvents, ...validity.ineligible.auditEvents, ...validity.valid.auditEvents];
+  const events = [...race.auditEvents, ...validity.expired.auditEvents, ...validity.ineligible.auditEvents, ...validity.valid.auditEvents, ...rideSafety.auditEvents];
   for (const event of events) {
     if (Object.keys(event).join('|') !== AUDIT_FIELDS.join('|')) throw new Error(`audit event contains unexpected fields: ${Object.keys(event).join(',')}`);
   }
   const encoded = JSON.stringify(events);
   const forbidden = [...Object.values(FIXTURE.tokens), 'Idempotency-Key', 'phone', 'email', 'observedPlate', 'permit', '+679', '@'];
   if (forbidden.some(value => encoded.toLowerCase().includes(value.toLowerCase()))) throw new Error('audit events contain a credential or private input');
-  return {race, validity, events};
+  return {race, validity, rideSafety, events};
+}
+
+async function runRideSafetyContract() {
+  const mock = await startMockServer({rideStatus: 'assigned', rideRevision: 2, assignedDriverId: 'driver-assigned'});
+  const transition = (key, body) => requestJson(mock.baseUrl, {
+    method: 'POST', path: `/v1/rides/${FIXTURE.requestId}/transitions`, token: FIXTURE.tokens.assignedDriver,
+    headers: {'Idempotency-Key': key}, body
+  }, fetch);
+  const confirm = (key, body) => requestJson(mock.baseUrl, {
+    method: 'POST', path: `/v1/rides/${FIXTURE.requestId}/vehicle-confirmations`, token: FIXTURE.tokens.owner,
+    headers: {'Idempotency-Key': key}, body
+  }, fetch);
+  try {
+    const arrivingCommand = {from: 'assigned', to: 'arriving', expectedRevision: 2};
+    const arriving = await transition('ride-arriving-0001', arrivingCommand);
+    const arrivingReplay = await transition('ride-arriving-0001', arrivingCommand);
+    const confirmationCommand = {observedPlate: 'ＤＥＭＯ－００１', samePerson: true, sameVehicle: true, expectedRevision: 3};
+    const confirmation = await confirm('vehicle-confirm-0001', confirmationCommand);
+    const confirmationReplay = await confirm('vehicle-confirm-0001', confirmationCommand);
+    const mismatch = await confirm('vehicle-mismatch-0001', {observedPlate: 'DEMO 999', samePerson: true, sameVehicle: true, expectedRevision: 4});
+    const startWithoutConfirmation = await transition('ride-start-blocked-0001', {from: 'arriving', to: 'on_trip', expectedRevision: 5});
+    const reconfirmation = await confirm('vehicle-reconfirm-0001', {observedPlate: 'DEMO 001', samePerson: true, sameVehicle: true, expectedRevision: 5});
+    mock.state.driverEligibility['driver-assigned'] = false;
+    const revokedDriver = await transition('ride-start-revoked-0001', {from: 'arriving', to: 'on_trip', expectedRevision: 6});
+    mock.state.driverEligibility['driver-assigned'] = true;
+    const started = await transition('ride-start-0001', {from: 'arriving', to: 'on_trip', expectedRevision: 6});
+    const completed = await transition('ride-complete-0001', {from: 'on_trip', to: 'completed', expectedRevision: 7});
+    if (arriving.status !== 200 || arriving.body.revision !== 3 || JSON.stringify(arrivingReplay.body) !== JSON.stringify(arriving.body)) throw new Error('assigned-to-arriving transition or replay failed');
+    if (confirmation.status !== 201 || confirmation.body.assignmentRevision !== 3 || JSON.stringify(confirmationReplay.body) !== JSON.stringify(confirmation.body)) throw new Error('vehicle confirmation or replay failed');
+    if (mismatch.status !== 409 || mismatch.body?.code !== 'vehicle_mismatch' || mismatch.body.revision !== 5) throw new Error('vehicle mismatch did not invalidate current confirmation');
+    if (startWithoutConfirmation.status !== 409 || startWithoutConfirmation.body?.code !== 'vehicle_confirmation_required') throw new Error('ride start was not blocked without current confirmation');
+    if (revokedDriver.status !== 409 || revokedDriver.body?.code !== 'driver_unavailable') throw new Error('ride start did not recheck assigned driver eligibility');
+    if (started.status !== 200 || started.body.status !== 'on_trip' || completed.status !== 200 || completed.body.status !== 'completed') throw new Error('confirmed eligible ride could not complete the allowed transition path');
+    return {
+      arriving, arrivingReplay, confirmation, confirmationReplay, mismatch, startWithoutConfirmation,
+      reconfirmation, revokedDriver, started, completed,
+      state: structuredClone(mock.state.ride),
+      auditEvents: structuredClone(mock.state.auditEvents),
+      storedKeys: mock.state.idempotency.size
+    };
+  } finally {
+    await mock.close();
+  }
 }
 
 if (require.main === module) {
   Promise.all([runMockContract(), runAuditContract()]).then(([results, audit]) => {
-    const {race, validity} = audit;
+    const {race, validity, rideSafety} = audit;
     const denied = results.filter(r => r.status >= 400).length;
     console.log(`HTTP contract OK: ${results.length} scenarios (${denied} safe denials, ${results.length - denied} positive controls)`);
     console.log(`HTTP race OK: ${race.winner.command} won, ${race.loser.command} received stale_revision, exact replay was stable, changed replay was rejected`);
     console.log(`HTTP validity OK: ${validity.expired.result.body.code}, exact-boundary expiry, ${validity.ineligible.result.body.code}, client clock rejected, current offer selected`);
-    console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, one race commit, one stale rejection, no replay duplicate or private input`);
+    console.log(`HTTP ride safety OK: vehicle mismatch invalidated confirmation, unconfirmed/revoked start blocked, allowed path completed at revision ${rideSafety.state.revision}`);
+    console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
     process.exitCode = 1;
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runAuditContract, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runAuditContract, startMockServer};

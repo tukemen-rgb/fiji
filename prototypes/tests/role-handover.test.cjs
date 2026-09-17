@@ -6,11 +6,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runAuditContract} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runAuditContract} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
 function auditedHttpResults() { return auditContract ||= runAuditContract(); }
+let rideSafetyContract;
+function rideSafetyResults() { return rideSafetyContract ||= runRideSafetyContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -391,6 +393,9 @@ test('API checker fails closed when safety requirements are removed', () => {
   const injected=structuredClone(loadContract());
   injected.components.schemas.CreateOfferInput.properties.driverId={type:'string'};
   assert.ok(validateContract(injected).some(message=>message.includes('server-owned driverId')));
+  const missingVehicleError=structuredClone(loadContract());
+  missingVehicleError.components.schemas.Error.properties.code.enum=missingVehicleError.components.schemas.Error.properties.code.enum.filter(code=>code!=='vehicle_confirmation_required');
+  assert.ok(validateContract(missingVehicleError).some(message=>message.includes('Error code enum requires vehicle_confirmation_required')));
 });
 test('HTTP contract runner enforces role, ownership, eligibility and safe errors over loopback', async () => {
   const results=await runMockContract();
@@ -437,7 +442,7 @@ test('server clock rejects an expired offer without changing the ride', async ()
   assert.equal(validity.expired.result.body.code,'offer_expired');
   assert.equal(validity.expired.result.body.revision,2);
   assert.equal(validity.expired.offer.status,'expired');
-  assert.deepEqual(validity.expired.ride,{id:'ride-owner-1',status:'collecting',revision:2});
+  assert.deepEqual(validity.expired.ride,{id:'ride-owner-1',status:'collecting',revision:2,assignedDriverId:null,vehicleConfirmation:null});
 });
 test('offer is expired at the exact server-side expiry boundary', async () => {
   const validity=await runOfferValidityContract();
@@ -494,4 +499,45 @@ test('audit events use only the allowlist and exclude credentials and private re
   for(const forbidden of [...Object.values(FIXTURE.tokens),'idempotency-key','phone','email','observedplate','permit','+679','@']){
     assert.ok(!encoded.includes(forbidden.toLowerCase()),forbidden);
   }
+});
+test('assigned driver transition advances one revision and exact replay changes nothing', async () => {
+  const result=await rideSafetyResults();
+  assert.deepEqual(result.arriving,{status:200,body:{id:FIXTURE.requestId,status:'arriving',revision:3}});
+  assert.deepEqual(result.arrivingReplay,result.arriving);
+  assert.equal(result.auditEvents.filter(event=>event.type==='ride.transition'&&event.fromRevision===2).length,1);
+});
+test('vehicle confirmation normalizes the booked plate and is idempotent', async () => {
+  const result=await rideSafetyResults();
+  assert.equal(result.confirmation.status,201);
+  assert.deepEqual(result.confirmation.body,{requestId:FIXTURE.requestId,assignmentRevision:3,confirmedAt:'2026-09-17T03:00:00.000Z'});
+  assert.deepEqual(result.confirmationReplay,result.confirmation);
+  assert.equal(result.auditEvents.filter(event=>event.type==='vehicle.confirmation'&&event.outcome==='committed').length,2,'initial and fresh reconfirmation only');
+});
+test('a later vehicle mismatch clears proof and advances the revision once', async () => {
+  const result=await rideSafetyResults(),event=result.auditEvents.find(item=>item.reason==='vehicle_mismatch');
+  assert.equal(result.mismatch.status,409);
+  assert.equal(result.mismatch.body.code,'vehicle_mismatch');
+  assert.equal(result.mismatch.body.revision,5);
+  assert.deepEqual([event.fromRevision,event.toRevision],[4,5]);
+});
+test('ride start needs current vehicle proof and current driver eligibility', async () => {
+  const result=await rideSafetyResults();
+  assert.equal(result.startWithoutConfirmation.body.code,'vehicle_confirmation_required');
+  assert.equal(result.startWithoutConfirmation.body.revision,5);
+  assert.equal(result.revokedDriver.body.code,'driver_unavailable');
+  assert.equal(result.revokedDriver.body.revision,6);
+  assert.deepEqual([result.started.body.status,result.started.body.revision],['on_trip',7]);
+  assert.deepEqual([result.completed.body.status,result.completed.body.revision],['completed',8]);
+  assert.equal(result.state.status,'completed');
+  assert.equal(result.state.revision,8);
+});
+test('ride safety audit records decisions without observed plate or replay duplicates', async () => {
+  const result=await rideSafetyResults();
+  assert.equal(result.auditEvents.length,8);
+  assert.deepEqual(result.auditEvents.map(event=>event.id),['audit-1','audit-2','audit-3','audit-4','audit-5','audit-6','audit-7','audit-8']);
+  assert.ok(result.auditEvents.every(event=>Object.keys(event).join('|')===AUDIT_FIELDS.join('|')));
+  const encoded=JSON.stringify(result.auditEvents).toLowerCase();
+  assert.ok(!encoded.includes('demo 001'));
+  assert.ok(!encoded.includes('demo 999'));
+  assert.ok(!encoded.includes('observedplate'));
 });
