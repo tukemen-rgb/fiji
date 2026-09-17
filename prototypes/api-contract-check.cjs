@@ -10,6 +10,7 @@ const OPERATIONS = [
   ['post', '/v1/ride-requests/{requestId}/offers', 'createRideOffer', 'expectedRequestRevision'],
   ['post', '/v1/offers/{offerId}/select', 'selectRideOffer', 'expectedRequestRevision'],
   ['post', '/v1/ride-requests/{requestId}/cancel', 'cancelRideRequest', 'expectedRevision'],
+  ['get', '/v1/rides/current', 'getCurrentRide', null],
   ['get', '/v1/rides/{requestId}', 'getRideState', null],
   ['post', '/v1/rides/{requestId}/vehicle-confirmations', 'confirmAssignedVehicle', 'expectedRevision'],
   ['post', '/v1/rides/{requestId}/transitions', 'transitionRide', 'expectedRevision']
@@ -83,7 +84,7 @@ function validateContract(spec) {
 
   const error = spec.components?.schemas?.Error;
   for (const field of ['code', 'message', 'requestId']) if (!error?.required?.includes(field)) add(`Error requires ${field}`);
-  for (const code of ['vehicle_mismatch', 'vehicle_confirmation_required', 'rate_limited', 'service_unavailable']) {
+  for (const code of ['vehicle_mismatch', 'vehicle_confirmation_required', 'ambiguous_current_ride', 'rate_limited', 'service_unavailable']) {
     if (!error?.properties?.code?.enum?.includes(code)) add(`Error code enum requires ${code}`);
   }
   const fare = spec.components?.schemas?.CreateOfferInput?.properties?.fareCents;
@@ -120,6 +121,26 @@ function validateContract(spec) {
     if (!response) add(`getRideState must document ${code}`);
     else if (!response.headers?.['Retry-After']) add(`getRideState ${code} requires Retry-After header`);
   }
+  const currentPath = spec.paths?.['/v1/rides/current'];
+  const currentRead = currentPath?.get;
+  const currentParameters = parametersFor(spec, currentPath || {}, currentRead || {});
+  if (currentParameters.some(parameter => ['path', 'query'].includes(parameter?.in) || parameter?.name === 'requestId')) {
+    add('getCurrentRide must derive scope from authentication without path or query identifiers');
+  }
+  for (const code of ['200', '204', '409', '422']) {
+    if (!currentRead?.responses?.[code]) add(`getCurrentRide must document ${code}`);
+  }
+  if (currentRead?.responses?.['304']) add('getCurrentRide must return a full startup result instead of 304');
+  if (currentRead?.responses?.['204']?.content) add('getCurrentRide 204 must not define a response body');
+  for (const [code, names] of [['200', ['ETag', 'Cache-Control', 'Vary']], ['204', ['Cache-Control', 'Vary']]]) {
+    const headers = currentRead?.responses?.[code]?.headers || {};
+    for (const name of names) if (!headers[name]) add(`getCurrentRide ${code} requires ${name} header`);
+  }
+  for (const code of ['429', '503']) {
+    const response = resolveRef(spec, currentRead?.responses?.[code]);
+    if (!response) add(`getCurrentRide must document ${code}`);
+    else if (!response.headers?.['Retry-After']) add(`getCurrentRide ${code} requires Retry-After header`);
+  }
   if (spec.components?.headers?.PrivateNoCache?.schema?.const !== 'private, no-cache') add('ride state cache control must be private, no-cache');
   if (spec.components?.headers?.VaryAuthorization?.schema?.const !== 'Authorization') add('ride state response must vary by Authorization');
   return errors;
@@ -133,7 +154,7 @@ if (require.main === module) {
       console.error(`API contract failed (${errors.length})\n- ${errors.join('\n- ')}`);
       process.exitCode = 1;
     } else {
-      console.log(`API contract OK: ${OPERATIONS.length} operations, authentication, idempotency, revision, safe recovery, conditional-read and retry-control checks`);
+      console.log(`API contract OK: ${OPERATIONS.length} operations, authentication, idempotency, revision, safe discovery/recovery, conditional-read and retry-control checks`);
     }
   } catch (error) {
     console.error(`API contract could not be read: ${error.message}`);

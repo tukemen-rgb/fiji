@@ -33,7 +33,7 @@ function errorBody(code, message, suffix = 'error') {
 }
 
 function send(res, status, body, headers = {}) {
-  if (status === 304) {
+  if (status === 204 || status === 304) {
     res.writeHead(status, headers);
     return res.end();
   }
@@ -128,6 +128,7 @@ function createMockState(options = {}) {
     bookedPlate: normalizePlate(options.bookedPlate ?? 'DEMO 001'),
     commandDelays: {...(options.commandDelays || {})},
     recoveryFailures: (options.recoveryFailures || []).map(failure => ({...failure})),
+    duplicateCurrentFor: options.duplicateCurrentFor || null,
     clockMs,
     auditEvents: [],
     auditSequence: 0,
@@ -201,9 +202,25 @@ function createMockHandler(state = createMockState()) {
     const offersPath = `/v1/ride-requests/${FIXTURE.requestId}/offers`;
     const selectPath = `/v1/offers/${FIXTURE.offerId}/select`;
     const cancelPath = `/v1/ride-requests/${FIXTURE.requestId}/cancel`;
+    const currentRidePath = '/v1/rides/current';
     const ridePath = `/v1/rides/${FIXTURE.requestId}`;
     const confirmationPath = `/v1/rides/${FIXTURE.requestId}/vehicle-confirmations`;
     const transitionPath = `/v1/rides/${FIXTURE.requestId}/transitions`;
+
+    if (req.method === 'GET' && url.pathname === currentRidePath) {
+      const headers = {'cache-control': 'private, no-cache', 'vary': 'Authorization'};
+      if (url.searchParams.size) return send(res, 422, errorBody('invalid_request', 'Current ride discovery does not accept ride identifiers.', 'current-input'), headers);
+      const isActive = ['collecting', 'assigned', 'arriving', 'on_trip'].includes(state.ride.status);
+      const ownsRide = actor.role === 'passenger' && actor.id === 'passenger-owner';
+      const isAssignedDriver = actor.role === 'driver' && actor.id === state.ride.assignedDriverId;
+      const candidates = isActive && (ownsRide || isAssignedDriver) ? [state.ride] : [];
+      if (state.duplicateCurrentFor === actor.id && candidates.length) candidates.push({...state.ride, id: 'ride-duplicate-fixture'});
+      if (candidates.length > 1) {
+        return send(res, 409, errorBody('ambiguous_current_ride', 'The current ride could not be selected safely.', 'current-ambiguous'), headers);
+      }
+      if (!candidates.length) return send(res, 204, null, headers);
+      return send(res, 200, rideStateView(state, actor), {...headers, etag: rideStateEtag(state, actor)});
+    }
 
     if (req.method === 'GET' && url.pathname === ridePath) {
       const ownsRide = actor.role === 'passenger' && actor.id === 'passenger-owner';
@@ -771,6 +788,53 @@ async function startMockServer(options = {}) {
   };
 }
 
+async function runCurrentRideDiscoveryContract() {
+  const assigned = await startMockServer({rideStatus: 'assigned', assignedDriverId: 'driver-assigned'});
+  const completed = await startMockServer({rideStatus: 'completed', assignedDriverId: 'driver-assigned'});
+  const cancelled = await startMockServer({rideStatus: 'cancelled', assignedDriverId: 'driver-assigned'});
+  const ambiguous = await startMockServer({rideStatus: 'assigned', assignedDriverId: 'driver-assigned', duplicateCurrentFor: 'passenger-owner'});
+  const read = (baseUrl, token, path = '/v1/rides/current') => requestJson(baseUrl, {
+    method: 'GET', path, token, captureHeaders: true
+  }, fetch);
+  try {
+    const before = {
+      revision: assigned.state.ride.revision,
+      idempotency: assigned.state.idempotency.size,
+      audit: assigned.state.auditEvents.length
+    };
+    const [passenger, driver, otherPassenger, otherDriver, unauthenticated, injectedId, completedPassenger, completedDriver, cancelledPassenger, cancelledDriver, multiple] = await Promise.all([
+      read(assigned.baseUrl, FIXTURE.tokens.owner),
+      read(assigned.baseUrl, FIXTURE.tokens.assignedDriver),
+      read(assigned.baseUrl, FIXTURE.tokens.otherPassenger),
+      read(assigned.baseUrl, FIXTURE.tokens.otherDriver),
+      read(assigned.baseUrl),
+      read(assigned.baseUrl, FIXTURE.tokens.owner, `/v1/rides/current?requestId=${FIXTURE.requestId}`),
+      read(completed.baseUrl, FIXTURE.tokens.owner),
+      read(completed.baseUrl, FIXTURE.tokens.assignedDriver),
+      read(cancelled.baseUrl, FIXTURE.tokens.owner),
+      read(cancelled.baseUrl, FIXTURE.tokens.assignedDriver),
+      read(ambiguous.baseUrl, FIXTURE.tokens.owner)
+    ]);
+    const after = {
+      revision: assigned.state.ride.revision,
+      idempotency: assigned.state.idempotency.size,
+      audit: assigned.state.auditEvents.length
+    };
+    if (passenger.status !== 200 || passenger.body?.viewerRole !== 'passenger') throw new Error('owning passenger could not discover the current ride');
+    if (driver.status !== 200 || driver.body?.viewerRole !== 'driver') throw new Error('assigned driver could not discover the current ride');
+    if ([otherPassenger, otherDriver].some(result => result.status !== 204 || result.body !== null)) throw new Error('unrelated actor learned that another current ride exists');
+    if (unauthenticated.status !== 401) throw new Error('unauthenticated current-ride discovery was not rejected');
+    if (injectedId.status !== 422 || injectedId.body?.code !== 'invalid_request') throw new Error('current-ride discovery accepted a caller-supplied ride identifier');
+    if ([completedPassenger, completedDriver, cancelledPassenger, cancelledDriver].some(result => result.status !== 204 || result.body !== null)) throw new Error('terminal ride was returned as current');
+    if (multiple.status !== 409 || multiple.body?.code !== 'ambiguous_current_ride') throw new Error('ambiguous current rides were not stopped safely');
+    if (JSON.stringify(multiple.body).includes('ride-duplicate-fixture')) throw new Error('ambiguous current-ride error leaked a candidate identifier');
+    if (JSON.stringify(before) !== JSON.stringify(after)) throw new Error('current-ride discovery changed business state');
+    return {passenger, driver, otherPassenger, otherDriver, unauthenticated, injectedId, completedPassenger, completedDriver, cancelledPassenger, cancelledDriver, multiple, before, after};
+  } finally {
+    await Promise.all([assigned.close(), completed.close(), cancelled.close(), ambiguous.close()]);
+  }
+}
+
 async function selectOnFreshMock(options, suffix, body = {expectedRequestRevision: FIXTURE.revision}) {
   const mock = await startMockServer(options);
   try {
@@ -1304,7 +1368,7 @@ async function runCommandRecoveryContract() {
 }
 
 if (require.main === module) {
-  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract(), runCommandRecoveryContract()]).then(([results, audit, retry, notification, commandRecovery]) => {
+  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract(), runCommandRecoveryContract(), runCurrentRideDiscoveryContract()]).then(([results, audit, retry, notification, commandRecovery, currentRide]) => {
     const {race, validity, rideSafety, boardingRace} = audit;
     const merge = runRevisionMergeContract();
     const session = runSessionIsolationContract();
@@ -1321,6 +1385,7 @@ if (require.main === module) {
     console.log(`Session isolation OK: logout and role/account switches cleared cache, cancelled retry, aborted old reads and accepted only ${session.driverState.viewerRole} recovery`);
     console.log(`Command session OK: expired and stale-session results stopped without auto-retry; same raw key separated ${commandSession.accountAScope !== commandSession.accountBScope ? 'by account' : 'incorrectly'}`);
     console.log(`Command recovery OK: applied state skipped replay; unchanged state replayed once; changed/access-lost/stale sessions stopped (${commandRecovery.replayCalls.length} explicit replay)`);
+    console.log(`Current ride discovery OK: ${currentRide.passenger.body.viewerRole}/${currentRide.driver.body.viewerRole} found one active ride; unrelated and terminal viewers received bodyless 204; ambiguity stopped with 409`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -1328,4 +1393,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};

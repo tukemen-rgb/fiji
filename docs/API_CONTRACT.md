@@ -4,7 +4,7 @@ Status: GDP / ChatGPT acceptance contract for Claude's future production impleme
 
 Machine-readable companion: `docs/openapi.json`. Run `node prototypes/api-contract-check.cjs` to check its required operations, authentication, idempotency headers, optimistic revisions, safe input fields, money/time representations and error envelope. This is a static contract check, not an HTTP or backend integration test.
 
-HTTP acceptance runner: `node prototypes/http-contract-runner.cjs`. Its default mode starts ephemeral servers on `127.0.0.1`, sends real HTTP requests, then closes them. Fourteen scenarios cover unauthenticated access, passenger/driver role confusion, pending-driver denial, foreign passenger resources, unassigned-driver transitions, caller-supplied identity, missing idempotency keys and three positive controls. Additional flows cover selection/cancellation races, offer validity, vehicle confirmation, the assigned-to-completed ride path and role-shaped recovery reads after a stale conflict. `runHttpContract(baseUrl, tokens)` is transport-reusable for a future authorized test environment, but no remote base URL or real token is configured or contacted here.
+HTTP acceptance runner: `node prototypes/http-contract-runner.cjs`. Its default mode starts ephemeral servers on `127.0.0.1`, sends real HTTP requests, then closes them. Fourteen scenarios cover unauthenticated access, passenger/driver role confusion, pending-driver denial, foreign passenger resources, unassigned-driver transitions, caller-supplied identity, missing idempotency keys and three positive controls. Additional flows cover selection/cancellation races, offer validity, vehicle confirmation, the assigned-to-completed ride path, role-shaped recovery reads after a stale conflict and authenticated unfinished-ride discovery without a caller-supplied ride ID. `runHttpContract(baseUrl, tokens)` is transport-reusable for a future authorized test environment, but no remote base URL or real token is configured or contacted here.
 
 The same command also sends offer selection and cancellation concurrently from revision 2 with different idempotency keys. Exactly one returns 200 and revision 3; the loser returns `409 stale_revision`. An exact retry of the winner returns the frozen original response without another state change, while the same key with changed content returns `409 idempotency_conflict`. This loopback mock serializes with an in-memory promise lock and stores replay records in a Map; it is executable acceptance behavior, not evidence of database locks, multi-process safety or persistent idempotency storage.
 
@@ -96,6 +96,16 @@ Acceptance:
 - An exact retry with the same idempotency key returns the original cancellation even when the submitted expected revision is now old.
 - Do not automatically return an assigned driver to on-duty state. No fee is charged by this endpoint unless a separately approved policy and payment flow exists.
 
+### `GET /v1/rides/current` — authenticated passenger or driver
+
+Acceptance:
+- Accept no ride ID, account ID or role selector in the path, query or body. Derive the account and role from the authenticated session and search only unfinished rides visible to that actor.
+- Return 200 with the same six-field `RideStateView` used by the scoped read when exactly one unfinished ride exists for the owning passenger or assigned driver.
+- Return bodyless 204 when the authenticated role has no unfinished ride, including when only completed or cancelled records exist. Do not distinguish no record from another account's record.
+- Return `409 ambiguous_current_ride` without candidate IDs when data corruption or a missing uniqueness rule yields multiple unfinished rides. Never select one arbitrarily.
+- Startup discovery needs a complete representation, so it does not accept `If-None-Match` and does not return 304. Use `Cache-Control: private, no-cache` and `Vary: Authorization`; 200 may provide a role-shaped ETag for later scoped reads.
+- Keep the read side-effect free and return bounded `Retry-After` for 429/503. Production must enforce the one-unfinished-ride invariant transactionally; the loopback duplicate fixture is only an executable failure-mode check.
+
 ### `GET /v1/rides/{requestId}` — owning passenger or assigned driver
 
 Acceptance:
@@ -153,6 +163,7 @@ Acceptance:
 | 409 | `vehicle_mismatch` | Observed driver or vehicle does not match the booking; prior proof is invalidated |
 | 409 | `vehicle_confirmation_required` | Ride start lacks a confirmation bound to the current revision |
 | 409 | `idempotency_conflict` | Same key was used for different content |
+| 409 | `ambiguous_current_ride` | More than one unfinished ride matched; no candidate was selected or disclosed |
 | 429 | `rate_limited` | Too many recovery reads; honor bounded `Retry-After` |
 | 503 | `service_unavailable` | Recovery read is temporarily unavailable; honor bounded `Retry-After` |
 | 422 | `invalid_request` | Field validation failed |
@@ -185,5 +196,6 @@ Error bodies contain a stable `code`, safe localized message, `requestId` for su
 20. passenger/driver command feedback uses role-specific safe copy, rejects duplicate activation while pending, locks unresolved/session/conflict outcomes until explicit recovery and clears on role change.
 21. reload/restart recovery stores only a four-field expiring marker, rejects extended/malformed/expired data, never stores identifiers or command material, and resumes as locked reconciliation with `autoResend=false`.
 22. startup reconciliation retains that marker across network/5xx/304 and 401/403 failures, permits one explicit reason-matched reread, rejects in-flight/extra reads, clears on 200/404 and never replays the command.
+23. authenticated current-ride discovery accepts no ride identifier, returns role-shaped 200 for one unfinished ride, bodyless 204 for none, non-disclosing 409 for ambiguity and remains side-effect free.
 
 These are sequential reference-model tests, not proof of database locking, real concurrency, HTTP authentication or cross-device behavior. Claude's production PR must add integration tests that send concurrent commands to the real persistence layer and verify one winner, stable idempotent replay and complete audit events.

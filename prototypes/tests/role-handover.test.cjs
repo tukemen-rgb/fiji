@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
@@ -15,6 +15,8 @@ let rideSafetyContract;
 function rideSafetyResults() { return rideSafetyContract ||= runRideSafetyContract(); }
 let boardingRaceContract;
 function boardingRaceResults() { return boardingRaceContract ||= runBoardingRaceContract(); }
+let currentRideDiscoveryContract;
+function currentRideDiscoveryResults() { return currentRideDiscoveryContract ||= runCurrentRideDiscoveryContract(); }
 let recoveryRetryContract;
 function recoveryRetryResults() { return recoveryRetryContract ||= runRecoveryRetryContract(); }
 let revisionMergeContract;
@@ -616,6 +618,24 @@ test('API checker fails closed when safety requirements are removed', () => {
   delete noRetryAfter.components.responses.ServiceUnavailable.headers['Retry-After'];
   assert.ok(validateContract(noRetryAfter).some(message=>message.includes('getRideState 503 requires Retry-After header')));
 });
+test('current-ride discovery contract derives scope from authentication and fails closed', () => {
+  const spec=loadContract(),operation=spec.paths['/v1/rides/current'].get;
+  assert.equal(operation.operationId,'getCurrentRide');
+  assert.deepEqual(operation.parameters,undefined);
+  assert.ok(operation.responses['200']);
+  assert.ok(operation.responses['204']);
+  assert.ok(operation.responses['409']);
+  assert.equal(operation.responses['304'],undefined);
+  const withRideId=structuredClone(spec);
+  withRideId.paths['/v1/rides/current'].get.parameters=[{name:'requestId',in:'query',required:false,schema:{type:'string'}}];
+  assert.ok(validateContract(withRideId).some(message=>message.includes('without path or query identifiers')));
+  const withoutEmpty=structuredClone(spec);
+  delete withoutEmpty.paths['/v1/rides/current'].get.responses['204'];
+  assert.ok(validateContract(withoutEmpty).some(message=>message.includes('getCurrentRide must document 204')));
+  const conditional=structuredClone(spec);
+  conditional.paths['/v1/rides/current'].get.responses['304']={description:'unsafe empty startup response'};
+  assert.ok(validateContract(conditional).some(message=>message.includes('full startup result instead of 304')));
+});
 test('HTTP contract runner enforces role, ownership, eligibility and safe errors over loopback', async () => {
   const results=await runMockContract();
   assert.equal(results.length,14);
@@ -633,6 +653,51 @@ test('HTTP contract scenarios conceal foreign resources instead of leaking owner
 test('HTTP contract runner fails when a permissive transport returns success for every request', async () => {
   const permissiveFetch=async()=>({status:200,text:async()=>'{}',headers:{get:()=>null}});
   await assert.rejects(runHttpContract('http://mock.invalid',undefined,permissiveFetch),/no session cannot read offers/);
+});
+test('authenticated passenger and assigned driver discover role-shaped current state without a ride ID', async () => {
+  const {passenger,driver}=await currentRideDiscoveryResults();
+  assert.deepEqual([passenger.status,passenger.body.viewerRole,passenger.body.nextAction],[200,'passenger','track_pickup']);
+  assert.deepEqual([driver.status,driver.body.viewerRole,driver.body.nextAction],[200,'driver','start_pickup']);
+  const safeFields=['id','status','revision','viewerRole','nextAction','updatedAt'];
+  assert.deepEqual(Object.keys(passenger.body),safeFields);
+  assert.deepEqual(Object.keys(driver.body),safeFields);
+});
+test('unrelated authenticated actors receive bodyless 204 without foreign ride details', async () => {
+  const {otherPassenger,otherDriver}=await currentRideDiscoveryResults();
+  for(const result of [otherPassenger,otherDriver]){
+    assert.deepEqual([result.status,result.body],[204,null]);
+    assert.equal(result.headers.cacheControl,'private, no-cache');
+    assert.equal(result.headers.vary,'Authorization');
+    assert.equal(result.headers.etag,null);
+  }
+});
+test('completed and cancelled rides are excluded from current-ride discovery', async () => {
+  const {completedPassenger,completedDriver,cancelledPassenger,cancelledDriver}=await currentRideDiscoveryResults();
+  assert.deepEqual([completedPassenger.status,completedPassenger.body],[204,null]);
+  assert.deepEqual([completedDriver.status,completedDriver.body],[204,null]);
+  assert.deepEqual([cancelledPassenger.status,cancelledPassenger.body],[204,null]);
+  assert.deepEqual([cancelledDriver.status,cancelledDriver.body],[204,null]);
+});
+test('multiple unfinished candidates stop with a non-disclosing conflict', async () => {
+  const {multiple}=await currentRideDiscoveryResults();
+  assert.equal(multiple.status,409);
+  assert.equal(multiple.body.code,'ambiguous_current_ride');
+  assert.match(multiple.body.requestId,/^trace-mock-/);
+  assert.ok(!JSON.stringify(multiple.body).includes(FIXTURE.requestId));
+  assert.ok(!JSON.stringify(multiple.body).includes('ride-duplicate-fixture'));
+});
+test('current-ride discovery rejects missing authentication and caller-supplied ride IDs', async () => {
+  const {unauthenticated,injectedId}=await currentRideDiscoveryResults();
+  assert.deepEqual([unauthenticated.status,unauthenticated.body.code],[401,'authentication_required']);
+  assert.deepEqual([injectedId.status,injectedId.body.code],[422,'invalid_request']);
+});
+test('current-ride discovery is a side-effect-free private full read', async () => {
+  const {passenger,driver,before,after}=await currentRideDiscoveryResults();
+  assert.deepEqual(after,before);
+  assert.equal(passenger.headers.cacheControl,'private, no-cache');
+  assert.equal(passenger.headers.vary,'Authorization');
+  assert.match(passenger.headers.etag,/^"[A-Za-z0-9_-]{24}"$/);
+  assert.notEqual(passenger.headers.etag,driver.headers.etag);
 });
 test('concurrent offer selection and cancellation produce exactly one HTTP winner', async () => {
   const race=await runConcurrencyContract();

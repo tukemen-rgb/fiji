@@ -107,6 +107,37 @@
         }
       }
     },
+    "/v1/rides/current": {
+      "get": {
+        "operationId": "getCurrentRide",
+        "summary": "Discover the authenticated viewer's single unfinished ride without a stored ride identifier",
+        "tags": ["Passenger", "Driver"],
+        "responses": {
+          "200": {
+            "description": "The one unfinished ride visible to the authenticated passenger or assigned driver",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/RideStateETag" },
+              "Cache-Control": { "$ref": "#/components/headers/PrivateNoCache" },
+              "Vary": { "$ref": "#/components/headers/VaryAuthorization" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RideStateView" } } }
+          },
+          "204": {
+            "description": "The authenticated viewer has no unfinished ride; no response body",
+            "headers": {
+              "Cache-Control": { "$ref": "#/components/headers/PrivateNoCache" },
+              "Vary": { "$ref": "#/components/headers/VaryAuthorization" }
+            }
+          },
+          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/RoleDenied" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "422": { "$ref": "#/components/responses/InvalidRequest" },
+          "429": { "$ref": "#/components/responses/TooManyRequests" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
     "/v1/rides/{requestId}": {
       "get": {
         "operationId": "getRideState",
@@ -366,7 +397,7 @@
         "additionalProperties": false,
         "required": ["code", "message", "requestId"],
         "properties": {
-          "code": { "type": "string", "enum": ["authentication_required", "role_or_eligibility_denied", "resource_not_found", "stale_revision", "invalid_transition", "offer_expired", "driver_unavailable", "vehicle_mismatch", "vehicle_confirmation_required", "idempotency_conflict", "invalid_request", "rate_limited", "service_unavailable"] },
+          "code": { "type": "string", "enum": ["authentication_required", "role_or_eligibility_denied", "resource_not_found", "stale_revision", "invalid_transition", "offer_expired", "driver_unavailable", "vehicle_mismatch", "vehicle_confirmation_required", "idempotency_conflict", "ambiguous_current_ride", "invalid_request", "rate_limited", "service_unavailable"] },
           "message": { "type": "string" },
           "requestId": { "type": "string" },
           "revision": { "$ref": "#/components/schemas/Revision" }
@@ -379,7 +410,7 @@
       "NotFound": { "description": "Missing or concealed foreign resource", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "TooManyRequests": { "description": "Recovery read rate limit", "headers": { "Retry-After": { "$ref": "#/components/headers/RetryAfter" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "ServiceUnavailable": { "description": "Temporary recovery read outage", "headers": { "Retry-After": { "$ref": "#/components/headers/RetryAfter" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "Conflict": { "description": "Stale revision, invalid transition, expired offer, unavailable driver, vehicle mismatch, missing current vehicle confirmation or idempotency conflict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Conflict": { "description": "Stale revision, invalid transition, expired offer, unavailable driver, vehicle mismatch, missing current vehicle confirmation, ambiguous current ride or idempotency conflict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "InvalidRequest": { "description": "Field validation failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
     }
   }
