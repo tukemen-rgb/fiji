@@ -83,7 +83,7 @@ function validateContract(spec) {
 
   const error = spec.components?.schemas?.Error;
   for (const field of ['code', 'message', 'requestId']) if (!error?.required?.includes(field)) add(`Error requires ${field}`);
-  for (const code of ['vehicle_mismatch', 'vehicle_confirmation_required']) {
+  for (const code of ['vehicle_mismatch', 'vehicle_confirmation_required', 'rate_limited', 'service_unavailable']) {
     if (!error?.properties?.code?.enum?.includes(code)) add(`Error code enum requires ${code}`);
   }
   const fare = spec.components?.schemas?.CreateOfferInput?.properties?.fareCents;
@@ -115,6 +115,11 @@ function validateContract(spec) {
     for (const name of ['ETag', 'Cache-Control', 'Vary']) if (!headers[name]) add(`getRideState ${code} requires ${name} header`);
   }
   if (rideRead?.responses?.['304']?.content) add('getRideState 304 must not define a response body');
+  for (const code of ['429', '503']) {
+    const response = resolveRef(spec, rideRead?.responses?.[code]);
+    if (!response) add(`getRideState must document ${code}`);
+    else if (!response.headers?.['Retry-After']) add(`getRideState ${code} requires Retry-After header`);
+  }
   if (spec.components?.headers?.PrivateNoCache?.schema?.const !== 'private, no-cache') add('ride state cache control must be private, no-cache');
   if (spec.components?.headers?.VaryAuthorization?.schema?.const !== 'Authorization') add('ride state response must vary by Authorization');
   return errors;
@@ -128,7 +133,7 @@ if (require.main === module) {
       console.error(`API contract failed (${errors.length})\n- ${errors.join('\n- ')}`);
       process.exitCode = 1;
     } else {
-      console.log(`API contract OK: ${OPERATIONS.length} operations, authentication, idempotency, revision, safe recovery and conditional-read checks`);
+      console.log(`API contract OK: ${OPERATIONS.length} operations, authentication, idempotency, revision, safe recovery, conditional-read and retry-control checks`);
     }
   } catch (error) {
     console.error(`API contract could not be read: ${error.message}`);

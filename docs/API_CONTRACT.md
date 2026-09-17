@@ -20,6 +20,8 @@ After either race, both the owning passenger and the currently assigned driver r
 
 The recovery read also returns an opaque ETag scoped to the current revision and authenticated viewer role. A matching strong or weak `If-None-Match` returns `304 Not Modified` with no body; an old or other-role validator returns 200 with the current role-shaped body and replacement ETag. Authorization and assignment checks happen before evaluating `If-None-Match`, including the wildcard, so a validator cannot reveal a foreign ride. Both 200 and 304 require `Cache-Control: private, no-cache` and `Vary: Authorization`. This is an executable loopback contract, not evidence of production proxy/CDN behavior, push delivery or cross-device synchronization.
 
+Temporary recovery pressure returns `429 rate_limited` and temporary outage returns `503 service_unavailable`, both with `Retry-After`. The reference client accepts delta-seconds or HTTP dates, clamps server-directed delays to 1–60 seconds, and otherwise uses jittered exponential backoff capped at 30 seconds. It stops after four attempts by default, stops immediately for 401/403/404, and sends no request while the view is hidden. Injected sleep, clock and randomness make these policies deterministic in acceptance tests; they are not evidence of mobile OS scheduling or real network behavior.
+
 ## Common rules
 
 - Prefix examples with `/v1`. HTTPS and authenticated sessions are mandatory in production.
@@ -89,6 +91,8 @@ Acceptance:
 - Return a representation-specific ETag that changes with revision and authenticated viewer role. Do not expose an internal database version, account ID or secret in the tag.
 - Accept optional `If-None-Match`. Evaluate ownership/assignment first; then return bodyless 304 only for the same authorized role-shaped representation. Return 200 and the new ETag for an old or other-role tag.
 - Send `Cache-Control: private, no-cache` and `Vary: Authorization` on both 200 and 304 so shared caches do not reuse authenticated role-specific responses.
+- Return `429 rate_limited` or `503 service_unavailable` with `Retry-After` when recovery should pause. A client must bound both the delay and total attempts, add jitter when using its own exponential backoff, and must not retry 401/403/404 as transient failures.
+- Stop scheduled recovery while the view is hidden or the account no longer has access. Foreground/network resumption must start a fresh authorized conditional read rather than replaying a state-changing command.
 
 ### `POST /v1/rides/{requestId}/vehicle-confirmations` — owning passenger
 
@@ -125,6 +129,8 @@ Acceptance:
 | 409 | `vehicle_mismatch` | Observed driver or vehicle does not match the booking; prior proof is invalidated |
 | 409 | `vehicle_confirmation_required` | Ride start lacks a confirmation bound to the current revision |
 | 409 | `idempotency_conflict` | Same key was used for different content |
+| 429 | `rate_limited` | Too many recovery reads; honor bounded `Retry-After` |
+| 503 | `service_unavailable` | Recovery read is temporarily unavailable; honor bounded `Retry-After` |
 | 422 | `invalid_request` | Field validation failed |
 
 Error bodies contain a stable `code`, safe localized message, `requestId` for support correlation and current `revision` only when the actor is allowed to read the resource. They do not expose permits, document paths, reviewer notes or another account's identifiers.
@@ -146,5 +152,6 @@ Error bodies contain a stable `code`, safe localized message, `requestId` for su
 11. cancellation/start races in both commit orders have one winner, one stale loser, stable replay and two non-duplicated audit decisions.
 12. both race participants can recover current role-shaped state, while unrelated actors receive a concealed error and reads remain side-effect free.
 13. role/revision ETags support strong, weak and wildcard revalidation; old or other-role tags return the current 200 representation, and authorization precedes cache validation.
+14. 429/503 and network failures wait without a tight loop, attempts and delays are bounded, access denials do not retry, and hidden views send no request.
 
 These are sequential reference-model tests, not proof of database locking, real concurrency, HTTP authentication or cross-device behavior. Claude's production PR must add integration tests that send concurrent commands to the real persistence layer and verify one winner, stable idempotent replay and complete audit events.

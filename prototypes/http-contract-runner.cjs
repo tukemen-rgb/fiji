@@ -127,6 +127,7 @@ function createMockState(options = {}) {
     },
     bookedPlate: normalizePlate(options.bookedPlate ?? 'DEMO 001'),
     commandDelays: {...(options.commandDelays || {})},
+    recoveryFailures: (options.recoveryFailures || []).map(failure => ({...failure})),
     clockMs,
     auditEvents: [],
     auditSequence: 0,
@@ -204,6 +205,13 @@ function createMockHandler(state = createMockState()) {
       const ownsRide = actor.role === 'passenger' && actor.id === 'passenger-owner';
       const isAssignedDriver = actor.role === 'driver' && actor.id === state.ride.assignedDriverId;
       if (!ownsRide && !isAssignedDriver) return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
+      const failure = state.recoveryFailures.shift();
+      if (failure) {
+        const code = failure.status === 429 ? 'rate_limited' : 'service_unavailable';
+        const message = failure.status === 429 ? 'Too many recovery requests. Retry later.' : 'Ride recovery is temporarily unavailable.';
+        const headers = failure.retryAfter === undefined ? {} : {'retry-after': String(failure.retryAfter)};
+        return send(res, failure.status, errorBody(code, message, code), headers);
+      }
       const etag = rideStateEtag(state, actor);
       const headers = {'etag': etag, 'cache-control': 'private, no-cache', 'vary': 'Authorization'};
       if (matchesIfNoneMatch(req.headers['if-none-match'], etag)) return send(res, 304, null, headers);
@@ -388,8 +396,67 @@ async function requestJson(baseUrl, scenario, fetchImpl) {
       cacheControl: response.headers.get('cache-control'),
       vary: response.headers.get('vary')
     };
+    const retryAfter = response.headers.get('retry-after');
+    if (retryAfter !== null) result.headers.retryAfter = retryAfter;
   }
   return result;
+}
+
+function parseRetryAfterMs(value, nowMs = Date.now()) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const raw = String(value).trim();
+  let delayMs;
+  if (/^\d+$/.test(raw)) delayMs = Number(raw) * 1000;
+  else {
+    const at = Date.parse(raw);
+    if (!Number.isFinite(at)) return null;
+    delayMs = at - nowMs;
+  }
+  if (!Number.isFinite(delayMs)) return null;
+  return Math.min(60_000, Math.max(1_000, Math.ceil(delayMs)));
+}
+
+function exponentialBackoffMs(retryIndex, random = Math.random) {
+  const base = Math.min(30_000, 1000 * 2 ** retryIndex);
+  const jitter = 0.5 + Math.min(1, Math.max(0, Number(random())));
+  return Math.min(30_000, Math.max(500, Math.round(base * jitter)));
+}
+
+async function fetchRideStateWithRetry(options) {
+  const {
+    baseUrl,
+    token,
+    etag,
+    fetchImpl = fetch,
+    sleep = delay => new Promise(resolve => setTimeout(resolve, delay)),
+    random = Math.random,
+    now = Date.now,
+    isVisible = () => true,
+    maxAttempts = 4
+  } = options;
+  const attempts = [];
+  if (!isVisible()) return {result: null, attempts, stopped: 'hidden'};
+  for (let index = 0; index < maxAttempts; index += 1) {
+    if (!isVisible()) return {result: null, attempts, stopped: 'hidden'};
+    let result;
+    try {
+      result = await requestJson(baseUrl, {
+        method: 'GET', path: `/v1/rides/${FIXTURE.requestId}`, token,
+        headers: etag ? {'If-None-Match': etag} : {}, captureHeaders: true
+      }, fetchImpl);
+    } catch (error) {
+      result = {status: 0, body: null, headers: {retryAfter: null}, error: error.message};
+    }
+    const attempt = {status: result.status, delayMs: null};
+    attempts.push(attempt);
+    if (result.status === 200 || result.status === 304) return {result, attempts, stopped: 'success'};
+    if ([401, 403, 404].includes(result.status)) return {result, attempts, stopped: 'access'};
+    if (![0, 429, 500, 502, 503, 504].includes(result.status)) return {result, attempts, stopped: 'non_retryable'};
+    if (index === maxAttempts - 1) return {result, attempts, stopped: 'exhausted'};
+    attempt.delayMs = parseRetryAfterMs(result.headers?.retryAfter, now()) ?? exponentialBackoffMs(index, random);
+    await sleep(attempt.delayMs);
+  }
+  return {result: null, attempts, stopped: 'exhausted'};
 }
 
 async function runHttpContract(baseUrl, tokens = FIXTURE.tokens, fetchImpl = fetch) {
@@ -661,8 +728,56 @@ async function runBoardingRaceContract() {
   return {cancelFirst, startFirst};
 }
 
+async function runRecoveryRetryContract() {
+  const run = async (serverOptions, clientOptions = {}) => {
+    const mock = await startMockServer({rideStatus: 'arriving', rideRevision: 7, assignedDriverId: 'driver-assigned', ...serverOptions});
+    const delays = [];
+    try {
+      const result = await fetchRideStateWithRetry({
+        baseUrl: mock.baseUrl,
+        token: FIXTURE.tokens.owner,
+        sleep: async delay => { delays.push(delay); },
+        random: () => 0.5,
+        ...clientOptions
+      });
+      return {result, delays, remainingFailures: mock.state.recoveryFailures.length};
+    } finally {
+      await mock.close();
+    }
+  };
+  const [rateLimited, unavailable, exhausted, accessDenied] = await Promise.all([
+    run({recoveryFailures: [{status: 429, retryAfter: '3'}]}),
+    run({recoveryFailures: [{status: 503}, {status: 503}]}),
+    run({recoveryFailures: Array.from({length: 4}, () => ({status: 503, retryAfter: '120'}))}),
+    run({}, {token: FIXTURE.tokens.otherPassenger})
+  ]);
+  let networkCalls = 0;
+  const networkMock = await startMockServer({rideStatus: 'arriving', rideRevision: 7, assignedDriverId: 'driver-assigned'});
+  const networkDelays = [];
+  let network;
+  try {
+    network = await fetchRideStateWithRetry({
+      baseUrl: networkMock.baseUrl,
+      token: FIXTURE.tokens.owner,
+      fetchImpl: (...args) => (++networkCalls === 1 ? Promise.reject(new Error('simulated network failure')) : fetch(...args)),
+      sleep: async delay => { networkDelays.push(delay); },
+      random: () => 0.5
+    });
+  } finally {
+    await networkMock.close();
+  }
+  let hiddenCalls = 0;
+  const hidden = await fetchRideStateWithRetry({
+    baseUrl: 'http://127.0.0.1:1', token: FIXTURE.tokens.owner,
+    fetchImpl: async () => { hiddenCalls += 1; throw new Error('must not fetch while hidden'); },
+    isVisible: () => false,
+    sleep: async () => {}
+  });
+  return {rateLimited, unavailable, exhausted, accessDenied, network: {result: network, delays: networkDelays, calls: networkCalls}, hidden: {result: hidden, calls: hiddenCalls}};
+}
+
 if (require.main === module) {
-  Promise.all([runMockContract(), runAuditContract()]).then(([results, audit]) => {
+  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract()]).then(([results, audit, retry]) => {
     const {race, validity, rideSafety, boardingRace} = audit;
     const denied = results.filter(r => r.status >= 400).length;
     console.log(`HTTP contract OK: ${results.length} scenarios (${denied} safe denials, ${results.length - denied} positive controls)`);
@@ -670,6 +785,7 @@ if (require.main === module) {
     console.log(`HTTP validity OK: ${validity.expired.result.body.code}, exact-boundary expiry, ${validity.ineligible.result.body.code}, client clock rejected, current offer selected`);
     console.log(`HTTP ride safety OK: vehicle mismatch invalidated confirmation, unconfirmed/revoked start blocked, allowed path completed at revision ${rideSafety.state.revision}`);
     console.log(`HTTP boarding race OK: ${boardingRace.cancelFirst.winner} and ${boardingRace.startFirst.winner} each won; role-safe recovery returned current state or an empty conditional 304`);
+    console.log(`HTTP recovery retry OK: Retry-After ${retry.rateLimited.delays[0]}ms, exponential ${retry.unavailable.delays.join('/')}ms, capped and access/visibility stops`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -677,4 +793,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runAuditContract, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runAuditContract, fetchRideStateWithRetry, parseRetryAfterMs, exponentialBackoffMs, startMockServer};

@@ -136,7 +136,9 @@
           },
           "401": { "$ref": "#/components/responses/AuthenticationRequired" },
           "403": { "$ref": "#/components/responses/RoleDenied" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/TooManyRequests" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
         }
       }
     },
@@ -200,7 +202,8 @@
     "headers": {
       "RideStateETag": { "description": "Opaque validator scoped to the ride revision and authenticated viewer role", "schema": { "type": "string" } },
       "PrivateNoCache": { "description": "Prevents shared reuse and requires revalidation", "schema": { "type": "string", "const": "private, no-cache" } },
-      "VaryAuthorization": { "description": "Separates authenticated representations", "schema": { "type": "string", "const": "Authorization" } }
+      "VaryAuthorization": { "description": "Separates authenticated representations", "schema": { "type": "string", "const": "Authorization" } },
+      "RetryAfter": { "description": "Minimum delay before retrying, as delta-seconds or an HTTP date", "schema": { "type": "string", "minLength": 1 } }
     },
     "schemas": {
       "Place": {
@@ -363,7 +366,7 @@
         "additionalProperties": false,
         "required": ["code", "message", "requestId"],
         "properties": {
-          "code": { "type": "string", "enum": ["authentication_required", "role_or_eligibility_denied", "resource_not_found", "stale_revision", "invalid_transition", "offer_expired", "driver_unavailable", "vehicle_mismatch", "vehicle_confirmation_required", "idempotency_conflict", "invalid_request"] },
+          "code": { "type": "string", "enum": ["authentication_required", "role_or_eligibility_denied", "resource_not_found", "stale_revision", "invalid_transition", "offer_expired", "driver_unavailable", "vehicle_mismatch", "vehicle_confirmation_required", "idempotency_conflict", "invalid_request", "rate_limited", "service_unavailable"] },
           "message": { "type": "string" },
           "requestId": { "type": "string" },
           "revision": { "$ref": "#/components/schemas/Revision" }
@@ -374,6 +377,8 @@
       "AuthenticationRequired": { "description": "No valid session", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "RoleDenied": { "description": "Role or current eligibility denied", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "NotFound": { "description": "Missing or concealed foreign resource", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "TooManyRequests": { "description": "Recovery read rate limit", "headers": { "Retry-After": { "$ref": "#/components/headers/RetryAfter" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "ServiceUnavailable": { "description": "Temporary recovery read outage", "headers": { "Retry-After": { "$ref": "#/components/headers/RetryAfter" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "Conflict": { "description": "Stale revision, invalid transition, expired offer, unavailable driver, vehicle mismatch, missing current vehicle confirmation or idempotency conflict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "InvalidRequest": { "description": "Field validation failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
     }

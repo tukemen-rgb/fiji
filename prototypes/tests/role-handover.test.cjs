@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runAuditContract} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
@@ -15,6 +15,8 @@ let rideSafetyContract;
 function rideSafetyResults() { return rideSafetyContract ||= runRideSafetyContract(); }
 let boardingRaceContract;
 function boardingRaceResults() { return boardingRaceContract ||= runBoardingRaceContract(); }
+let recoveryRetryContract;
+function recoveryRetryResults() { return recoveryRetryContract ||= runRecoveryRetryContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -407,6 +409,12 @@ test('API checker fails closed when safety requirements are removed', () => {
   const sharedCache=structuredClone(loadContract());
   sharedCache.components.headers.PrivateNoCache.schema.const='public, max-age=60';
   assert.ok(validateContract(sharedCache).some(message=>message.includes('ride state cache control must be private, no-cache')));
+  const noRateLimit=structuredClone(loadContract());
+  delete noRateLimit.paths['/v1/rides/{requestId}'].get.responses['429'];
+  assert.ok(validateContract(noRateLimit).some(message=>message.includes('getRideState must document 429')));
+  const noRetryAfter=structuredClone(loadContract());
+  delete noRetryAfter.components.responses.ServiceUnavailable.headers['Retry-After'];
+  assert.ok(validateContract(noRetryAfter).some(message=>message.includes('getRideState 503 requires Retry-After header')));
 });
 test('HTTP contract runner enforces role, ownership, eligibility and safe errors over loopback', async () => {
   const results=await runMockContract();
@@ -680,4 +688,52 @@ test('wildcard revalidation occurs only after participant authorization', async 
     assert.equal(race.recovery.wildcardOther.body.code,'resource_not_found');
     assert.equal(race.recovery.wildcardOther.headers.etag,null);
   }
+});
+test('429 recovery honors Retry-After before succeeding', async () => {
+  const {rateLimited}=await recoveryRetryResults();
+  assert.deepEqual(rateLimited.delays,[3000]);
+  assert.deepEqual(rateLimited.result.attempts.map(attempt=>attempt.status),[429,200]);
+  assert.equal(rateLimited.result.stopped,'success');
+  assert.equal(rateLimited.result.result.body.revision,7);
+});
+test('503 recovery uses capped exponential backoff when Retry-After is absent', async () => {
+  const {unavailable}=await recoveryRetryResults();
+  assert.deepEqual(unavailable.delays,[1000,2000]);
+  assert.deepEqual(unavailable.result.attempts.map(attempt=>attempt.status),[503,503,200]);
+  assert.equal(unavailable.result.stopped,'success');
+});
+test('network failure retries with backoff and then recovers', async () => {
+  const {network}=await recoveryRetryResults();
+  assert.equal(network.calls,2);
+  assert.deepEqual(network.delays,[1000]);
+  assert.deepEqual(network.result.attempts.map(attempt=>attempt.status),[0,200]);
+  assert.equal(network.result.stopped,'success');
+});
+test('retry delays and attempts are bounded during a sustained outage', async () => {
+  const {exhausted}=await recoveryRetryResults();
+  assert.deepEqual(exhausted.delays,[60000,60000,60000]);
+  assert.equal(exhausted.result.attempts.length,4);
+  assert.equal(exhausted.result.stopped,'exhausted');
+  assert.ok(exhausted.result.attempts.every(attempt=>attempt.status===503));
+});
+test('access denial stops recovery without retrying or revealing the ride', async () => {
+  const {accessDenied}=await recoveryRetryResults();
+  assert.deepEqual(accessDenied.delays,[]);
+  assert.equal(accessDenied.result.attempts.length,1);
+  assert.equal(accessDenied.result.stopped,'access');
+  assert.equal(accessDenied.result.result.status,404);
+  assert.equal(accessDenied.result.result.body.code,'resource_not_found');
+});
+test('a hidden screen stops recovery before any network request', async () => {
+  const {hidden}=await recoveryRetryResults();
+  assert.equal(hidden.calls,0);
+  assert.deepEqual(hidden.result.attempts,[]);
+  assert.equal(hidden.result.stopped,'hidden');
+});
+test('Retry-After accepts an HTTP date but rejects invalid input and clamps extremes', () => {
+  const now=Date.parse('2026-09-17T03:00:00Z');
+  assert.equal(parseRetryAfterMs('Thu, 17 Sep 2026 03:00:05 GMT',now),5000);
+  assert.equal(parseRetryAfterMs('invalid',now),null);
+  assert.equal(parseRetryAfterMs('0',now),1000);
+  assert.equal(parseRetryAfterMs('999',now),60000);
 });
