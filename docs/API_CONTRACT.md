@@ -24,6 +24,8 @@ Temporary recovery pressure returns `429 rate_limited` and temporary outage retu
 
 Notification and recovery results are merged only by the role-shaped ride `revision`. A lower revision never replaces the current display, regardless of arrival source. An identical same-revision delivery is a no-op; conflicting content at the same revision is not guessed and instead requests a fresh authorized recovery read. A notification that skips one or more revisions is not partially applied; a newer full recovery snapshot may establish the missing state. Ride ID and viewer role must match the current view, and a notification cannot establish the initial trusted baseline. This executable client rule does not prove push, WebSocket or cross-device delivery.
 
+A notification is an untrusted wake-up hint, not a ride representation. Its allowlist is exactly `type`, `rideId` and positive integer `revision`; it must not contain status, route, passenger/driver identity, contact details, fare, ETA, vehicle, plate, permit, document or free-form text. A newer in-scope hint triggers the authenticated `GET /v1/rides/{requestId}` and only that role-shaped response may update the display. Stale, duplicate, invalid or foreign-ride hints do not cause a read. A 401/403/404 recovery result clears cached ride state, while a 304 received for a supposedly newer hint does not fabricate state and remains pending for a later bounded recovery. Push destination authorization and real delivery are not implemented here.
+
 ## Common rules
 
 - Prefix examples with `/v1`. HTTPS and authenticated sessions are mandatory in production.
@@ -96,6 +98,7 @@ Acceptance:
 - Return `429 rate_limited` or `503 service_unavailable` with `Retry-After` when recovery should pause. A client must bound both the delay and total attempts, add jitter when using its own exponential backoff, and must not retry 401/403/404 as transient failures.
 - Stop scheduled recovery while the view is hidden or the account no longer has access. Foreground/network resumption must start a fresh authorized conditional read rather than replaying a state-changing command.
 - Merge notification and recovery results monotonically by `revision`. Ignore older or exact duplicate results, recover on a same-revision conflict or notification gap, and reject another ride or viewer-role representation.
+- Treat Push/WebSocket input only as a three-field non-sensitive hint. Never render it directly; obtain the role-shaped display through this authenticated endpoint and clear cached state if access is lost.
 
 ### `POST /v1/rides/{requestId}/vehicle-confirmations` — owning passenger
 
@@ -157,5 +160,6 @@ Error bodies contain a stable `code`, safe localized message, `requestId` for su
 13. role/revision ETags support strong, weak and wildcard revalidation; old or other-role tags return the current 200 representation, and authorization precedes cache validation.
 14. 429/503 and network failures wait without a tight loop, attempts and delays are bounded, access denials do not retry, and hidden views send no request.
 15. delayed notifications or recovery responses cannot roll state backward; duplicates are no-ops, same-revision conflicts and notification gaps require recovery, and cross-ride/cross-role input is rejected.
+16. notification hints allow only type/ride ID/revision, reject private or display fields, avoid reads for stale/foreign hints, and derive all visible state from an authorized recovery response.
 
 These are sequential reference-model tests, not proof of database locking, real concurrency, HTTP authentication or cross-device behavior. Claude's production PR must add integration tests that send concurrent commands to the real persistence layer and verify one winner, stable idempotent replay and complete audit events.

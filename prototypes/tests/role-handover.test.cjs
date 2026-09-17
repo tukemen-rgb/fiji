@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
@@ -19,6 +19,8 @@ let recoveryRetryContract;
 function recoveryRetryResults() { return recoveryRetryContract ||= runRecoveryRetryContract(); }
 let revisionMergeContract;
 function revisionMergeResults() { return revisionMergeContract ||= runRevisionMergeContract(); }
+let notificationHintContract;
+function notificationHintResults() { return notificationHintContract ||= runNotificationHintContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -795,4 +797,56 @@ test('cross-ride, cross-role and notification-only baselines never enter the cur
   assert.equal(recoveredBaseline.applied,true);
   assert.equal(recoveredBaseline.reason,'baseline');
   assert.equal(recoveredBaseline.state.revision,8);
+});
+test('a minimal notification hint obtains display state only from an authorized recovery read', async () => {
+  const {authorized}=await notificationHintResults();
+  assert.equal(authorized.calls,1);
+  assert.deepEqual(authorized.recoveredFrom,{type:'ride.changed',rideId:FIXTURE.requestId,revision:9});
+  assert.equal(authorized.fetched,true);
+  assert.equal(authorized.applied,true);
+  assert.equal(authorized.state.revision,9);
+  assert.equal(authorized.state.status,'on_trip');
+  assert.equal(authorized.state.nextAction,'show_on_trip');
+});
+test('notification payloads containing private or display fields are rejected without a read', async () => {
+  const {sensitive,rejectedCalls}=await notificationHintResults();
+  assert.equal(rejectedCalls,0);
+  assert.equal(sensitive.fetched,false);
+  assert.equal(sensitive.applied,false);
+  assert.equal(sensitive.reason,'invalid_hint');
+  assert.equal(sensitive.state.status,'cancelled');
+});
+test('stale, duplicate and foreign ride hints do not trigger recovery traffic', async () => {
+  const {stale,duplicate,foreign,rejectedCalls}=await notificationHintResults();
+  assert.equal(rejectedCalls,0);
+  assert.deepEqual([stale.reason,duplicate.reason,foreign.reason],['stale_or_duplicate_hint','stale_or_duplicate_hint','foreign_hint']);
+  for(const result of [stale,duplicate,foreign]){
+    assert.equal(result.fetched,false);
+    assert.equal(result.state.revision,8);
+  }
+});
+test('an authorized 404 clears cached ride state after access is lost', async () => {
+  const {accessLost}=await notificationHintResults();
+  assert.equal(accessLost.fetched,true);
+  assert.equal(accessLost.reason,'access_lost');
+  assert.equal(accessLost.state,null);
+  assert.equal(accessLost.needsRecovery,false);
+});
+test('a newer hint with a 304 response never fabricates the hinted state', async () => {
+  const {notYetVisible}=await notificationHintResults();
+  assert.equal(notYetVisible.fetched,true);
+  assert.equal(notYetVisible.applied,false);
+  assert.equal(notYetVisible.reason,'hint_not_yet_visible');
+  assert.equal(notYetVisible.needsRecovery,true);
+  assert.equal(notYetVisible.state.revision,8);
+  assert.equal(notYetVisible.state.status,'cancelled');
+});
+test('a notification can request but cannot itself establish an initial display baseline', async () => {
+  const {initial}=await notificationHintResults();
+  assert.equal(initial.fetched,true);
+  assert.equal(initial.applied,true);
+  assert.equal(initial.reason,'baseline');
+  assert.equal(initial.state.revision,4);
+  assert.equal(initial.state.status,'assigned');
+  assert.equal(initial.state.viewerRole,'passenger');
 });

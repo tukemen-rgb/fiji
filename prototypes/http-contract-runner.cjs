@@ -499,6 +499,47 @@ function mergeRideStateUpdate(current, incoming, source = 'notification') {
   return {state: structuredClone(incoming), applied: true, reason: source, needsRecovery: false};
 }
 
+const RIDE_NOTIFICATION_FIELDS = Object.freeze(['type', 'rideId', 'revision']);
+const RIDE_NOTIFICATION_TYPES = new Set(['ride.changed', 'ride.access_changed']);
+
+function parseRideNotificationHint(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== RIDE_NOTIFICATION_FIELDS.length || keys.some(key => !RIDE_NOTIFICATION_FIELDS.includes(key))) return null;
+  if (!RIDE_NOTIFICATION_TYPES.has(value.type) || typeof value.rideId !== 'string' || !value.rideId ||
+      !Number.isInteger(value.revision) || value.revision < 1) return null;
+  return Object.freeze({type: value.type, rideId: value.rideId, revision: value.revision});
+}
+
+async function handleRideNotificationHint(options) {
+  const {current, hint: rawHint, recover, expectedRideId, expectedViewerRole} = options;
+  const hint = parseRideNotificationHint(rawHint);
+  if (!hint) return {state: current, fetched: false, applied: false, reason: 'invalid_hint', needsRecovery: false};
+  const scopedRideId = current?.id ?? expectedRideId;
+  const scopedRole = current?.viewerRole ?? expectedViewerRole;
+  if (!scopedRideId || hint.rideId !== scopedRideId) {
+    return {state: current, fetched: false, applied: false, reason: 'foreign_hint', needsRecovery: false};
+  }
+  if (current && hint.revision <= current.revision) {
+    return {state: current, fetched: false, applied: false, reason: 'stale_or_duplicate_hint', needsRecovery: false};
+  }
+  const response = await recover({rideId: hint.rideId, revision: hint.revision, type: hint.type});
+  if ([401, 403, 404].includes(response?.status)) {
+    return {state: null, fetched: true, applied: false, reason: 'access_lost', needsRecovery: false};
+  }
+  if (response?.status === 304) {
+    return {state: current, fetched: true, applied: false, reason: 'hint_not_yet_visible', needsRecovery: true};
+  }
+  if (response?.status !== 200 || !response.body) {
+    return {state: current, fetched: true, applied: false, reason: 'recovery_failed', needsRecovery: true};
+  }
+  if (response.body.id !== scopedRideId || (scopedRole && response.body.viewerRole !== scopedRole)) {
+    return {state: current, fetched: true, applied: false, reason: 'recovery_scope_mismatch', needsRecovery: false};
+  }
+  const merged = mergeRideStateUpdate(current, response.body, 'recovery');
+  return {...merged, fetched: true};
+}
+
 async function runHttpContract(baseUrl, tokens = FIXTURE.tokens, fetchImpl = fetch) {
   const results = [];
   for (const scenario of scenarios(tokens)) {
@@ -855,8 +896,54 @@ function runRevisionMergeContract() {
   return {base, newerNotification, delayedRecovery, newerRecovery, delayedNotification, firstDelivery, duplicate, conflicting, gap, gapRecovery, wrongRide, wrongRole, missingBaseline, recoveredBaseline};
 }
 
+async function runNotificationHintContract() {
+  const snapshot = (revision, status, nextAction, overrides = {}) => ({
+    id: FIXTURE.requestId,
+    status,
+    revision,
+    viewerRole: 'passenger',
+    nextAction,
+    updatedAt: new Date(Date.parse('2026-09-17T03:00:00Z') + revision * 1000).toISOString(),
+    ...overrides
+  });
+  const base = snapshot(8, 'cancelled', 'show_cancelled_history');
+  const changedHint = {type: 'ride.changed', rideId: FIXTURE.requestId, revision: 9};
+  let authorizedCalls = 0;
+  let recoveredFrom;
+  const authorized = await handleRideNotificationHint({
+    current: base,
+    hint: changedHint,
+    recover: async hint => {
+      authorizedCalls += 1;
+      recoveredFrom = hint;
+      return {status: 200, body: snapshot(9, 'on_trip', 'show_on_trip')};
+    }
+  });
+
+  let rejectedCalls = 0;
+  const sensitive = await handleRideNotificationHint({
+    current: base,
+    hint: {...changedHint, status: 'on_trip', fareCents: 2300, driverId: 'driver-assigned', plate: 'DEMO 001'},
+    recover: async () => { rejectedCalls += 1; return {status: 500}; }
+  });
+  const stale = await handleRideNotificationHint({current: base, hint: {...changedHint, revision: 7}, recover: async () => { rejectedCalls += 1; return {status: 500}; }});
+  const duplicate = await handleRideNotificationHint({current: base, hint: {...changedHint, revision: 8}, recover: async () => { rejectedCalls += 1; return {status: 500}; }});
+  const foreign = await handleRideNotificationHint({current: base, hint: {...changedHint, rideId: 'ride-foreign'}, recover: async () => { rejectedCalls += 1; return {status: 500}; }});
+
+  const accessLost = await handleRideNotificationHint({current: base, hint: changedHint, recover: async () => ({status: 404, body: errorBody('resource_not_found', 'Resource was not found.', 'hidden')})});
+  const notYetVisible = await handleRideNotificationHint({current: base, hint: changedHint, recover: async () => ({status: 304, body: null})});
+  const initial = await handleRideNotificationHint({
+    current: null,
+    expectedRideId: FIXTURE.requestId,
+    expectedViewerRole: 'passenger',
+    hint: {...changedHint, revision: 4},
+    recover: async () => ({status: 200, body: snapshot(4, 'assigned', 'track_pickup')})
+  });
+  return {base, authorized: {...authorized, calls: authorizedCalls, recoveredFrom}, sensitive, stale, duplicate, foreign, rejectedCalls, accessLost, notYetVisible, initial};
+}
+
 if (require.main === module) {
-  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract()]).then(([results, audit, retry]) => {
+  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract()]).then(([results, audit, retry, notification]) => {
     const {race, validity, rideSafety, boardingRace} = audit;
     const merge = runRevisionMergeContract();
     const denied = results.filter(r => r.status >= 400).length;
@@ -867,6 +954,7 @@ if (require.main === module) {
     console.log(`HTTP boarding race OK: ${boardingRace.cancelFirst.winner} and ${boardingRace.startFirst.winner} each won; role-safe recovery returned current state or an empty conditional 304`);
     console.log(`HTTP recovery retry OK: Retry-After ${retry.rateLimited.delays[0]}ms, exponential ${retry.unavailable.delays.join('/')}ms, capped and access/visibility stops`);
     console.log(`Client revision merge OK: revision ${merge.newerNotification.state.revision} resisted delayed recovery, gaps/conflicts requested recovery, scope mismatches were rejected`);
+    console.log(`Notification hint OK: ${notification.authorized.calls} authorized recovery applied revision ${notification.authorized.state.revision}; private, stale and foreign hints made ${notification.rejectedCalls} requests`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -874,4 +962,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
