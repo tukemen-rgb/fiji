@@ -1,0 +1,329 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Fiji role-separated taxi API acceptance contract",
+    "version": "0.1.0",
+    "description": "Machine-readable acceptance boundary for the GDP prototype and Claude production implementation. This document does not indicate that a backend or regulator integration exists."
+  },
+  "servers": [
+    { "url": "https://api.example.invalid", "description": "Placeholder only; no production endpoint is connected" }
+  ],
+  "security": [{ "sessionAuth": [] }],
+  "paths": {
+    "/v1/ride-requests": {
+      "post": {
+        "operationId": "createRideRequest",
+        "summary": "Create or replace the authenticated passenger's collecting request",
+        "tags": ["Passenger"],
+        "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateRideRequestInput" } } }
+        },
+        "responses": {
+          "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RideRequest" } } } },
+          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/RoleDenied" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "422": { "$ref": "#/components/responses/InvalidRequest" }
+        }
+      }
+    },
+    "/v1/ride-requests/{requestId}/offers": {
+      "parameters": [{ "$ref": "#/components/parameters/RequestId" }],
+      "get": {
+        "operationId": "listRideOffers",
+        "summary": "List currently selectable offers for the owning passenger",
+        "tags": ["Passenger"],
+        "responses": {
+          "200": { "description": "Current offers and unavailable-count summary", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OfferList" } } } },
+          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/RoleDenied" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "operationId": "createRideOffer",
+        "summary": "Submit a new time-limited offer as the authenticated eligible driver",
+        "tags": ["Driver"],
+        "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateOfferInput" } } }
+        },
+        "responses": {
+          "201": { "description": "Offer created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Offer" } } } },
+          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/RoleDenied" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "422": { "$ref": "#/components/responses/InvalidRequest" }
+        }
+      }
+    },
+    "/v1/offers/{offerId}/select": {
+      "post": {
+        "operationId": "selectRideOffer",
+        "summary": "Atomically select an offer as the owning passenger",
+        "tags": ["Passenger"],
+        "parameters": [
+          { "$ref": "#/components/parameters/OfferId" },
+          { "$ref": "#/components/parameters/IdempotencyKey" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SelectOfferInput" } } }
+        },
+        "responses": {
+          "200": { "description": "Assigned request with immutable selected quote", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RideRequest" } } } },
+          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/RoleDenied" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "422": { "$ref": "#/components/responses/InvalidRequest" }
+        }
+      }
+    },
+    "/v1/ride-requests/{requestId}/cancel": {
+      "post": {
+        "operationId": "cancelRideRequest",
+        "summary": "Cancel a pre-boarding request as the owning passenger",
+        "tags": ["Passenger"],
+        "parameters": [
+          { "$ref": "#/components/parameters/RequestId" },
+          { "$ref": "#/components/parameters/IdempotencyKey" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CancelRideInput" } } }
+        },
+        "responses": {
+          "200": { "description": "Cancelled request with preserved history", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RideRequest" } } } },
+          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/RoleDenied" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "422": { "$ref": "#/components/responses/InvalidRequest" }
+        }
+      }
+    },
+    "/v1/rides/{requestId}/vehicle-confirmations": {
+      "post": {
+        "operationId": "confirmAssignedVehicle",
+        "summary": "Record the owning passenger's current booked-driver and vehicle comparison",
+        "tags": ["Passenger"],
+        "parameters": [
+          { "$ref": "#/components/parameters/RequestId" },
+          { "$ref": "#/components/parameters/IdempotencyKey" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VehicleConfirmationInput" } } }
+        },
+        "responses": {
+          "201": { "description": "Confirmation bound to the current assignment", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VehicleConfirmation" } } } },
+          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/RoleDenied" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "422": { "$ref": "#/components/responses/InvalidRequest" }
+        }
+      }
+    },
+    "/v1/rides/{requestId}/transitions": {
+      "post": {
+        "operationId": "transitionRide",
+        "summary": "Advance an assigned ride as the authenticated assigned driver",
+        "tags": ["Driver"],
+        "parameters": [
+          { "$ref": "#/components/parameters/RequestId" },
+          { "$ref": "#/components/parameters/IdempotencyKey" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransitionRideInput" } } }
+        },
+        "responses": {
+          "200": { "description": "Updated ride", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RideRequest" } } } },
+          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/RoleDenied" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "422": { "$ref": "#/components/responses/InvalidRequest" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "sessionAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "opaque-session-token" }
+    },
+    "parameters": {
+      "RequestId": { "name": "requestId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+      "OfferId": { "name": "offerId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+      "IdempotencyKey": { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string", "minLength": 16, "maxLength": 128 } }
+    },
+    "schemas": {
+      "Place": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference", "label"],
+        "properties": {
+          "reference": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "label": { "type": "string", "minLength": 1, "maxLength": 200 }
+        }
+      },
+      "CreateRideRequestInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pickup", "dropoff", "airport", "passengers", "language", "paymentPreference", "pickupAt", "pickupTimeZone"],
+        "properties": {
+          "pickup": { "$ref": "#/components/schemas/Place" },
+          "dropoff": { "$ref": "#/components/schemas/Place" },
+          "airport": { "type": "boolean" },
+          "passengers": { "type": "integer", "minimum": 1, "maximum": 4 },
+          "language": { "type": "string", "enum": ["ja", "en"] },
+          "paymentPreference": { "type": "string", "enum": ["cash", "card"] },
+          "pickupAt": { "type": ["string", "null"], "format": "date-time" },
+          "pickupTimeZone": { "type": "string", "const": "Pacific/Fiji" }
+        }
+      },
+      "CreateOfferInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["fareCents", "etaMinutes", "expectedRequestRevision"],
+        "properties": {
+          "fareCents": { "type": "integer", "minimum": 0 },
+          "etaMinutes": { "type": "integer", "minimum": 1, "maximum": 240 },
+          "expectedRequestRevision": { "$ref": "#/components/schemas/Revision" }
+        }
+      },
+      "SelectOfferInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["expectedRequestRevision"],
+        "properties": { "expectedRequestRevision": { "$ref": "#/components/schemas/Revision" } }
+      },
+      "CancelRideInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["expectedRevision", "reason"],
+        "properties": {
+          "expectedRevision": { "$ref": "#/components/schemas/Revision" },
+          "reason": { "type": "string", "enum": ["passenger_requested", "route_changed", "schedule_changed"] }
+        }
+      },
+      "VehicleConfirmationInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["observedPlate", "samePerson", "sameVehicle", "expectedRevision"],
+        "properties": {
+          "observedPlate": { "type": "string", "minLength": 1, "maxLength": 24 },
+          "samePerson": { "type": "boolean" },
+          "sameVehicle": { "type": "boolean" },
+          "expectedRevision": { "$ref": "#/components/schemas/Revision" }
+        }
+      },
+      "TransitionRideInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from", "to", "expectedRevision"],
+        "properties": {
+          "from": { "$ref": "#/components/schemas/RideStatus" },
+          "to": { "$ref": "#/components/schemas/RideStatus" },
+          "expectedRevision": { "$ref": "#/components/schemas/Revision" }
+        }
+      },
+      "Revision": { "type": "integer", "minimum": 1 },
+      "RideStatus": { "type": "string", "enum": ["collecting", "assigned", "arriving", "on_trip", "completed", "cancelled"] },
+      "RideRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "revision", "pickup", "dropoff", "pickupAt", "pickupTimeZone", "createdAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "$ref": "#/components/schemas/RideStatus" },
+          "revision": { "$ref": "#/components/schemas/Revision" },
+          "pickup": { "$ref": "#/components/schemas/Place" },
+          "dropoff": { "$ref": "#/components/schemas/Place" },
+          "pickupAt": { "type": ["string", "null"], "format": "date-time" },
+          "pickupTimeZone": { "type": "string", "const": "Pacific/Fiji" },
+          "createdAt": { "type": "string", "format": "date-time", "readOnly": true },
+          "selectedQuote": { "oneOf": [{ "$ref": "#/components/schemas/SelectedQuote" }, { "type": "null" }] },
+          "cancelledAt": { "type": ["string", "null"], "format": "date-time", "readOnly": true }
+        }
+      },
+      "Offer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "requestId", "fareCents", "etaMinutes", "status", "expiresAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "requestId": { "type": "string" },
+          "fareCents": { "type": "integer", "minimum": 0 },
+          "etaMinutes": { "type": "integer", "minimum": 1 },
+          "status": { "type": "string", "enum": ["active", "selected", "expired", "unavailable"] },
+          "expiresAt": { "type": "string", "format": "date-time", "readOnly": true }
+        }
+      },
+      "OfferList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["offers", "summary"],
+        "properties": {
+          "offers": { "type": "array", "items": { "$ref": "#/components/schemas/Offer" } },
+          "summary": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["active", "expired", "unavailable"],
+            "properties": {
+              "active": { "type": "integer", "minimum": 0 },
+              "expired": { "type": "integer", "minimum": 0 },
+              "unavailable": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      },
+      "SelectedQuote": {
+        "type": "object",
+        "additionalProperties": false,
+        "readOnly": true,
+        "required": ["fareCents", "etaMinutes", "pickupAt", "selectedAt"],
+        "properties": {
+          "fareCents": { "type": "integer", "minimum": 0 },
+          "etaMinutes": { "type": "integer", "minimum": 1 },
+          "pickupAt": { "type": ["string", "null"], "format": "date-time" },
+          "selectedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "VehicleConfirmation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["requestId", "assignmentRevision", "confirmedAt"],
+        "properties": {
+          "requestId": { "type": "string" },
+          "assignmentRevision": { "$ref": "#/components/schemas/Revision" },
+          "confirmedAt": { "type": "string", "format": "date-time", "readOnly": true }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message", "requestId"],
+        "properties": {
+          "code": { "type": "string", "enum": ["authentication_required", "role_or_eligibility_denied", "resource_not_found", "stale_revision", "invalid_transition", "offer_expired", "driver_unavailable", "idempotency_conflict", "invalid_request"] },
+          "message": { "type": "string" },
+          "requestId": { "type": "string" },
+          "revision": { "$ref": "#/components/schemas/Revision" }
+        }
+      }
+    },
+    "responses": {
+      "AuthenticationRequired": { "description": "No valid session", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "RoleDenied": { "description": "Role or current eligibility denied", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "NotFound": { "description": "Missing or concealed foreign resource", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Conflict": { "description": "Stale revision, invalid transition, expired offer, unavailable driver or idempotency conflict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "InvalidRequest": { "description": "Field validation failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    }
+  }
+}

@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 function setup() {
@@ -350,4 +351,41 @@ test('a stale driver transition cannot skip a newer trip state', () => {
   const {m,ride}=selected(); assert.equal(ride.revision,2);
   m.useReviewedFixture(); m.advanceTrip(ride.id,2); assert.equal(ride.status,'arriving'); assert.equal(ride.revision,3);
   assert.throws(()=>m.advanceTrip(ride.id,2),/別の画面で更新/); assert.equal(ride.status,'arriving');
+});
+
+test('machine-readable API contract passes the executable acceptance checker', () => {
+  assert.deepEqual(validateContract(loadContract()),[]);
+});
+test('API contract enumerates every passenger and driver operation exactly once', () => {
+  const spec=loadContract(),ids=[];
+  for(const [method,route,id] of OPERATIONS){assert.equal(spec.paths[route][method].operationId,id);ids.push(id);}
+  assert.equal(new Set(ids).size,OPERATIONS.length);
+});
+test('all state-changing API commands require an idempotency key', () => {
+  const spec=loadContract();
+  for(const [method,route,id] of OPERATIONS.filter(([method])=>method==='post')){
+    const pathItem=spec.paths[route],parameters=[...(pathItem.parameters||[]),...(pathItem[method].parameters||[])];
+    const resolved=parameters.map(p=>p.$ref?spec.components.parameters[p.$ref.split('/').at(-1)]:p);
+    assert.ok(resolved.some(p=>p.name==='Idempotency-Key'&&p.in==='header'&&p.required),id);
+  }
+});
+test('API inputs never accept caller-controlled actor or approval fields', () => {
+  const text=JSON.stringify(loadContract().components.schemas);
+  for(const field of ['passengerId','driverId','reviewerId','approved','eligible','reviewStatus']) assert.ok(!text.includes(`\"${field}\"`),field);
+});
+test('API contract fixes money, revision and scheduled pickup representations', () => {
+  const schemas=loadContract().components.schemas;
+  assert.deepEqual(schemas.Revision,{type:'integer',minimum:1});
+  assert.equal(schemas.CreateOfferInput.properties.fareCents.type,'integer');
+  assert.equal(schemas.CreateRideRequestInput.properties.pickupAt.format,'date-time');
+  assert.equal(schemas.CreateRideRequestInput.properties.pickupTimeZone.const,'Pacific/Fiji');
+  assert.equal(schemas.SelectedQuote.readOnly,true);
+});
+test('API checker fails closed when safety requirements are removed', () => {
+  const noKey=structuredClone(loadContract());
+  noKey.paths['/v1/offers/{offerId}/select'].post.parameters=noKey.paths['/v1/offers/{offerId}/select'].post.parameters.filter(p=>!p.$ref.endsWith('/IdempotencyKey'));
+  assert.ok(validateContract(noKey).some(message=>message.includes('selectRideOffer requires Idempotency-Key')));
+  const injected=structuredClone(loadContract());
+  injected.components.schemas.CreateOfferInput.properties.driverId={type:'string'};
+  assert.ok(validateContract(injected).some(message=>message.includes('server-owned driverId')));
 });

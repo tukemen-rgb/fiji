@@ -2,6 +2,8 @@
 
 Status: GDP / ChatGPT acceptance contract for Claude's future production implementation. No backend, authentication provider, database, notification service, payment service or regulator connection is implemented by this document.
 
+Machine-readable companion: `docs/openapi.json`. Run `node prototypes/api-contract-check.cjs` to check its required operations, authentication, idempotency headers, optimistic revisions, safe input fields, money/time representations and error envelope. This is a static contract check, not an HTTP or backend integration test.
+
 ## Common rules
 
 - Prefix examples with `/v1`. HTTPS and authenticated sessions are mandatory in production.
