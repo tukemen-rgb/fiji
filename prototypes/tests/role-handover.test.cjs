@@ -168,10 +168,10 @@ test('restart guard clears markers and fails safely when storage is unavailable'
 function currentRideView(role,overrides={}) {
   return {id:FIXTURE.requestId,status:role==='driver'?'assigned':'collecting',revision:2,viewerRole:role,nextAction:role==='driver'?'start_pickup':'compare_offers',updatedAt:'2026-09-17T03:00:00.000Z',...overrides};
 }
-function startupRecovery(R,role,readCurrentRide) {
+function startupRecovery(R,role,readCurrentRide,principal={accountRef:`demo-${role}-account`,viewerRole:role}) {
   const storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
   guard.mark(role,'pending');
-  return {storage,guard,controller:R.createStartupRecoveryController({guard,role,readCurrentRide})};
+  return {storage,guard,controller:R.createStartupRecoveryController({guard,role,principal,readCurrentRide})};
 }
 test('startup network failure retains the marker without replaying a command', async () => {
   const {R}=setup();let reads=0;
@@ -233,7 +233,7 @@ test('startup recovery does not treat a bodyless 304 as restored state', async (
 test('startup recovery discards a marker for another role before any read', async () => {
   const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});let reads=0;
   guard.mark('passenger','pending');
-  const controller=R.createStartupRecoveryController({guard,role:'driver',readCurrentRide:async()=>{reads+=1;return {status:200,body:currentRideView('driver')};}});
+  const controller=R.createStartupRecoveryController({guard,role:'driver',principal:{accountRef:'demo-driver-account',viewerRole:'driver'},readCurrentRide:async()=>{reads+=1;return {status:200,body:currentRideView('driver')};}});
   const result=await controller.reconcile();
   assert.equal(result.requested,false);
   assert.equal(result.state.markerRetained,false);
@@ -259,6 +259,7 @@ test('startup discovery restores a passenger ride to the passenger history witho
   assert.equal(requests[0].method,'GET');
   assert.equal(requests[0].path,'/v1/rides/current');
   assert.equal(requests[0].reason,'startup');
+  assert.equal(requests[0].signal.aborted,false);
   assert.equal(result.state.outcome,'confirmed');
   assert.equal(result.view.kind,'ride');
   assert.equal(result.view.page,'passenger-history');
@@ -267,6 +268,7 @@ test('startup discovery restores a passenger ride to the passenger history witho
   assert.equal(guard.restore(),null);
   assert.equal(Object.hasOwn(requests[0],'rideId'),false);
   assert.equal(Object.hasOwn(requests[0],'role'),false);
+  assert.equal(Object.hasOwn(requests[0],'accountRef'),false);
 });
 test('startup discovery restores an assigned driver ride to the driver trips screen', async () => {
   const {R}=setup();
@@ -329,6 +331,75 @@ test('startup discovery rejects a valid shape for the other role without navigat
   assert.equal(result.view.page,null);
   assert.equal(result.view.ride,null);
   assert.equal(guard.restore().role,'passenger');
+});
+test('logout aborts startup discovery and a delayed success cannot restore the passenger screen', async () => {
+  const {R}=setup();let release,request;
+  const {guard,controller}=startupRecovery(R,'passenger',value=>{request=value;return new Promise(resolve=>{release=resolve;});});
+  const pending=controller.reconcile();
+  const loggedOut=controller.replacePrincipal(null);
+  assert.equal(request.signal.aborted,true);
+  assert.equal(loggedOut.sessionActive,false);
+  assert.equal(loggedOut.markerRetained,false);
+  assert.equal(loggedOut.outcome,'session_changed');
+  assert.equal(guard.restore(),null);
+  release({status:200,body:currentRideView('passenger')});
+  const delayed=await pending;
+  assert.equal(delayed.reason,'stale_session');
+  assert.equal(delayed.view,null);
+  assert.equal(delayed.state.outcome,'session_changed');
+});
+test('role switching rejects a delayed passenger discovery even when the response is otherwise valid', async () => {
+  const {R}=setup();let release;
+  const {controller}=startupRecovery(R,'passenger',()=>new Promise(resolve=>{release=resolve;}));
+  const pending=controller.reconcile();
+  const switched=controller.replacePrincipal({accountRef:'demo-driver-account',viewerRole:'driver'});
+  assert.equal(switched.role,'passenger');
+  assert.equal(switched.sessionActive,false);
+  assert.equal(switched.sessionGeneration,2);
+  release({status:200,body:currentRideView('passenger')});
+  const delayed=await pending;
+  assert.equal(delayed.reason,'stale_session');
+  assert.equal(delayed.view,null);
+  assert.equal(delayed.state.markerRetained,false);
+});
+test('account switching rejects a delayed discovery for the same role without exposing account references', async () => {
+  const {R}=setup();let release,request;
+  const {controller}=startupRecovery(R,'passenger',value=>{request=value;return new Promise(resolve=>{release=resolve;});},{accountRef:'passenger-a',viewerRole:'passenger'});
+  const pending=controller.reconcile();
+  const switched=controller.replacePrincipal({accountRef:'passenger-b',viewerRole:'passenger'});
+  assert.equal(switched.sessionActive,true);
+  assert.equal(switched.sessionGeneration,2);
+  assert.equal(JSON.stringify(switched).includes('passenger-a'),false);
+  assert.equal(JSON.stringify(switched).includes('passenger-b'),false);
+  assert.equal(Object.hasOwn(request,'accountRef'),false);
+  release({status:200,body:currentRideView('passenger')});
+  const delayed=await pending;
+  assert.equal(delayed.reason,'stale_session');
+  assert.equal(delayed.view,null);
+  assert.equal(JSON.stringify(delayed).includes('passenger-a'),false);
+});
+test('a delayed no-current-ride response cannot navigate the new session home', async () => {
+  const {R}=setup();let release;
+  const {controller}=startupRecovery(R,'driver',()=>new Promise(resolve=>{release=resolve;}));
+  const pending=controller.reconcile();
+  controller.replacePrincipal({accountRef:'other-driver-account',viewerRole:'driver'});
+  release({status:204});
+  const delayed=await pending;
+  assert.equal(delayed.reason,'stale_session');
+  assert.equal(delayed.view,null);
+  assert.equal(delayed.state.outcome,'session_changed');
+});
+test('an old network failure cannot recreate a restart marker after the session changes', async () => {
+  const {R}=setup();let reject;
+  const {guard,controller}=startupRecovery(R,'passenger',()=>new Promise((resolve,rejectRead)=>{reject=rejectRead;}));
+  const pending=controller.reconcile();
+  controller.replacePrincipal(null);
+  reject(Error('offline after logout'));
+  const delayed=await pending;
+  assert.equal(delayed.reason,'stale_session');
+  assert.equal(delayed.state.markerRetained,false);
+  assert.equal(guard.restore(),null);
+  assert.equal((await controller.reconcile()).requested,false);
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);

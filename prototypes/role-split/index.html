@@ -249,15 +249,33 @@
     const ride=Object.freeze(Object.fromEntries(currentRideFields.map(field=>[field,body[field]])));
     return Object.freeze({kind:'ride',page:role==='driver'?'driver-trips':'passenger-history',ride,reason:'current_ride'});
   }
-  function createStartupRecoveryController({guard,role,readCurrentRide}){
+  function createStartupRecoveryController({guard,role,principal,readCurrentRide}){
     const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
+    const normalizePrincipal=value=>{
+      const keys=value&&typeof value==='object'&&!Array.isArray(value)?Object.keys(value).sort():[];
+      if(keys.join(',')!=='accountRef,viewerRole'||typeof value.accountRef!=='string'||!value.accountRef||!['passenger','driver'].includes(value.viewerRole))return null;
+      return Object.freeze({accountRef:value.accountRef,viewerRole:value.viewerRole});
+    };
     if(!normalized||!guard||typeof guard.restore!=='function'||typeof readCurrentRide!=='function')throw Error('起動時復旧の設定が不正です。');
+    let binding=normalizePrincipal(principal),generation=1;
     let marker=guard.restore(),outcome=marker?'unresolved':'idle',attempts=0,retryUsed=false,busy=false,done=!marker;
-    if(marker&&marker.role!==normalized){guard.clear();marker=null;outcome='idle';done=true;}
+    const inflight=new Set();
+    if(marker&&(marker.role!==normalized||!binding||binding.viewerRole!==normalized)){guard.clear();marker=null;outcome=binding?'idle':'session_changed';done=true;}
     const retryReason=()=>outcome==='reauth'?'reauth':outcome==='unresolved'?'connectivity':null;
-    const snapshot=()=>Object.freeze({role:normalized,outcome,attempts,retryUsed,busy,markerRetained:Boolean(marker),canRetry:Boolean(marker&&!busy&&!done&&attempts>0&&!retryUsed&&retryReason()),autoCommandReplay:false});
+    const snapshot=()=>Object.freeze({role:normalized,outcome,attempts,retryUsed,busy,markerRetained:Boolean(marker),canRetry:Boolean(marker&&!busy&&!done&&attempts>0&&!retryUsed&&retryReason()),autoCommandReplay:false,sessionActive:Boolean(binding&&binding.viewerRole===normalized),sessionGeneration:generation,inFlight:inflight.size});
+    const abortController=()=>typeof AbortController==='function'?new AbortController():(()=>{const signal={aborted:false};return {signal,abort(){signal.aborted=true;}};})();
+    const current=handle=>Boolean(handle)&&!handle.signal.aborted&&handle.generation===generation&&handle.binding===binding;
+    const replacePrincipal=nextPrincipal=>{
+      generation+=1;
+      for(const handle of inflight)handle.controller.abort();
+      inflight.clear();
+      binding=normalizePrincipal(nextPrincipal);
+      guard.clear();marker=null;outcome='session_changed';done=true;busy=false;
+      return snapshot();
+    };
     async function reconcile(reason='startup'){
       if(!marker||done)return {requested:false,reason:'no_recovery',state:snapshot()};
+      if(!binding||binding.viewerRole!==normalized){guard.clear();marker=null;outcome='session_changed';done=true;return {requested:false,reason:'no_session',state:snapshot()};}
       if(busy)return {requested:false,reason:'in_flight',state:snapshot()};
       if(attempts===0&&reason!=='startup')return {requested:false,reason:'startup_required',state:snapshot()};
       if(attempts>0){
@@ -266,8 +284,12 @@
       }
       busy=true;attempts+=1;
       let view=null;
+      const controller=abortController(),handle=Object.freeze({binding,generation,controller,signal:controller.signal});
+      inflight.add(handle);
       try{
-        const response=await readCurrentRide(Object.freeze({method:'GET',path:'/v1/rides/current',reason})),status=Number(response?.status);
+        const response=await readCurrentRide(Object.freeze({method:'GET',path:'/v1/rides/current',reason,signal:handle.signal}));
+        if(!current(handle))return {requested:true,reason:'stale_session',state:snapshot(),view:null};
+        const status=Number(response?.status);
         view=currentRideRecoveryView(normalized,response);
         if(status===200&&view?.kind==='ride'){guard.clear();marker=null;outcome='confirmed';done=true;}
         else if(status===204){guard.clear();marker=null;outcome='empty';done=true;}
@@ -275,11 +297,14 @@
         else if(status===404){guard.clear();marker=null;outcome='rejected';done=true;}
         else if(status===409||status===422||(status===200&&view?.kind==='blocked')){guard.mark(normalized,'conflict');marker=guard.restore();outcome='conflict';done=true;}
         else{guard.mark(normalized,'unresolved');marker=guard.restore();outcome='unresolved';}
-      }catch{guard.mark(normalized,'unresolved');marker=guard.restore();outcome='unresolved';}
-      finally{busy=false;}
+      }catch{
+        if(!current(handle))return {requested:true,reason:'stale_session',state:snapshot(),view:null};
+        guard.mark(normalized,'unresolved');marker=guard.restore();outcome='unresolved';
+      }
+      finally{inflight.delete(handle);busy=false;}
       return {requested:true,state:snapshot(),view};
     }
-    return Object.freeze({snapshot,reconcile});
+    return Object.freeze({snapshot,reconcile,replacePrincipal});
   }
   function create(){
     let seq=10;
