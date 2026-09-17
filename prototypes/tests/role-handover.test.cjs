@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
+const {scenarios: httpScenarios, runHttpContract, runMockContract} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 function setup() {
@@ -388,4 +389,22 @@ test('API checker fails closed when safety requirements are removed', () => {
   const injected=structuredClone(loadContract());
   injected.components.schemas.CreateOfferInput.properties.driverId={type:'string'};
   assert.ok(validateContract(injected).some(message=>message.includes('server-owned driverId')));
+});
+test('HTTP contract runner enforces role, ownership, eligibility and safe errors over loopback', async () => {
+  const results=await runMockContract();
+  assert.equal(results.length,14);
+  assert.equal(results.filter(r=>r.status===404).length,5);
+  assert.equal(results.filter(r=>r.status===403).length,3);
+  assert.equal(results.filter(r=>r.status===401).length,1);
+  assert.equal(results.filter(r=>r.status===422).length,2);
+  assert.equal(results.filter(r=>r.status<300).length,3);
+});
+test('HTTP contract scenarios conceal foreign resources instead of leaking ownership', () => {
+  const hidden=httpScenarios().filter(s=>s.concealed);
+  assert.deepEqual(hidden.map(s=>s.expected[0]),[404,404,404,404,404]);
+  assert.ok(hidden.every(s=>s.expected[1]==='resource_not_found'));
+});
+test('HTTP contract runner fails when a permissive transport returns success for every request', async () => {
+  const permissiveFetch=async()=>({status:200,json:async()=>({})});
+  await assert.rejects(runHttpContract('http://mock.invalid',undefined,permissiveFetch),/no session cannot read offers/);
 });
