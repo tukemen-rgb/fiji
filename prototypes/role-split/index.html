@@ -217,6 +217,27 @@
     const clear=()=>{current=commandFeedback(role,'idle');return snapshot();};
     return {snapshot,setRole,begin,finish,clear};
   }
+  function createCommandRestartGuard(storage,options={}){
+    const key='taxi-command-guard-v1',now=typeof options.now==='function'?options.now:Date.now,maxAgeMs=Number.isFinite(options.maxAgeMs)?options.maxAgeMs:86400000;
+    const outcomes=new Set(['pending','unresolved','reauth','conflict']);
+    const clear=()=>{try{storage?.removeItem(key);return true;}catch{return false;}};
+    const mark=(role,outcome='pending')=>{
+      const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
+      if(!normalized||!outcomes.has(outcome))return false;
+      const marker={version:1,role:normalized,outcome,savedAt:now()};
+      try{storage?.setItem(key,JSON.stringify(marker));return Boolean(storage);}catch{return false;}
+    };
+    const restore=()=>{
+      try{
+        const raw=storage?.getItem(key);if(!raw)return null;
+        const marker=JSON.parse(raw),keys=marker&&typeof marker==='object'&&!Array.isArray(marker)?Object.keys(marker).sort():[];
+        const age=now()-marker?.savedAt;
+        if(keys.join(',')!=='outcome,role,savedAt,version'||marker.version!==1||!['passenger','driver'].includes(marker.role)||!outcomes.has(marker.outcome)||!Number.isFinite(marker.savedAt)||age<0||age>maxAgeMs){clear();return null;}
+        return Object.freeze({role:marker.role,outcome:'unresolved',resumedFrom:marker.outcome,feedback:commandFeedback(marker.role,'unresolved'),autoResend:false});
+      }catch{clear();return null;}
+    };
+    return Object.freeze({key,mark,restore,clear});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -374,7 +395,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -389,6 +410,9 @@ let records = model.state.records;
 const names = {taxi_permit:'Taxi Permit（営業許可）',vehicle_licence:'車両登録・PSV車両資格',driver_licence:'運転免許',psv_driver_permit:'PSV運転手許可',fitness:'車両検査・適合証明',insurance:'営業利用を含む保険',operator_assignment:'名義人の同意・運転権限',airport_authorization:'空港側の営業承認'};
 const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
 const commandUi=R.createCommandUiController();
+let restartStorage=null;try{restartStorage=window.localStorage;}catch{}
+const restartGuard=R.createCommandRestartGuard(restartStorage);
+let startupRecovery=restartGuard.restore(),startupRecoveryApplied=false;
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let toastTimer;
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(()=> $('toast').hidden = true, 5000); }
@@ -403,10 +427,11 @@ function commandOutcomeForError(error){const message=String(error?.message||'');
 function runCommandAction(role,action){
   const started=commandUi.begin(role);renderCommandFeedback();
   if(!started.accepted){toast('前の操作結果を確認してから進めてください。');return {ok:false,busy:true};}
-  try{const value=action();commandUi.finish('confirmed');renderCommandFeedback();return {ok:true,value};}
-  catch(error){commandUi.finish(commandOutcomeForError(error));renderCommandFeedback();throw error;}
+  restartGuard.mark(role,'pending');
+  try{const value=action();restartGuard.clear();commandUi.finish('confirmed');renderCommandFeedback();return {ok:true,value};}
+  catch(error){const outcome=commandOutcomeForError(error);if(['unresolved','reauth','conflict'].includes(outcome))restartGuard.mark(role,outcome);else restartGuard.clear();commandUi.finish(outcome);renderCommandFeedback();throw error;}
 }
-$('command-feedback-action').onclick=()=>{const view=commandUi.snapshot();commandUi.clear();if(view.action==='reauth')show('role');else show(state.page);renderCommandFeedback();};
+$('command-feedback-action').onclick=()=>{const view=commandUi.snapshot();restartGuard.clear();startupRecovery=null;commandUi.clear();if(view.action==='reauth')show('role');else show(state.page);renderCommandFeedback();};
 function show(target) {
   if(target==='role')model.leave();
   const page=R.route(model.state.activeRole,model.state.profile,target);
@@ -424,7 +449,14 @@ function show(target) {
   if(page==='driver-requests')renderDriverRequests();
   if(page==='driver-trips')renderDriverTrips();
   if(page==='driver-account')renderDriverProfile();
-  if(model.state.activeRole)commandUi.setRole(model.state.activeRole);else commandUi.clear();
+  if(model.state.activeRole){
+    commandUi.setRole(model.state.activeRole);
+    if(startupRecovery&&!startupRecoveryApplied){
+      if(startupRecovery.role===model.state.activeRole)commandUi.finish('unresolved');
+      else{restartGuard.clear();startupRecovery=null;}
+      startupRecoveryApplied=true;
+    }
+  }else commandUi.clear();
   renderCommandFeedback();
   try{history.replaceState(null,'','#'+page);}catch{}
   window.scrollTo({top:0,behavior:'instant'});

@@ -107,6 +107,62 @@ test('role switching clears old command feedback before showing the other role',
   assert.equal(switched.outcome,'idle');
   assert.equal(switched.disableCommands,false);
 });
+function memoryStorage(seed={}) {
+  const values=new Map(Object.entries(seed));
+  return {getItem:key=>values.has(key)?values.get(key):null,setItem:(key,value)=>values.set(key,String(value)),removeItem:key=>values.delete(key),value:key=>values.get(key)};
+}
+test('restart guard persists only a minimal allowlisted marker', () => {
+  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
+  assert.equal(guard.mark('passenger','pending'),true);
+  const marker=JSON.parse(storage.value(guard.key));
+  assert.deepEqual(Object.keys(marker).sort(),['outcome','role','savedAt','version']);
+  assert.deepEqual(marker,{version:1,role:'passenger',outcome:'pending',savedAt:1000});
+  for(const forbidden of ['command','action','rideId','accountId','token','idempotencyKey'])assert.equal(forbidden in marker,false);
+});
+test('restart guard converts an interrupted command into locked reconciliation without replay', () => {
+  const {R}=setup(),storage=memoryStorage(),writer=R.createCommandRestartGuard(storage,{now:()=>1000});
+  writer.mark('driver','pending');
+  const restored=R.createCommandRestartGuard(storage,{now:()=>1500}).restore();
+  assert.equal(restored.role,'driver');
+  assert.equal(restored.outcome,'unresolved');
+  assert.equal(restored.resumedFrom,'pending');
+  assert.equal(restored.autoResend,false);
+  assert.equal(restored.feedback.disableCommands,true);
+  assert.match(restored.feedback.title,/確認できません/);
+});
+test('restart guard discards an expired marker', () => {
+  const {R}=setup(),storage=memoryStorage(),writer=R.createCommandRestartGuard(storage,{now:()=>1000,maxAgeMs:500});
+  writer.mark('passenger','unresolved');
+  const restored=R.createCommandRestartGuard(storage,{now:()=>1501,maxAgeMs:500}).restore();
+  assert.equal(restored,null);
+  assert.equal(storage.value(writer.key),undefined);
+});
+test('restart guard rejects malformed or extended markers instead of trusting them', () => {
+  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
+  storage.setItem(guard.key,JSON.stringify({version:1,role:'passenger',outcome:'pending',savedAt:900,rideId:'private-ride'}));
+  assert.equal(guard.restore(),null);
+  assert.equal(storage.value(guard.key),undefined);
+  storage.setItem(guard.key,'not-json');
+  assert.equal(guard.restore(),null);
+});
+test('restart guard keeps passenger and driver recovery wording separate', () => {
+  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
+  guard.mark('driver','conflict');
+  const restored=guard.restore();
+  assert.equal(restored.role,'driver');
+  assert.match(restored.feedback.message,/最新状態/);
+  assert.notEqual(restored.feedback.role,'passenger');
+});
+test('restart guard clears markers and fails safely when storage is unavailable', () => {
+  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
+  guard.mark('passenger','pending');
+  assert.equal(guard.clear(),true);
+  assert.equal(guard.restore(),null);
+  const broken={getItem(){throw Error('blocked');},setItem(){throw Error('blocked');},removeItem(){throw Error('blocked');}};
+  const unavailable=R.createCommandRestartGuard(broken,{now:()=>1000});
+  assert.equal(unavailable.mark('passenger','pending'),false);
+  assert.equal(unavailable.restore(),null);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');
