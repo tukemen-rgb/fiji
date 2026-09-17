@@ -163,6 +163,89 @@ test('restart guard clears markers and fails safely when storage is unavailable'
   assert.equal(unavailable.mark('passenger','pending'),false);
   assert.equal(unavailable.restore(),null);
 });
+function startupRecovery(R,role,readState) {
+  const storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
+  guard.mark(role,'pending');
+  return {storage,guard,controller:R.createStartupRecoveryController({guard,role,readState})};
+}
+test('startup network failure retains the marker without replaying a command', async () => {
+  const {R}=setup();let reads=0;
+  const {guard,controller}=startupRecovery(R,'passenger',async()=>{reads+=1;throw Error('offline');});
+  const result=await controller.reconcile();
+  assert.equal(result.requested,true);
+  assert.equal(reads,1);
+  assert.equal(result.state.outcome,'unresolved');
+  assert.equal(result.state.markerRetained,true);
+  assert.equal(result.state.canRetry,true);
+  assert.equal(result.state.autoCommandReplay,false);
+  assert.equal(guard.restore().role,'passenger');
+});
+test('connectivity recovery permits one explicit state reread and then clears the marker', async () => {
+  const {R}=setup();let reads=0;
+  const {guard,controller}=startupRecovery(R,'driver',async()=>{reads+=1;if(reads===1)throw Error('offline');return {status:200,body:{private:'not retained'}};});
+  await controller.reconcile();
+  const recovered=await controller.reconcile('connectivity');
+  assert.equal(recovered.requested,true);
+  assert.equal(recovered.state.outcome,'confirmed');
+  assert.equal(recovered.state.markerRetained,false);
+  assert.equal(reads,2);
+  assert.equal(guard.restore(),null);
+  assert.equal((await controller.reconcile('connectivity')).requested,false);
+});
+test('authentication recovery waits for explicit reauthentication and rereads once', async () => {
+  const {R}=setup();let reads=0;
+  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:++reads===1?401:200}));
+  const expired=await controller.reconcile();
+  assert.equal(expired.state.outcome,'reauth');
+  assert.equal(expired.state.markerRetained,true);
+  assert.equal((await controller.reconcile('connectivity')).requested,false);
+  assert.equal(reads,1);
+  const recovered=await controller.reconcile('reauth');
+  assert.equal(recovered.state.outcome,'confirmed');
+  assert.equal(reads,2);
+  assert.equal(guard.restore(),null);
+});
+test('startup recovery clears a concealed not-found result without retry', async () => {
+  const {R}=setup();let reads=0;
+  const {guard,controller}=startupRecovery(R,'driver',async()=>{reads+=1;return {status:404};});
+  const result=await controller.reconcile();
+  assert.equal(result.state.outcome,'rejected');
+  assert.equal(result.state.markerRetained,false);
+  assert.equal(result.state.canRetry,false);
+  assert.equal(guard.restore(),null);
+  assert.equal((await controller.reconcile('connectivity')).requested,false);
+  assert.equal(reads,1);
+});
+test('startup recovery does not treat a bodyless 304 as restored state', async () => {
+  const {R}=setup();
+  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:304}));
+  const result=await controller.reconcile();
+  assert.equal(result.state.outcome,'unresolved');
+  assert.equal(result.state.markerRetained,true);
+  assert.equal(result.state.canRetry,true);
+  assert.equal(guard.restore().role,'passenger');
+});
+test('startup recovery discards a marker for another role before any read', async () => {
+  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});let reads=0;
+  guard.mark('passenger','pending');
+  const controller=R.createStartupRecoveryController({guard,role:'driver',readState:async()=>{reads+=1;return {status:200};}});
+  const result=await controller.reconcile();
+  assert.equal(result.requested,false);
+  assert.equal(result.state.markerRetained,false);
+  assert.equal(reads,0);
+  assert.equal(guard.restore(),null);
+});
+test('startup recovery rejects duplicate reads while one is in flight', async () => {
+  const {R}=setup();let release,reads=0;
+  const {controller}=startupRecovery(R,'passenger',()=>{reads+=1;return new Promise(resolve=>{release=resolve;});});
+  const first=controller.reconcile();
+  const duplicate=await controller.reconcile();
+  assert.equal(duplicate.requested,false);
+  assert.equal(duplicate.reason,'in_flight');
+  assert.equal(reads,1);
+  release({status:200});
+  assert.equal((await first).state.outcome,'confirmed');
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');
