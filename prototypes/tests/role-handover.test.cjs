@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
@@ -23,6 +23,8 @@ let notificationHintContract;
 function notificationHintResults() { return notificationHintContract ||= runNotificationHintContract(); }
 let sessionIsolationContract;
 function sessionIsolationResults() { return sessionIsolationContract ||= runSessionIsolationContract(); }
+let commandSessionContract;
+function commandSessionResults() { return commandSessionContract ||= runCommandSessionContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -899,4 +901,47 @@ test('switching accounts rejects an old response even when role and ride ID matc
   assert.equal(accountBState.viewerRole,'passenger');
   assert.equal(accountBState.state,null);
   assert.equal(accountBState.etag,null);
+});
+test('a command success completing after logout is discarded', () => {
+  const {loggedOut,logoutAborted,delayedSuccess}=commandSessionResults();
+  assert.equal(loggedOut.active,false);
+  assert.equal(loggedOut.inFlight,0);
+  assert.equal(logoutAborted,true);
+  assert.equal(delayedSuccess.committed,false);
+  assert.equal(delayedSuccess.reason,'stale_session');
+  assert.equal(delayedSuccess.autoRetry,false);
+});
+test('session expiry during a state-changing command requires reauthentication without auto-retry', () => {
+  const {sessionExpired}=commandSessionResults();
+  assert.equal(sessionExpired.committed,false);
+  assert.equal(sessionExpired.reason,'session_expired');
+  assert.equal(sessionExpired.autoRetry,false);
+  assert.equal(sessionExpired.needsReauth,true);
+  assert.equal(sessionExpired.needsRecovery,true);
+});
+test('an unknown command outcome is reconciled before an explicit same-key retry', () => {
+  const {outcomeUnknown}=commandSessionResults();
+  assert.equal(outcomeUnknown.committed,false);
+  assert.equal(outcomeUnknown.reason,'outcome_unknown');
+  assert.equal(outcomeUnknown.autoRetry,false);
+  assert.equal(outcomeUnknown.needsRecovery,true);
+  assert.equal(outcomeUnknown.reuseSameKey,true);
+});
+test('account switching rejects the old command but allows the new account command', () => {
+  const {delayedAccountA,accountBCommitted}=commandSessionResults();
+  assert.equal(delayedAccountA.reason,'stale_session');
+  assert.equal(delayedAccountA.committed,false);
+  assert.equal(accountBCommitted.reason,'committed');
+  assert.equal(accountBCommitted.committed,true);
+});
+test('the same raw Idempotency-Key is isolated by authenticated account', () => {
+  const {accountAScope,reauthScope,accountBScope,accountAHandleScope,accountBHandleScope}=commandSessionResults();
+  assert.equal(accountAScope,reauthScope);
+  assert.equal(accountAScope,accountAHandleScope);
+  assert.equal(accountBScope,accountBHandleScope);
+  assert.notEqual(accountAScope,accountBScope);
+});
+test('structured idempotency scoping avoids delimiter collisions', () => {
+  const {delimiterA,delimiterB}=commandSessionResults();
+  assert.notEqual(delimiterA,delimiterB);
 });

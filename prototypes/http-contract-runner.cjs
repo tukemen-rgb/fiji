@@ -164,8 +164,12 @@ function commandFingerprint(req, url, body) {
   return JSON.stringify({method: req.method, path: url.pathname, body});
 }
 
+function idempotencyScopeKey(accountRef, idempotencyKey) {
+  return JSON.stringify([String(accountRef), String(idempotencyKey)]);
+}
+
 async function atomicCommand(state, actor, req, url, body, action) {
-  const key = `${actor.id}:${req.headers['idempotency-key']}`;
+  const key = idempotencyScopeKey(actor.id, req.headers['idempotency-key']);
   const fingerprint = commandFingerprint(req, url, body);
   return serialize(state, async () => {
     const saved = state.idempotency.get(key);
@@ -625,6 +629,60 @@ function createRideSessionClient(initialBinding = null) {
   return {snapshot, resetSession, setCache, scheduleRetry, startRecovery, finishRecovery};
 }
 
+function createSessionBoundCommandClient(initialBinding = null) {
+  const normalizeBinding = value => {
+    if (!value || typeof value.sessionId !== 'string' || !value.sessionId ||
+        typeof value.accountRef !== 'string' || !value.accountRef ||
+        !['passenger', 'driver'].includes(value.viewerRole)) return null;
+    return Object.freeze({sessionId: value.sessionId, accountRef: value.accountRef, viewerRole: value.viewerRole});
+  };
+  let binding = normalizeBinding(initialBinding);
+  let generation = 1;
+  const inflight = new Set();
+  const snapshot = () => ({active: Boolean(binding), viewerRole: binding?.viewerRole ?? null, generation, inFlight: inflight.size});
+  const resetSession = nextBinding => {
+    generation += 1;
+    for (const handle of inflight) handle.controller.abort();
+    inflight.clear();
+    binding = normalizeBinding(nextBinding);
+    return snapshot();
+  };
+  const startCommand = command => {
+    if (!binding || !command || typeof command.action !== 'string' || !command.action ||
+        typeof command.idempotencyKey !== 'string' || !command.idempotencyKey) return null;
+    const controller = new AbortController();
+    const handle = Object.freeze({
+      binding,
+      generation,
+      action: command.action,
+      scopedKey: idempotencyScopeKey(binding.accountRef, command.idempotencyKey),
+      controller,
+      signal: controller.signal
+    });
+    inflight.add(handle);
+    return handle;
+  };
+  const finishCommand = (handle, response) => {
+    if (!handle) return {committed: false, reason: 'no_session', autoRetry: false};
+    inflight.delete(handle);
+    if (handle.signal.aborted || handle.generation !== generation || handle.binding !== binding) {
+      return {committed: false, reason: 'stale_session', autoRetry: false};
+    }
+    if ([200, 201].includes(response?.status)) return {committed: true, reason: 'committed', autoRetry: false};
+    if ([401, 403].includes(response?.status)) {
+      return {committed: false, reason: 'session_expired', autoRetry: false, needsReauth: true, needsRecovery: true};
+    }
+    if (response?.status === 409 && response.body?.code === 'stale_revision') {
+      return {committed: false, reason: 'stale_revision', autoRetry: false, needsRecovery: true};
+    }
+    if ([0, 429, 500, 502, 503, 504].includes(response?.status)) {
+      return {committed: false, reason: 'outcome_unknown', autoRetry: false, needsRecovery: true, reuseSameKey: true};
+    }
+    return {committed: false, reason: 'rejected', autoRetry: false, needsRecovery: false};
+  };
+  return {snapshot, resetSession, startCommand, finishCommand};
+}
+
 async function runHttpContract(baseUrl, tokens = FIXTURE.tokens, fetchImpl = fetch) {
   const results = [];
   for (const scenario of scenarios(tokens)) {
@@ -1067,11 +1125,46 @@ function runSessionIsolationContract() {
   return {loggedOut, logoutSignalAborted: logoutHandle.signal.aborted, retryCancelled, delayedAfterLogout, afterRoleSwitch, passengerSignalAborted: passengerHandle.signal.aborted, delayedPassenger, driverRecovery, driverState, delayedAccountA, accountBState};
 }
 
+function runCommandSessionContract() {
+  const accountA = {sessionId: 'session-a', accountRef: 'account-passenger-a', viewerRole: 'passenger'};
+  const accountAReauth = {sessionId: 'session-a-reauth', accountRef: 'account-passenger-a', viewerRole: 'passenger'};
+  const accountB = {sessionId: 'session-b', accountRef: 'account-passenger-b', viewerRole: 'passenger'};
+  const command = {action: 'cancel_ride', idempotencyKey: 'command-shared-key'};
+
+  const logoutClient = createSessionBoundCommandClient(accountA);
+  const logoutHandle = logoutClient.startCommand(command);
+  const loggedOut = logoutClient.resetSession(null);
+  const delayedSuccess = logoutClient.finishCommand(logoutHandle, {status: 200, body: {status: 'cancelled'}});
+
+  const expiryClient = createSessionBoundCommandClient(accountA);
+  const expiryHandle = expiryClient.startCommand(command);
+  const sessionExpired = expiryClient.finishCommand(expiryHandle, {status: 401, body: errorBody('authentication_required', 'Authentication is required.', 'expired-session')});
+
+  const unknownClient = createSessionBoundCommandClient(accountA);
+  const unknownHandle = unknownClient.startCommand(command);
+  const outcomeUnknown = unknownClient.finishCommand(unknownHandle, {status: 0, body: null});
+
+  const switchClient = createSessionBoundCommandClient(accountA);
+  const accountAHandle = switchClient.startCommand(command);
+  switchClient.resetSession(accountB);
+  const delayedAccountA = switchClient.finishCommand(accountAHandle, {status: 200, body: {status: 'cancelled'}});
+  const accountBHandle = switchClient.startCommand(command);
+  const accountBCommitted = switchClient.finishCommand(accountBHandle, {status: 200, body: {status: 'cancelled'}});
+
+  const accountAScope = idempotencyScopeKey(accountA.accountRef, command.idempotencyKey);
+  const reauthScope = idempotencyScopeKey(accountAReauth.accountRef, command.idempotencyKey);
+  const accountBScope = idempotencyScopeKey(accountB.accountRef, command.idempotencyKey);
+  const delimiterA = idempotencyScopeKey('account:a', 'key');
+  const delimiterB = idempotencyScopeKey('account', 'a:key');
+  return {loggedOut, logoutAborted: logoutHandle.signal.aborted, delayedSuccess, sessionExpired, outcomeUnknown, delayedAccountA, accountBCommitted, accountAScope, reauthScope, accountBScope, accountAHandleScope: accountAHandle.scopedKey, accountBHandleScope: accountBHandle.scopedKey, delimiterA, delimiterB};
+}
+
 if (require.main === module) {
   Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract()]).then(([results, audit, retry, notification]) => {
     const {race, validity, rideSafety, boardingRace} = audit;
     const merge = runRevisionMergeContract();
     const session = runSessionIsolationContract();
+    const commandSession = runCommandSessionContract();
     const denied = results.filter(r => r.status >= 400).length;
     console.log(`HTTP contract OK: ${results.length} scenarios (${denied} safe denials, ${results.length - denied} positive controls)`);
     console.log(`HTTP race OK: ${race.winner.command} won, ${race.loser.command} received stale_revision, exact replay was stable, changed replay was rejected`);
@@ -1082,6 +1175,7 @@ if (require.main === module) {
     console.log(`Client revision merge OK: revision ${merge.newerNotification.state.revision} resisted delayed recovery, gaps/conflicts requested recovery, scope mismatches were rejected`);
     console.log(`Notification hint OK: ${notification.authorized.calls} authorized recovery applied revision ${notification.authorized.state.revision}; private, stale and foreign hints made ${notification.rejectedCalls} requests`);
     console.log(`Session isolation OK: logout and role/account switches cleared cache, cancelled retry, aborted old reads and accepted only ${session.driverState.viewerRole} recovery`);
+    console.log(`Command session OK: expired and stale-session results stopped without auto-retry; same raw key separated ${commandSession.accountAScope !== commandSession.accountBScope ? 'by account' : 'incorrectly'}`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -1089,4 +1183,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
