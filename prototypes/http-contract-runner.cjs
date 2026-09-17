@@ -459,6 +459,46 @@ async function fetchRideStateWithRetry(options) {
   return {result: null, attempts, stopped: 'exhausted'};
 }
 
+const RIDE_STATE_FIELDS = Object.freeze(['id', 'status', 'revision', 'viewerRole', 'nextAction', 'updatedAt']);
+
+function rideStateFingerprint(value) {
+  return JSON.stringify(Object.fromEntries(RIDE_STATE_FIELDS.map(field => [field, value[field]])));
+}
+
+function mergeRideStateUpdate(current, incoming, source = 'notification') {
+  const validSource = source === 'notification' || source === 'recovery';
+  const validShape = incoming && typeof incoming === 'object' &&
+    typeof incoming.id === 'string' && incoming.id.length > 0 &&
+    typeof incoming.status === 'string' && incoming.status.length > 0 &&
+    Number.isInteger(incoming.revision) && incoming.revision > 0 &&
+    ['passenger', 'driver'].includes(incoming.viewerRole) &&
+    typeof incoming.nextAction === 'string' && incoming.nextAction.length > 0 &&
+    typeof incoming.updatedAt === 'string' && Number.isFinite(Date.parse(incoming.updatedAt));
+  if (!validSource || !validShape) {
+    return {state: current, applied: false, reason: 'invalid_update', needsRecovery: true};
+  }
+  if (!current) {
+    if (source !== 'recovery') return {state: null, applied: false, reason: 'missing_baseline', needsRecovery: true};
+    return {state: structuredClone(incoming), applied: true, reason: 'baseline', needsRecovery: false};
+  }
+  if (incoming.id !== current.id || incoming.viewerRole !== current.viewerRole) {
+    return {state: current, applied: false, reason: 'scope_mismatch', needsRecovery: false};
+  }
+  if (incoming.revision < current.revision) {
+    return {state: current, applied: false, reason: 'stale', needsRecovery: false};
+  }
+  if (incoming.revision === current.revision) {
+    if (rideStateFingerprint(incoming) === rideStateFingerprint(current)) {
+      return {state: current, applied: false, reason: 'duplicate', needsRecovery: false};
+    }
+    return {state: current, applied: false, reason: 'same_revision_conflict', needsRecovery: true};
+  }
+  if (source === 'notification' && incoming.revision !== current.revision + 1) {
+    return {state: current, applied: false, reason: 'revision_gap', needsRecovery: true};
+  }
+  return {state: structuredClone(incoming), applied: true, reason: source, needsRecovery: false};
+}
+
 async function runHttpContract(baseUrl, tokens = FIXTURE.tokens, fetchImpl = fetch) {
   const results = [];
   for (const scenario of scenarios(tokens)) {
@@ -776,9 +816,49 @@ async function runRecoveryRetryContract() {
   return {rateLimited, unavailable, exhausted, accessDenied, network: {result: network, delays: networkDelays, calls: networkCalls}, hidden: {result: hidden, calls: hiddenCalls}};
 }
 
+function runRevisionMergeContract() {
+  const action = {
+    arriving: 'confirm_vehicle',
+    cancelled: 'show_cancelled_history',
+    on_trip: 'show_on_trip',
+    completed: 'show_completed'
+  };
+  const snapshot = (revision, status, overrides = {}) => ({
+    id: FIXTURE.requestId,
+    status,
+    revision,
+    viewerRole: 'passenger',
+    nextAction: action[status],
+    updatedAt: new Date(Date.parse('2026-09-17T03:00:00Z') + revision * 1000).toISOString(),
+    ...overrides
+  });
+  const base = snapshot(7, 'arriving');
+
+  const newerNotification = mergeRideStateUpdate(base, snapshot(8, 'cancelled'), 'notification');
+  const delayedRecovery = mergeRideStateUpdate(newerNotification.state, base, 'recovery');
+
+  const newerRecovery = mergeRideStateUpdate(base, snapshot(9, 'on_trip'), 'recovery');
+  const delayedNotification = mergeRideStateUpdate(newerRecovery.state, snapshot(8, 'cancelled'), 'notification');
+
+  const firstDelivery = mergeRideStateUpdate(base, snapshot(8, 'cancelled'), 'notification');
+  const duplicate = mergeRideStateUpdate(firstDelivery.state, snapshot(8, 'cancelled'), 'notification');
+  const conflicting = mergeRideStateUpdate(firstDelivery.state, snapshot(8, 'arriving'), 'notification');
+
+  const gap = mergeRideStateUpdate(base, snapshot(10, 'completed'), 'notification');
+  const gapRecovery = mergeRideStateUpdate(gap.state, snapshot(10, 'completed'), 'recovery');
+
+  const wrongRide = mergeRideStateUpdate(base, snapshot(8, 'cancelled', {id: 'ride-foreign'}), 'notification');
+  const wrongRole = mergeRideStateUpdate(base, snapshot(8, 'cancelled', {viewerRole: 'driver'}), 'notification');
+  const missingBaseline = mergeRideStateUpdate(null, snapshot(8, 'cancelled'), 'notification');
+  const recoveredBaseline = mergeRideStateUpdate(null, snapshot(8, 'cancelled'), 'recovery');
+
+  return {base, newerNotification, delayedRecovery, newerRecovery, delayedNotification, firstDelivery, duplicate, conflicting, gap, gapRecovery, wrongRide, wrongRole, missingBaseline, recoveredBaseline};
+}
+
 if (require.main === module) {
   Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract()]).then(([results, audit, retry]) => {
     const {race, validity, rideSafety, boardingRace} = audit;
+    const merge = runRevisionMergeContract();
     const denied = results.filter(r => r.status >= 400).length;
     console.log(`HTTP contract OK: ${results.length} scenarios (${denied} safe denials, ${results.length - denied} positive controls)`);
     console.log(`HTTP race OK: ${race.winner.command} won, ${race.loser.command} received stale_revision, exact replay was stable, changed replay was rejected`);
@@ -786,6 +866,7 @@ if (require.main === module) {
     console.log(`HTTP ride safety OK: vehicle mismatch invalidated confirmation, unconfirmed/revoked start blocked, allowed path completed at revision ${rideSafety.state.revision}`);
     console.log(`HTTP boarding race OK: ${boardingRace.cancelFirst.winner} and ${boardingRace.startFirst.winner} each won; role-safe recovery returned current state or an empty conditional 304`);
     console.log(`HTTP recovery retry OK: Retry-After ${retry.rateLimited.delays[0]}ms, exponential ${retry.unavailable.delays.join('/')}ms, capped and access/visibility stops`);
+    console.log(`Client revision merge OK: revision ${merge.newerNotification.state.revision} resisted delayed recovery, gaps/conflicts requested recovery, scope mismatches were rejected`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -793,4 +874,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runAuditContract, fetchRideStateWithRetry, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRetryAfterMs, exponentialBackoffMs, startMockServer};

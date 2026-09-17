@@ -22,6 +22,8 @@ The recovery read also returns an opaque ETag scoped to the current revision and
 
 Temporary recovery pressure returns `429 rate_limited` and temporary outage returns `503 service_unavailable`, both with `Retry-After`. The reference client accepts delta-seconds or HTTP dates, clamps server-directed delays to 1–60 seconds, and otherwise uses jittered exponential backoff capped at 30 seconds. It stops after four attempts by default, stops immediately for 401/403/404, and sends no request while the view is hidden. Injected sleep, clock and randomness make these policies deterministic in acceptance tests; they are not evidence of mobile OS scheduling or real network behavior.
 
+Notification and recovery results are merged only by the role-shaped ride `revision`. A lower revision never replaces the current display, regardless of arrival source. An identical same-revision delivery is a no-op; conflicting content at the same revision is not guessed and instead requests a fresh authorized recovery read. A notification that skips one or more revisions is not partially applied; a newer full recovery snapshot may establish the missing state. Ride ID and viewer role must match the current view, and a notification cannot establish the initial trusted baseline. This executable client rule does not prove push, WebSocket or cross-device delivery.
+
 ## Common rules
 
 - Prefix examples with `/v1`. HTTPS and authenticated sessions are mandatory in production.
@@ -93,6 +95,7 @@ Acceptance:
 - Send `Cache-Control: private, no-cache` and `Vary: Authorization` on both 200 and 304 so shared caches do not reuse authenticated role-specific responses.
 - Return `429 rate_limited` or `503 service_unavailable` with `Retry-After` when recovery should pause. A client must bound both the delay and total attempts, add jitter when using its own exponential backoff, and must not retry 401/403/404 as transient failures.
 - Stop scheduled recovery while the view is hidden or the account no longer has access. Foreground/network resumption must start a fresh authorized conditional read rather than replaying a state-changing command.
+- Merge notification and recovery results monotonically by `revision`. Ignore older or exact duplicate results, recover on a same-revision conflict or notification gap, and reject another ride or viewer-role representation.
 
 ### `POST /v1/rides/{requestId}/vehicle-confirmations` — owning passenger
 
@@ -153,5 +156,6 @@ Error bodies contain a stable `code`, safe localized message, `requestId` for su
 12. both race participants can recover current role-shaped state, while unrelated actors receive a concealed error and reads remain side-effect free.
 13. role/revision ETags support strong, weak and wildcard revalidation; old or other-role tags return the current 200 representation, and authorization precedes cache validation.
 14. 429/503 and network failures wait without a tight loop, attempts and delays are bounded, access denials do not retry, and hidden views send no request.
+15. delayed notifications or recovery responses cannot roll state backward; duplicates are no-ops, same-revision conflicts and notification gaps require recovery, and cross-ride/cross-role input is rejected.
 
 These are sequential reference-model tests, not proof of database locking, real concurrency, HTTP authentication or cross-device behavior. Claude's production PR must add integration tests that send concurrent commands to the real persistence layer and verify one winner, stable idempotent replay and complete audit events.

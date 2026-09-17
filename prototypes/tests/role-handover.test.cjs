@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
@@ -17,6 +17,8 @@ let boardingRaceContract;
 function boardingRaceResults() { return boardingRaceContract ||= runBoardingRaceContract(); }
 let recoveryRetryContract;
 function recoveryRetryResults() { return recoveryRetryContract ||= runRecoveryRetryContract(); }
+let revisionMergeContract;
+function revisionMergeResults() { return revisionMergeContract ||= runRevisionMergeContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -736,4 +738,61 @@ test('Retry-After accepts an HTTP date but rejects invalid input and clamps extr
   assert.equal(parseRetryAfterMs('invalid',now),null);
   assert.equal(parseRetryAfterMs('0',now),1000);
   assert.equal(parseRetryAfterMs('999',now),60000);
+});
+test('a delayed recovery response cannot roll back a newer notification', () => {
+  const {newerNotification,delayedRecovery}=revisionMergeResults();
+  assert.equal(newerNotification.applied,true);
+  assert.equal(newerNotification.state.revision,8);
+  assert.equal(newerNotification.state.status,'cancelled');
+  assert.equal(delayedRecovery.applied,false);
+  assert.equal(delayedRecovery.reason,'stale');
+  assert.equal(delayedRecovery.state.revision,8);
+  assert.equal(delayedRecovery.state.status,'cancelled');
+});
+test('a delayed notification cannot roll back a newer recovery response', () => {
+  const {newerRecovery,delayedNotification}=revisionMergeResults();
+  assert.equal(newerRecovery.state.revision,9);
+  assert.equal(newerRecovery.state.status,'on_trip');
+  assert.equal(delayedNotification.applied,false);
+  assert.equal(delayedNotification.reason,'stale');
+  assert.equal(delayedNotification.state.status,'on_trip');
+});
+test('an exact duplicate revision is ignored without requesting recovery', () => {
+  const {duplicate}=revisionMergeResults();
+  assert.equal(duplicate.applied,false);
+  assert.equal(duplicate.reason,'duplicate');
+  assert.equal(duplicate.needsRecovery,false);
+  assert.equal(duplicate.state.revision,8);
+});
+test('conflicting content at the same revision is not applied and requests recovery', () => {
+  const {conflicting}=revisionMergeResults();
+  assert.equal(conflicting.applied,false);
+  assert.equal(conflicting.reason,'same_revision_conflict');
+  assert.equal(conflicting.needsRecovery,true);
+  assert.equal(conflicting.state.status,'cancelled');
+});
+test('a notification revision gap waits for an authoritative recovery snapshot', () => {
+  const {gap,gapRecovery}=revisionMergeResults();
+  assert.equal(gap.applied,false);
+  assert.equal(gap.reason,'revision_gap');
+  assert.equal(gap.needsRecovery,true);
+  assert.equal(gap.state.revision,7);
+  assert.equal(gapRecovery.applied,true);
+  assert.equal(gapRecovery.state.revision,10);
+  assert.equal(gapRecovery.state.status,'completed');
+});
+test('cross-ride, cross-role and notification-only baselines never enter the current view', () => {
+  const {wrongRide,wrongRole,missingBaseline,recoveredBaseline}=revisionMergeResults();
+  for(const result of [wrongRide,wrongRole]){
+    assert.equal(result.applied,false);
+    assert.equal(result.reason,'scope_mismatch');
+    assert.equal(result.needsRecovery,false);
+    assert.equal(result.state.revision,7);
+  }
+  assert.equal(missingBaseline.reason,'missing_baseline');
+  assert.equal(missingBaseline.needsRecovery,true);
+  assert.equal(missingBaseline.state,null);
+  assert.equal(recoveredBaseline.applied,true);
+  assert.equal(recoveredBaseline.reason,'baseline');
+  assert.equal(recoveredBaseline.state.revision,8);
 });
