@@ -367,6 +367,42 @@
     };
     return Object.freeze({snapshot,beginSession,apply});
   }
+  function createStartupRecoveryFlow({role,controller,uiAdapter}){
+    const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
+    if(!normalized||!controller||typeof controller.snapshot!=='function'||typeof controller.reconcile!=='function'||typeof controller.beginSessionRecovery!=='function'||typeof controller.replacePrincipal!=='function'||!uiAdapter||typeof uiAdapter.snapshot!=='function'||typeof uiAdapter.apply!=='function'||typeof uiAdapter.beginSession!=='function')throw Error('起動時復旧フローの設定が不正です。');
+    const initialController=controller.snapshot(),initialUi=uiAdapter.snapshot();
+    if(initialController.role!==normalized||initialUi.role!==normalized||initialController.sessionGeneration!==initialUi.sessionGeneration)throw Error('起動時復旧フローの役割または世代が一致しません。');
+    let disposed=false,epoch=1,lastAction='idle';
+    const snapshot=()=>Object.freeze({role:normalized,disposed,epoch,lastAction,controller:controller.snapshot(),ui:uiAdapter.snapshot()});
+    const perform=async(reason,runEpoch=epoch)=>{
+      if(disposed)return {processed:false,reason:'flow_disposed',state:snapshot()};
+      lastAction=reason;
+      const result=await controller.reconcile(reason);
+      if(disposed||runEpoch!==epoch)return {processed:false,reason:'flow_stale',result,state:snapshot()};
+      const application=uiAdapter.apply(result);
+      return {processed:application.applied,reason:application.reason,result,application,state:snapshot()};
+    };
+    const recoverOnStartup=()=>perform('startup');
+    const resume=reason=>{
+      if(!['connectivity','reauth'].includes(reason))return Promise.resolve({processed:false,reason:'invalid_resume_reason',state:snapshot()});
+      return perform(reason);
+    };
+    const beginSession=async principal=>{
+      if(disposed)return {processed:false,reason:'flow_disposed',state:snapshot()};
+      const initialized=controller.beginSessionRecovery(principal);
+      if(!initialized.started)return {processed:false,reason:initialized.reason,initialized,state:snapshot()};
+      epoch+=1;lastAction='session_start';
+      const uiStart=uiAdapter.beginSession(initialized.state.sessionGeneration);
+      if(!uiStart.started){controller.replacePrincipal(null);disposed=true;epoch+=1;lastAction='disposed';return {processed:false,reason:'ui_session_rejected',initialized,uiStart,state:snapshot()};}
+      return perform('startup',epoch);
+    };
+    const dispose=()=>{
+      if(disposed)return {disposed:false,reason:'already_disposed',state:snapshot()};
+      disposed=true;epoch+=1;lastAction='disposed';controller.replacePrincipal(null);
+      return {disposed:true,reason:'disposed',state:snapshot()};
+    };
+    return Object.freeze({snapshot,recoverOnStartup,resume,beginSession,dispose});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -524,7 +560,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>

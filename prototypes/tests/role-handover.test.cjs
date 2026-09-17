@@ -534,6 +534,65 @@ test('cross-role or unexpected recovery views fail closed', () => {
   assert.equal(blocked.applied,true);assert.equal(blocked.reason,'invalid_view');
   assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().outcome,'conflict');assert.equal(commandUi.snapshot().disableCommands,true);
 });
+function recoveryFlow(R,role,readCurrentRide,principal={accountRef:`demo-${role}-account`,viewerRole:role}) {
+  const storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});guard.mark(role,'pending');
+  const controller=R.createStartupRecoveryController({guard,role,principal,readCurrentRide});
+  const pages=[],commandUi=R.createCommandUiController(role);commandUi.finish('unresolved');
+  const uiAdapter=R.createStartupRecoveryUiAdapter({role,sessionGeneration:controller.snapshot().sessionGeneration,navigate:page=>pages.push(page),commandUi});
+  const flow=R.createStartupRecoveryFlow({role,controller,uiAdapter});
+  return {storage,guard,controller,pages,commandUi,uiAdapter,flow};
+}
+test('startup screen flow applies passenger recovery to navigation and lock once', async () => {
+  const {R}=setup(),{flow,pages,commandUi}=recoveryFlow(R,'passenger',async()=>({status:200,body:currentRideView('passenger')}));
+  const recovered=await flow.recoverOnStartup();
+  assert.equal(recovered.processed,true);assert.equal(recovered.reason,'ride_restored');
+  assert.deepEqual(pages,['passenger-history']);assert.equal(commandUi.snapshot().disableCommands,false);
+  const duplicate=await flow.recoverOnStartup();
+  assert.equal(duplicate.processed,false);assert.equal(duplicate.result.reason,'no_recovery');assert.deepEqual(pages,['passenger-history']);
+});
+test('connectivity recovery action rereads once and then unlocks the correct role', async () => {
+  const {R}=setup();let reads=0;
+  const {flow,pages,commandUi}=recoveryFlow(R,'driver',async()=>{reads+=1;if(reads===1)throw Error('offline');return {status:200,body:currentRideView('driver')};});
+  const offline=await flow.recoverOnStartup();
+  assert.equal(offline.processed,true);assert.equal(commandUi.snapshot().action,'refresh');assert.deepEqual(pages,[]);
+  const restored=await flow.resume('connectivity');
+  assert.equal(restored.processed,true);assert.deepEqual(pages,['driver-trips']);assert.equal(commandUi.snapshot().disableCommands,false);assert.equal(reads,2);
+  assert.equal((await flow.resume('connectivity')).processed,false);assert.equal(reads,2);
+});
+test('reauthentication action keeps commands locked until the authorized reread succeeds', async () => {
+  const {R}=setup();let reads=0;
+  const {flow,pages,commandUi}=recoveryFlow(R,'passenger',async()=>{reads+=1;return reads===1?{status:401}:{status:204};});
+  await flow.recoverOnStartup();assert.equal(commandUi.snapshot().action,'reauth');assert.deepEqual(pages,[]);
+  const restored=await flow.resume('reauth');
+  assert.equal(restored.processed,true);assert.deepEqual(pages,['home']);assert.equal(commandUi.snapshot().disableCommands,false);
+});
+test('a new authenticated session is initialized and applied through one flow', async () => {
+  const {R}=setup();let reads=0;
+  const {flow,controller,pages}=recoveryFlow(R,'driver',async()=>{reads+=1;return {status:204};},{accountRef:'driver-a',viewerRole:'driver'});
+  controller.replacePrincipal(null);
+  const started=await flow.beginSession({accountRef:'driver-b',viewerRole:'driver'});
+  assert.equal(started.processed,true);assert.equal(started.reason,'home_restored');assert.deepEqual(pages,['driver-home']);assert.equal(reads,1);
+  const duplicate=await flow.beginSession({accountRef:'driver-b',viewerRole:'driver'});
+  assert.equal(duplicate.processed,false);assert.equal(duplicate.reason,'already_initialized');assert.equal(reads,1);
+});
+test('disposing a role flow aborts its read and rejects the delayed completion', async () => {
+  const {R}=setup();let resolve;
+  const {flow,pages,commandUi}=recoveryFlow(R,'passenger',()=>new Promise(done=>{resolve=done;}));
+  const pending=flow.recoverOnStartup();
+  const disposed=flow.dispose();assert.equal(disposed.disposed,true);
+  resolve({status:200,body:currentRideView('passenger')});
+  const stale=await pending;
+  assert.equal(stale.processed,false);assert.equal(stale.reason,'flow_stale');assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().disableCommands,true);
+  assert.equal((await flow.resume('connectivity')).reason,'flow_disposed');
+});
+test('role mismatch and invalid recovery actions send no discovery request', async () => {
+  const {R}=setup();let reads=0;
+  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;return {status:204};});
+  const wrong=await flow.beginSession({accountRef:'driver-account',viewerRole:'driver'});
+  assert.equal(wrong.processed,false);assert.equal(wrong.reason,'role_mismatch');
+  const invalid=await flow.resume('automatic');
+  assert.equal(invalid.processed,false);assert.equal(invalid.reason,'invalid_resume_reason');assert.equal(reads,0);assert.deepEqual(pages,[]);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');
