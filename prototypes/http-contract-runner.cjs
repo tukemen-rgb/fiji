@@ -1,6 +1,7 @@
 'use strict';
 
 const http = require('node:http');
+const crypto = require('node:crypto');
 
 const FIXTURE = Object.freeze({
   requestId: 'ride-owner-1',
@@ -31,9 +32,13 @@ function errorBody(code, message, suffix = 'error') {
   return {code, message, requestId: `trace-mock-${suffix}`};
 }
 
-function send(res, status, body) {
+function send(res, status, body, headers = {}) {
+  if (status === 304) {
+    res.writeHead(status, headers);
+    return res.end();
+  }
   const encoded = JSON.stringify(body);
-  res.writeHead(status, {'content-type': 'application/json', 'content-length': Buffer.byteLength(encoded)});
+  res.writeHead(status, {...headers, 'content-type': 'application/json', 'content-length': Buffer.byteLength(encoded)});
   res.end(encoded);
 }
 
@@ -84,6 +89,17 @@ function rideStateView(state, actor) {
     nextAction: (actor.role === 'passenger' ? passengerActions : driverActions)[state.ride.status],
     updatedAt: new Date(state.clockMs).toISOString()
   };
+}
+
+function rideStateEtag(state, actor) {
+  const digest = crypto.createHash('sha256').update(JSON.stringify(rideStateView(state, actor))).digest('base64url').slice(0, 24);
+  return `"${digest}"`;
+}
+
+function matchesIfNoneMatch(value, etag) {
+  if (!value) return false;
+  const normalized = token => token.trim().replace(/^W\//i, '');
+  return String(value).split(',').some(candidate => candidate.trim() === '*' || normalized(candidate) === etag);
 }
 
 function createMockState(options = {}) {
@@ -188,7 +204,10 @@ function createMockHandler(state = createMockState()) {
       const ownsRide = actor.role === 'passenger' && actor.id === 'passenger-owner';
       const isAssignedDriver = actor.role === 'driver' && actor.id === state.ride.assignedDriverId;
       if (!ownsRide && !isAssignedDriver) return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      return send(res, 200, rideStateView(state, actor));
+      const etag = rideStateEtag(state, actor);
+      const headers = {'etag': etag, 'cache-control': 'private, no-cache', 'vary': 'Authorization'};
+      if (matchesIfNoneMatch(req.headers['if-none-match'], etag)) return send(res, 304, null, headers);
+      return send(res, 200, rideStateView(state, actor), headers);
     }
 
     if (req.method === 'GET' && url.pathname === offersPath) {
@@ -361,7 +380,16 @@ async function requestJson(baseUrl, scenario, fetchImpl) {
   if (scenario.token) headers.authorization = `Bearer ${scenario.token}`;
   if (scenario.body !== undefined) headers['content-type'] = 'application/json';
   const response = await fetchImpl(`${baseUrl}${scenario.path}`, {method: scenario.method, headers, body: scenario.body === undefined ? undefined : JSON.stringify(scenario.body)});
-  return {status: response.status, body: await response.json()};
+  const text = await response.text();
+  const result = {status: response.status, body: text ? JSON.parse(text) : null};
+  if (scenario.captureHeaders) {
+    result.headers = {
+      etag: response.headers.get('etag'),
+      cacheControl: response.headers.get('cache-control'),
+      vary: response.headers.get('vary')
+    };
+  }
+  return result;
 }
 
 async function runHttpContract(baseUrl, tokens = FIXTURE.tokens, fetchImpl = fetch) {
@@ -575,8 +603,8 @@ async function runBoardingRaceCase(winner) {
     if (replay.status !== 200 || JSON.stringify(replay.body) !== JSON.stringify(winningResult.body)) throw new Error(`${winner}-first exact replay was not stable`);
     if (mock.state.ride.revision !== 7 || mock.state.auditEvents.length !== 2) throw new Error(`${winner}-first race changed state or audit more than once`);
     if (winner === 'cancel' && mock.state.ride.vehicleConfirmation !== null) throw new Error('cancellation winner retained vehicle confirmation');
-    const read = token => requestJson(mock.baseUrl, {
-      method: 'GET', path: `/v1/rides/${FIXTURE.requestId}`, token
+    const read = (token, headers = {}) => requestJson(mock.baseUrl, {
+      method: 'GET', path: `/v1/rides/${FIXTURE.requestId}`, token, headers, captureHeaders: true
     }, fetch);
     const auditCount = mock.state.auditEvents.length;
     const storedKeys = mock.state.idempotency.size;
@@ -591,6 +619,22 @@ async function runBoardingRaceCase(winner) {
       throw new Error(`${winner}-first recovery returned stale state`);
     }
     if (otherPassenger.status !== 404 || otherDriver.status !== 404) throw new Error(`${winner}-first recovery exposed the ride to a non-participant`);
+    const [passengerNotModified, driverNotModified, stalePassenger, crossRoleValidator, wildcardPassenger, wildcardOther] = await Promise.all([
+      read(FIXTURE.tokens.owner, {'If-None-Match': passenger.headers.etag}),
+      read(FIXTURE.tokens.assignedDriver, {'If-None-Match': `W/${driver.headers.etag}`}),
+      read(FIXTURE.tokens.owner, {'If-None-Match': '"obsolete-validator"'}),
+      read(FIXTURE.tokens.assignedDriver, {'If-None-Match': passenger.headers.etag}),
+      read(FIXTURE.tokens.owner, {'If-None-Match': '*'}),
+      read(FIXTURE.tokens.otherPassenger, {'If-None-Match': '*'})
+    ]);
+    if (passengerNotModified.status !== 304 || driverNotModified.status !== 304 || passengerNotModified.body !== null || driverNotModified.body !== null) {
+      throw new Error(`${winner}-first matching validator did not return an empty 304`);
+    }
+    if (stalePassenger.status !== 200 || stalePassenger.body.revision !== 7 || stalePassenger.headers.etag !== passenger.headers.etag) {
+      throw new Error(`${winner}-first stale validator did not return current state`);
+    }
+    if (crossRoleValidator.status !== 200 || crossRoleValidator.body.viewerRole !== 'driver') throw new Error(`${winner}-first shared a passenger validator with the driver representation`);
+    if (wildcardPassenger.status !== 304 || wildcardOther.status !== 404) throw new Error(`${winner}-first evaluated a validator before participant authorization`);
     if (mock.state.auditEvents.length !== auditCount || mock.state.idempotency.size !== storedKeys || mock.state.ride.revision !== 7) {
       throw new Error(`${winner}-first recovery read mutated command state`);
     }
@@ -599,7 +643,7 @@ async function runBoardingRaceCase(winner) {
       cancel,
       start,
       replay,
-      recovery: {passenger, driver, otherPassenger, otherDriver},
+      recovery: {passenger, driver, otherPassenger, otherDriver, passengerNotModified, driverNotModified, stalePassenger, crossRoleValidator, wildcardPassenger, wildcardOther},
       state: structuredClone(mock.state.ride),
       auditEvents: structuredClone(mock.state.auditEvents),
       storedKeys
@@ -625,7 +669,7 @@ if (require.main === module) {
     console.log(`HTTP race OK: ${race.winner.command} won, ${race.loser.command} received stale_revision, exact replay was stable, changed replay was rejected`);
     console.log(`HTTP validity OK: ${validity.expired.result.body.code}, exact-boundary expiry, ${validity.ineligible.result.body.code}, client clock rejected, current offer selected`);
     console.log(`HTTP ride safety OK: vehicle mismatch invalidated confirmation, unconfirmed/revoked start blocked, allowed path completed at revision ${rideSafety.state.revision}`);
-    console.log(`HTTP boarding race OK: ${boardingRace.cancelFirst.winner} and ${boardingRace.startFirst.winner} each won their ordered race; every loser received stale_revision and both participants recovered current state`);
+    console.log(`HTTP boarding race OK: ${boardingRace.cancelFirst.winner} and ${boardingRace.startFirst.winner} each won; role-safe recovery returned current state or an empty conditional 304`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);

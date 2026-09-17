@@ -16,7 +16,9 @@ Vehicle confirmation and ride-transition scenarios use the same revision, idempo
 
 The boarding race sends passenger cancellation and driver `arriving -> on_trip` from the same revision over concurrent loopback HTTP requests. Both deterministic orderings are exercised: cancellation-first clears vehicle proof and makes ride start return `409 stale_revision`; start-first enters `on_trip` and makes cancellation return the same safe conflict. Exactly one command returns 200 and revision 7, the loser receives current revision 7, and replaying the winner does not add a state or audit change. Small injected mock delays control which request reaches the serialized section first; they are test scaffolding, not evidence of production scheduling, database isolation or multi-server locking.
 
-After either race, both the owning passenger and the currently assigned driver read `GET /v1/rides/{requestId}`. Each receives the same current status and revision with a role-specific `nextAction`; unrelated passengers and drivers receive a concealed `404 resource_not_found`. The response uses a six-field allowlist and excludes assignment identifiers, vehicle-confirmation internals, plates, contact details and permit data. Reads do not consume idempotency keys, advance revision or append audit events. This is a recovery contract, not evidence of real authentication, caching, push delivery or cross-device synchronization.
+After either race, both the owning passenger and the currently assigned driver read `GET /v1/rides/{requestId}`. Each receives the same current status and revision with a role-specific `nextAction`; unrelated passengers and drivers receive a concealed `404 resource_not_found`. The response uses a six-field allowlist and excludes assignment identifiers, vehicle-confirmation internals, plates, contact details and permit data. Reads do not consume idempotency keys, advance revision or append audit events.
+
+The recovery read also returns an opaque ETag scoped to the current revision and authenticated viewer role. A matching strong or weak `If-None-Match` returns `304 Not Modified` with no body; an old or other-role validator returns 200 with the current role-shaped body and replacement ETag. Authorization and assignment checks happen before evaluating `If-None-Match`, including the wildcard, so a validator cannot reveal a foreign ride. Both 200 and 304 require `Cache-Control: private, no-cache` and `Vary: Authorization`. This is an executable loopback contract, not evidence of production proxy/CDN behavior, push delivery or cross-device synchronization.
 
 ## Common rules
 
@@ -84,6 +86,9 @@ Acceptance:
 - Return `404 resource_not_found` for another passenger or an unassigned driver so ownership and assignment are not disclosed.
 - Do not return actor IDs, contact details, permits, document references, raw or booked plates, confirmation evidence, internal assignment fields or server authorization decisions.
 - The read is side-effect free: it does not change revision, consume an idempotency key or create a command audit event.
+- Return a representation-specific ETag that changes with revision and authenticated viewer role. Do not expose an internal database version, account ID or secret in the tag.
+- Accept optional `If-None-Match`. Evaluate ownership/assignment first; then return bodyless 304 only for the same authorized role-shaped representation. Return 200 and the new ETag for an old or other-role tag.
+- Send `Cache-Control: private, no-cache` and `Vary: Authorization` on both 200 and 304 so shared caches do not reuse authenticated role-specific responses.
 
 ### `POST /v1/rides/{requestId}/vehicle-confirmations` — owning passenger
 
@@ -140,5 +145,6 @@ Error bodies contain a stable `code`, safe localized message, `requestId` for su
 10. fresh confirmation permits only the allowed `arriving -> on_trip -> completed` path.
 11. cancellation/start races in both commit orders have one winner, one stale loser, stable replay and two non-duplicated audit decisions.
 12. both race participants can recover current role-shaped state, while unrelated actors receive a concealed error and reads remain side-effect free.
+13. role/revision ETags support strong, weak and wildcard revalidation; old or other-role tags return the current 200 representation, and authorization precedes cache validation.
 
 These are sequential reference-model tests, not proof of database locking, real concurrency, HTTP authentication or cross-device behavior. Claude's production PR must add integration tests that send concurrent commands to the real persistence layer and verify one winner, stable idempotent replay and complete audit events.

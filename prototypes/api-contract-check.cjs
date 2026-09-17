@@ -103,6 +103,20 @@ function validateContract(spec) {
   for (const field of Object.keys(rideState?.properties || {})) {
     if (!safeRideStateFields.has(field)) add(`RideStateView must not expose private field ${field}`);
   }
+  const ridePath = spec.paths?.['/v1/rides/{requestId}'];
+  const rideRead = ridePath?.get;
+  const rideReadParameters = parametersFor(spec, ridePath || {}, rideRead || {});
+  if (!rideReadParameters.some(parameter => parameter?.in === 'header' && parameter.name === 'If-None-Match' && parameter.required === false)) {
+    add('getRideState must accept optional If-None-Match');
+  }
+  if (!rideRead?.responses?.['304']) add('getRideState must document bodyless 304');
+  for (const code of ['200', '304']) {
+    const headers = rideRead?.responses?.[code]?.headers || {};
+    for (const name of ['ETag', 'Cache-Control', 'Vary']) if (!headers[name]) add(`getRideState ${code} requires ${name} header`);
+  }
+  if (rideRead?.responses?.['304']?.content) add('getRideState 304 must not define a response body');
+  if (spec.components?.headers?.PrivateNoCache?.schema?.const !== 'private, no-cache') add('ride state cache control must be private, no-cache');
+  if (spec.components?.headers?.VaryAuthorization?.schema?.const !== 'Authorization') add('ride state response must vary by Authorization');
   return errors;
 }
 
@@ -114,7 +128,7 @@ if (require.main === module) {
       console.error(`API contract failed (${errors.length})\n- ${errors.join('\n- ')}`);
       process.exitCode = 1;
     } else {
-      console.log(`API contract OK: ${OPERATIONS.length} operations, authentication, idempotency, revision, safe-input and recovery-output checks`);
+      console.log(`API contract OK: ${OPERATIONS.length} operations, authentication, idempotency, revision, safe recovery and conditional-read checks`);
     }
   } catch (error) {
     console.error(`API contract could not be read: ${error.message}`);

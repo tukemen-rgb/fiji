@@ -401,6 +401,12 @@ test('API checker fails closed when safety requirements are removed', () => {
   const leakedRideState=structuredClone(loadContract());
   leakedRideState.components.schemas.RideStateView.properties.assignedDriverId={type:'string'};
   assert.ok(validateContract(leakedRideState).some(message=>message.includes('RideStateView must not expose private field assignedDriverId')));
+  const noConditional=structuredClone(loadContract());
+  delete noConditional.paths['/v1/rides/{requestId}'].get.responses['304'];
+  assert.ok(validateContract(noConditional).some(message=>message.includes('getRideState must document bodyless 304')));
+  const sharedCache=structuredClone(loadContract());
+  sharedCache.components.headers.PrivateNoCache.schema.const='public, max-age=60';
+  assert.ok(validateContract(sharedCache).some(message=>message.includes('ride state cache control must be private, no-cache')));
 });
 test('HTTP contract runner enforces role, ownership, eligibility and safe errors over loopback', async () => {
   const results=await runMockContract();
@@ -417,7 +423,7 @@ test('HTTP contract scenarios conceal foreign resources instead of leaking owner
   assert.ok(hidden.every(s=>s.expected[1]==='resource_not_found'));
 });
 test('HTTP contract runner fails when a permissive transport returns success for every request', async () => {
-  const permissiveFetch=async()=>({status:200,json:async()=>({})});
+  const permissiveFetch=async()=>({status:200,text:async()=>'{}',headers:{get:()=>null}});
   await assert.rejects(runHttpContract('http://mock.invalid',undefined,permissiveFetch),/no session cannot read offers/);
 });
 test('concurrent offer selection and cancellation produce exactly one HTTP winner', async () => {
@@ -585,11 +591,11 @@ test('cancellation-race participants recover role-shaped cancelled state', async
   assert.deepEqual(recovery.passenger,{status:200,body:{
     id:FIXTURE.requestId,status:'cancelled',revision:7,viewerRole:'passenger',
     nextAction:'show_cancelled_history',updatedAt:'2026-09-17T03:00:00.000Z'
-  }});
+  },headers:{etag:recovery.passenger.headers.etag,cacheControl:'private, no-cache',vary:'Authorization'}});
   assert.deepEqual(recovery.driver,{status:200,body:{
     id:FIXTURE.requestId,status:'cancelled',revision:7,viewerRole:'driver',
     nextAction:'show_cancelled_trip',updatedAt:'2026-09-17T03:00:00.000Z'
-  }});
+  },headers:{etag:recovery.driver.headers.etag,cacheControl:'private, no-cache',vary:'Authorization'}});
 });
 test('ride-start-race participants recover role-shaped on-trip state', async () => {
   const {recovery}= (await boardingRaceResults()).startFirst;
@@ -626,5 +632,52 @@ test('recovery reads do not advance revision, consume idempotency keys or add au
     assert.equal(race.storedKeys,2);
     assert.equal(race.auditEvents.length,2);
     assert.deepEqual(race.auditEvents.map(event=>event.id),['audit-1','audit-2']);
+  }
+});
+test('ride-state responses use private role-scoped validators', async () => {
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    assert.match(race.recovery.passenger.headers.etag,/^"[A-Za-z0-9_-]{24}"$/);
+    assert.match(race.recovery.driver.headers.etag,/^"[A-Za-z0-9_-]{24}"$/);
+    assert.notEqual(race.recovery.passenger.headers.etag,race.recovery.driver.headers.etag);
+    for(const result of [race.recovery.passenger,race.recovery.driver]){
+      assert.equal(result.headers.cacheControl,'private, no-cache');
+      assert.equal(result.headers.vary,'Authorization');
+    }
+  }
+});
+test('matching strong and weak validators return bodyless 304', async () => {
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    assert.deepEqual([race.recovery.passengerNotModified.status,race.recovery.passengerNotModified.body],[304,null]);
+    assert.deepEqual([race.recovery.driverNotModified.status,race.recovery.driverNotModified.body],[304,null]);
+    assert.equal(race.recovery.passengerNotModified.headers.etag,race.recovery.passenger.headers.etag);
+    assert.equal(race.recovery.driverNotModified.headers.etag,race.recovery.driver.headers.etag);
+  }
+});
+test('a stale validator returns the current representation and replacement ETag', async () => {
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    assert.equal(race.recovery.stalePassenger.status,200);
+    assert.equal(race.recovery.stalePassenger.body.revision,7);
+    assert.equal(race.recovery.stalePassenger.body.status,race.state.status);
+    assert.equal(race.recovery.stalePassenger.headers.etag,race.recovery.passenger.headers.etag);
+  }
+});
+test('a passenger validator cannot suppress the driver representation', async () => {
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    assert.equal(race.recovery.crossRoleValidator.status,200);
+    assert.equal(race.recovery.crossRoleValidator.body.viewerRole,'driver');
+    assert.equal(race.recovery.crossRoleValidator.headers.etag,race.recovery.driver.headers.etag);
+  }
+});
+test('wildcard revalidation occurs only after participant authorization', async () => {
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    assert.deepEqual([race.recovery.wildcardPassenger.status,race.recovery.wildcardPassenger.body],[304,null]);
+    assert.equal(race.recovery.wildcardOther.status,404);
+    assert.equal(race.recovery.wildcardOther.body.code,'resource_not_found');
+    assert.equal(race.recovery.wildcardOther.headers.etag,null);
   }
 });

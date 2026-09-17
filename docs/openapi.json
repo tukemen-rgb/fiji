@@ -112,9 +112,28 @@
         "operationId": "getRideState",
         "summary": "Read the latest role-shaped ride state after a conflict or reconnect",
         "tags": ["Passenger", "Driver"],
-        "parameters": [{ "$ref": "#/components/parameters/RequestId" }],
+        "parameters": [
+          { "$ref": "#/components/parameters/RequestId" },
+          { "$ref": "#/components/parameters/IfNoneMatch" }
+        ],
         "responses": {
-          "200": { "description": "Current state and the viewer's safe next action", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RideStateView" } } } },
+          "200": {
+            "description": "Current state and the viewer's safe next action",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/RideStateETag" },
+              "Cache-Control": { "$ref": "#/components/headers/PrivateNoCache" },
+              "Vary": { "$ref": "#/components/headers/VaryAuthorization" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RideStateView" } } }
+          },
+          "304": {
+            "description": "The authorized viewer's role-shaped representation has not changed; no response body",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/RideStateETag" },
+              "Cache-Control": { "$ref": "#/components/headers/PrivateNoCache" },
+              "Vary": { "$ref": "#/components/headers/VaryAuthorization" }
+            }
+          },
           "401": { "$ref": "#/components/responses/AuthenticationRequired" },
           "403": { "$ref": "#/components/responses/RoleDenied" },
           "404": { "$ref": "#/components/responses/NotFound" }
@@ -175,7 +194,13 @@
     "parameters": {
       "RequestId": { "name": "requestId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
       "OfferId": { "name": "offerId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+      "IfNoneMatch": { "name": "If-None-Match", "in": "header", "required": false, "schema": { "type": "string", "minLength": 1 }, "description": "Opaque ETag previously returned for this authenticated role-shaped representation" },
       "IdempotencyKey": { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string", "minLength": 16, "maxLength": 128 } }
+    },
+    "headers": {
+      "RideStateETag": { "description": "Opaque validator scoped to the ride revision and authenticated viewer role", "schema": { "type": "string" } },
+      "PrivateNoCache": { "description": "Prevents shared reuse and requires revalidation", "schema": { "type": "string", "const": "private, no-cache" } },
+      "VaryAuthorization": { "description": "Separates authenticated representations", "schema": { "type": "string", "const": "Authorization" } }
     },
     "schemas": {
       "Place": {
