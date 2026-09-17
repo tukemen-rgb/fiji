@@ -69,7 +69,7 @@ function createMockState(options = {}) {
       status: rideStatus,
       revision: options.rideRevision ?? FIXTURE.revision,
       assignedDriverId: options.assignedDriverId ?? (rideStatus === 'collecting' ? null : 'driver-assigned'),
-      vehicleConfirmation: null
+      vehicleConfirmation: options.vehicleConfirmation ? structuredClone(options.vehicleConfirmation) : null
     },
     offer: {
       id: FIXTURE.offerId,
@@ -84,6 +84,7 @@ function createMockState(options = {}) {
       'driver-assigned': options.assignedDriverEligible ?? true
     },
     bookedPlate: normalizePlate(options.bookedPlate ?? 'DEMO 001'),
+    commandDelays: {...(options.commandDelays || {})},
     clockMs,
     auditEvents: [],
     auditSequence: 0,
@@ -199,6 +200,7 @@ function createMockHandler(state = createMockState()) {
     if (req.method === 'POST' && url.pathname === cancelPath) {
       if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
       if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
+      if (state.commandDelays.cancel) await new Promise(resolve => setTimeout(resolve, state.commandDelays.cancel));
       const response = await atomicCommand(state, actor, req, url, body, () => {
         const fromRevision = state.ride.revision;
         if (Number(body.expectedRevision) !== state.ride.revision) {
@@ -209,7 +211,7 @@ function createMockHandler(state = createMockState()) {
           recordAudit(state, actor, {type: 'ride.cancellation', outcome: 'rejected', reason: 'invalid_transition', fromRevision, toRevision: fromRevision});
           return {status: 409, body: errorBody('invalid_transition', 'The request can no longer be cancelled.', 'transition')};
         }
-        state.ride.status = 'cancelled'; state.ride.revision += 1; state.ride.cancelReason = body.reason;
+        state.ride.status = 'cancelled'; state.ride.revision += 1; state.ride.cancelReason = body.reason; state.ride.vehicleConfirmation = null;
         recordAudit(state, actor, {type: 'ride.cancellation', outcome: 'committed', fromRevision, toRevision: state.ride.revision});
         return {status: 200, body: structuredClone(state.ride)};
       });
@@ -267,6 +269,7 @@ function createMockHandler(state = createMockState()) {
           typeof body.from !== 'string' || typeof body.to !== 'string') {
         return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
       }
+      if (state.commandDelays.transition) await new Promise(resolve => setTimeout(resolve, state.commandDelays.transition));
       const response = await atomicCommand(state, actor, req, url, body, () => {
         const fromRevision = state.ride.revision;
         if (Number(body.expectedRevision) !== fromRevision) {
@@ -437,21 +440,21 @@ async function runConcurrencyContract() {
 }
 
 async function runAuditContract() {
-  const [race, validity, rideSafety] = await Promise.all([runConcurrencyContract(), runOfferValidityContract(), runRideSafetyContract()]);
+  const [race, validity, rideSafety, boardingRace] = await Promise.all([runConcurrencyContract(), runOfferValidityContract(), runRideSafetyContract(), runBoardingRaceContract()]);
   if (race.auditEvents.length !== 2) throw new Error('concurrent commands and exact replay did not produce exactly two audit events');
   if (race.auditEvents.filter(event => event.outcome === 'committed').length !== 1) throw new Error('race audit did not record exactly one committed command');
   if (race.auditEvents.filter(event => event.reason === 'stale_revision').length !== 1) throw new Error('race audit did not record the stale loser');
   if (validity.expired.auditEvents[0]?.reason !== 'offer_expired') throw new Error('expired selection rejection was not audited');
   if (validity.ineligible.auditEvents[0]?.reason !== 'driver_unavailable') throw new Error('eligibility rejection was not audited');
   if (validity.valid.auditEvents[0]?.outcome !== 'committed') throw new Error('successful selection was not audited');
-  const events = [...race.auditEvents, ...validity.expired.auditEvents, ...validity.ineligible.auditEvents, ...validity.valid.auditEvents, ...rideSafety.auditEvents];
+  const events = [...race.auditEvents, ...validity.expired.auditEvents, ...validity.ineligible.auditEvents, ...validity.valid.auditEvents, ...rideSafety.auditEvents, ...boardingRace.cancelFirst.auditEvents, ...boardingRace.startFirst.auditEvents];
   for (const event of events) {
     if (Object.keys(event).join('|') !== AUDIT_FIELDS.join('|')) throw new Error(`audit event contains unexpected fields: ${Object.keys(event).join(',')}`);
   }
   const encoded = JSON.stringify(events);
   const forbidden = [...Object.values(FIXTURE.tokens), 'Idempotency-Key', 'phone', 'email', 'observedPlate', 'permit', '+679', '@'];
   if (forbidden.some(value => encoded.toLowerCase().includes(value.toLowerCase()))) throw new Error('audit events contain a credential or private input');
-  return {race, validity, rideSafety, events};
+  return {race, validity, rideSafety, boardingRace, events};
 }
 
 async function runRideSafetyContract() {
@@ -497,14 +500,77 @@ async function runRideSafetyContract() {
   }
 }
 
+async function runBoardingRaceCase(winner) {
+  const delayLoser = winner === 'cancel' ? {transition: 15} : {cancel: 15};
+  const mock = await startMockServer({
+    rideStatus: 'arriving',
+    rideRevision: 6,
+    assignedDriverId: 'driver-assigned',
+    vehicleConfirmation: {
+      requestId: FIXTURE.requestId,
+      assignmentRevision: 5,
+      confirmedAt: '2026-09-17T03:00:00.000Z',
+      validForRevision: 6
+    },
+    commandDelays: delayLoser
+  });
+  const commands = {
+    cancel: {
+      method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/cancel`, token: FIXTURE.tokens.owner,
+      headers: {'Idempotency-Key': `boarding-race-${winner}-cancel-0001`},
+      body: {expectedRevision: 6, reason: 'passenger_requested'}
+    },
+    start: {
+      method: 'POST', path: `/v1/rides/${FIXTURE.requestId}/transitions`, token: FIXTURE.tokens.assignedDriver,
+      headers: {'Idempotency-Key': `boarding-race-${winner}-start-0001`},
+      body: {from: 'arriving', to: 'on_trip', expectedRevision: 6}
+    }
+  };
+  try {
+    const [cancel, start] = await Promise.all([
+      requestJson(mock.baseUrl, commands.cancel, fetch),
+      requestJson(mock.baseUrl, commands.start, fetch)
+    ]);
+    const expected = winner === 'cancel' ? {cancel: 200, start: 409} : {cancel: 409, start: 200};
+    if (cancel.status !== expected.cancel || start.status !== expected.start) throw new Error(`${winner}-first boarding race produced an unexpected winner`);
+    const loser = winner === 'cancel' ? start : cancel;
+    if (loser.body?.code !== 'stale_revision' || loser.body?.revision !== 7) throw new Error(`${winner}-first boarding race loser did not receive current revision`);
+    const winningCommand = commands[winner];
+    const winningResult = winner === 'cancel' ? cancel : start;
+    const replay = await requestJson(mock.baseUrl, winningCommand, fetch);
+    if (replay.status !== 200 || JSON.stringify(replay.body) !== JSON.stringify(winningResult.body)) throw new Error(`${winner}-first exact replay was not stable`);
+    if (mock.state.ride.revision !== 7 || mock.state.auditEvents.length !== 2) throw new Error(`${winner}-first race changed state or audit more than once`);
+    if (winner === 'cancel' && mock.state.ride.vehicleConfirmation !== null) throw new Error('cancellation winner retained vehicle confirmation');
+    return {
+      winner,
+      cancel,
+      start,
+      replay,
+      state: structuredClone(mock.state.ride),
+      auditEvents: structuredClone(mock.state.auditEvents)
+    };
+  } finally {
+    await mock.close();
+  }
+}
+
+async function runBoardingRaceContract() {
+  const [cancelFirst, startFirst] = await Promise.all([
+    runBoardingRaceCase('cancel'),
+    runBoardingRaceCase('start')
+  ]);
+  return {cancelFirst, startFirst};
+}
+
 if (require.main === module) {
   Promise.all([runMockContract(), runAuditContract()]).then(([results, audit]) => {
-    const {race, validity, rideSafety} = audit;
+    const {race, validity, rideSafety, boardingRace} = audit;
     const denied = results.filter(r => r.status >= 400).length;
     console.log(`HTTP contract OK: ${results.length} scenarios (${denied} safe denials, ${results.length - denied} positive controls)`);
     console.log(`HTTP race OK: ${race.winner.command} won, ${race.loser.command} received stale_revision, exact replay was stable, changed replay was rejected`);
     console.log(`HTTP validity OK: ${validity.expired.result.body.code}, exact-boundary expiry, ${validity.ineligible.result.body.code}, client clock rejected, current offer selected`);
     console.log(`HTTP ride safety OK: vehicle mismatch invalidated confirmation, unconfirmed/revoked start blocked, allowed path completed at revision ${rideSafety.state.revision}`);
+    console.log(`HTTP boarding race OK: ${boardingRace.cancelFirst.winner} and ${boardingRace.startFirst.winner} each won their ordered race; every loser received stale_revision`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -512,4 +578,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runAuditContract, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runAuditContract, startMockServer};

@@ -14,6 +14,8 @@ The loopback runner also records allowlisted audit events for offer selection an
 
 Vehicle confirmation and ride-transition scenarios use the same revision, idempotency and audit mechanism. The booked plate is normalized server-side; the raw observed plate is never copied into audit events. A later mismatch invalidates an existing confirmation and advances the revision so a stale ride-start command cannot reuse it. `arriving -> on_trip` requires both a confirmation current for that exact revision and a currently eligible assigned driver. Exact confirmation/transition replays do not advance state or duplicate audit records.
 
+The boarding race sends passenger cancellation and driver `arriving -> on_trip` from the same revision over concurrent loopback HTTP requests. Both deterministic orderings are exercised: cancellation-first clears vehicle proof and makes ride start return `409 stale_revision`; start-first enters `on_trip` and makes cancellation return the same safe conflict. Exactly one command returns 200 and revision 7, the loser receives current revision 7, and replaying the winner does not add a state or audit change. Small injected mock delays control which request reaches the serialized section first; they are test scaffolding, not evidence of production scheduling, database isolation or multi-server locking.
+
 ## Common rules
 
 - Prefix examples with `/v1`. HTTPS and authenticated sessions are mandatory in production.
@@ -68,6 +70,7 @@ Input: `expectedRevision`, reason enum (`passenger_requested`, `route_changed`, 
 Acceptance:
 - Permit `collecting`, `assigned` and `arriving`; reject `on_trip` and `completed` with `409 invalid_transition`.
 - Atomically set `cancelled`, increment revision, expire all offers and invalidate vehicle confirmation while retaining selected quote/driver history.
+- If cancellation races with `arriving -> on_trip` from the same revision, only the command that locks and commits first may succeed. Cancellation-first must clear confirmation; start-first must make cancellation stale because `on_trip` is not cancellable.
 - An exact retry with the same idempotency key returns the original cancellation even when the submitted expected revision is now old.
 - Do not automatically return an assigned driver to on-duty state. No fee is charged by this endpoint unless a separately approved policy and payment flow exists.
 
@@ -91,6 +94,7 @@ Acceptance:
 - `arriving -> on_trip` additionally requires a bound vehicle confirmation valid for the exact current revision; otherwise return `409 vehicle_confirmation_required` without advancing state.
 - Recheck the assigned driver's current eligibility inside the serialized transition. Revocation returns `409 driver_unavailable` without consuming the confirmation or changing the ride.
 - A cancellation or another transition that commits first makes the stale transition return `409 stale_revision` without changing state.
+- When ride start commits first, a concurrent cancellation from the prior revision returns `409 stale_revision`; the cancellation path must not overwrite `on_trip`.
 
 ## Standard errors
 
@@ -123,5 +127,6 @@ Error bodies contain a stable `code`, safe localized message, `requestId` for su
 8. a later mismatch invalidates proof and advances revision;
 9. missing proof or revoked eligibility blocks ride start without advancing state;
 10. fresh confirmation permits only the allowed `arriving -> on_trip -> completed` path.
+11. cancellation/start races in both commit orders have one winner, one stale loser, stable replay and two non-duplicated audit decisions.
 
 These are sequential reference-model tests, not proof of database locking, real concurrency, HTTP authentication or cross-device behavior. Claude's production PR must add integration tests that send concurrent commands to the real persistence layer and verify one winner, stable idempotent replay and complete audit events.

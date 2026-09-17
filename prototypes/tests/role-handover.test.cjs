@@ -6,13 +6,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runAuditContract} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runAuditContract} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
 function auditedHttpResults() { return auditContract ||= runAuditContract(); }
 let rideSafetyContract;
 function rideSafetyResults() { return rideSafetyContract ||= runRideSafetyContract(); }
+let boardingRaceContract;
+function boardingRaceResults() { return boardingRaceContract ||= runBoardingRaceContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -540,4 +542,38 @@ test('ride safety audit records decisions without observed plate or replay dupli
   assert.ok(!encoded.includes('demo 001'));
   assert.ok(!encoded.includes('demo 999'));
   assert.ok(!encoded.includes('observedplate'));
+});
+test('boarding race commits exactly one of cancellation and ride start', async () => {
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    assert.deepEqual([race.cancel.status,race.start.status].sort((a,b)=>a-b),[200,409]);
+    assert.equal(race.state.revision,7);
+    assert.equal(race.auditEvents.filter(event=>event.outcome==='committed').length,1);
+    assert.equal(race.auditEvents.filter(event=>event.reason==='stale_revision').length,1);
+  }
+});
+test('cancellation-first prevents stale ride start and clears vehicle proof', async () => {
+  const {cancelFirst}=await boardingRaceResults();
+  assert.equal(cancelFirst.cancel.status,200);
+  assert.equal(cancelFirst.state.status,'cancelled');
+  assert.equal(cancelFirst.state.vehicleConfirmation,null);
+  assert.equal(cancelFirst.start.body.code,'stale_revision');
+  assert.equal(cancelFirst.start.body.revision,7);
+});
+test('ride-start-first prevents stale cancellation after boarding begins', async () => {
+  const {startFirst}=await boardingRaceResults();
+  assert.equal(startFirst.start.status,200);
+  assert.equal(startFirst.state.status,'on_trip');
+  assert.equal(startFirst.cancel.body.code,'stale_revision');
+  assert.equal(startFirst.cancel.body.revision,7);
+});
+test('boarding-race winner replay is stable without duplicate state or audit', async () => {
+  const races=await boardingRaceResults();
+  for(const race of [races.cancelFirst,races.startFirst]){
+    const winnerResult=race.winner==='cancel'?race.cancel:race.start;
+    assert.deepEqual(race.replay,winnerResult);
+    assert.equal(race.state.revision,7);
+    assert.equal(race.auditEvents.length,2);
+    assert.deepEqual(race.auditEvents.map(event=>event.id),['audit-1','audit-2']);
+  }
 });
