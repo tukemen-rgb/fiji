@@ -56,6 +56,57 @@ test('role routing keeps passenger and driver controls separate', () => {
   assert.equal(R.route('passenger',{},'driver-home'),'home');
   assert.equal(R.route('driver',{},'offers'),'driver-home');
 });
+test('command feedback uses separate passenger and driver wording', () => {
+  const {R}=setup();
+  const passenger=R.commandFeedback('passenger','pending');
+  const driver=R.commandFeedback('driver','pending');
+  assert.match(passenger.title,/依頼/);
+  assert.match(driver.title,/運行/);
+  assert.notEqual(passenger.title,driver.title);
+  assert.equal(passenger.disableCommands,true);
+  assert.equal(driver.disableCommands,true);
+});
+test('a pending command rejects duplicate button activation', () => {
+  const {R}=setup(),ui=R.createCommandUiController('passenger');
+  const first=ui.begin('passenger'),duplicate=ui.begin('passenger');
+  assert.equal(first.accepted,true);
+  assert.equal(duplicate.accepted,false);
+  assert.equal(duplicate.state.outcome,'pending');
+  assert.equal(duplicate.state.disableCommands,true);
+});
+test('confirmed command feedback unlocks state-changing controls', () => {
+  const {R}=setup(),ui=R.createCommandUiController('driver');
+  ui.begin('driver');const confirmed=ui.finish('confirmed');
+  assert.equal(confirmed.role,'driver');
+  assert.equal(confirmed.outcome,'confirmed');
+  assert.equal(confirmed.disableCommands,false);
+  assert.equal(confirmed.action,null);
+});
+test('an unresolved command stays locked until explicit latest-state acknowledgement', () => {
+  const {R}=setup(),ui=R.createCommandUiController('passenger');
+  ui.begin('passenger');const unresolved=ui.finish('unresolved');
+  assert.equal(unresolved.disableCommands,true);
+  assert.equal(unresolved.action,'refresh');
+  assert.equal(ui.begin('passenger').accepted,false);
+  assert.equal(ui.clear().outcome,'idle');
+  assert.equal(ui.begin('passenger').accepted,true);
+});
+test('session expiry presents reauthentication instead of another command attempt', () => {
+  const {R}=setup(),ui=R.createCommandUiController('driver');
+  ui.begin('driver');const expired=ui.finish('reauth');
+  assert.equal(expired.disableCommands,true);
+  assert.equal(expired.action,'reauth');
+  assert.match(expired.title,/再ログイン/);
+  assert.equal(ui.begin('driver').accepted,false);
+});
+test('role switching clears old command feedback before showing the other role', () => {
+  const {R}=setup(),ui=R.createCommandUiController('passenger');
+  ui.begin('passenger');ui.finish('unresolved');
+  const switched=ui.setRole('driver');
+  assert.equal(switched.role,'driver');
+  assert.equal(switched.outcome,'idle');
+  assert.equal(switched.disableCommands,false);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');

@@ -5,7 +5,7 @@
 /* Role-specific navigation and onboarding. */
 .text-control{background:white;border:0;font-size:11px;color:var(--muted);min-height:44px;padding:6px}.welcome{padding:28px 0 14px}.welcome h1{font-size:31px;letter-spacing:-1px;line-height:1.45;margin:10px 0}.flow-steps{display:flex;gap:18px;font-size:10px;color:var(--muted);padding:10px 0 25px}.flow-steps b{font-size:10px;font-weight:500;margin-right:3px;color:#313b34}.role-card{display:flex;gap:14px;align-items:center;width:100%;padding:23px 16px;border:1px solid #d8ddd6;border-radius:12px;background:white;text-align:left;color:var(--ink);margin-bottom:14px;min-height:138px}.role-card:hover{border-color:#7b887a}.role-icon{width:42px;height:42px;display:grid;place-items:center;background:var(--wash);border-radius:10px;flex:none}.role-copy{flex:1;min-width:0}.role-copy small{display:block;letter-spacing:.12em;font-size:9px;color:var(--muted);margin-bottom:7px}.role-copy strong{display:block;font-size:18px;font-weight:600;line-height:1.5}.role-copy span{display:block;font-size:11px;color:var(--muted);margin-top:4px;line-height:1.6}.role-copy em{display:block;font-style:normal;font-size:11px;margin-top:12px;color:#4e6155}.role-card>.icon{width:16px}.demo-note{font-size:11px;color:var(--muted);padding:12px 0;line-height:1.7}.demo-note p{margin-bottom:7px}.test-tools{border-top:1px solid var(--line);padding:16px 0;font-size:12px}.test-tools summary{padding:8px 0;cursor:pointer;min-height:44px}.test-tools .secondary{font-size:12px}.role-nav{grid-template-columns:repeat(4,1fr)}.role-nav .icon{width:21px;height:21px}.preference-line{display:flex;gap:8px;font-size:11px;color:var(--muted);margin-bottom:10px}.dashboard-header{display:flex;gap:14px;align-items:center;margin-bottom:15px}.status-dot{width:7px;height:7px;background:#747c75;border-radius:50%;display:inline-block;margin-right:5px}.status-dot.online{background:var(--accent)}.driver-stats{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--line);border-radius:12px;margin:15px 0}.driver-stats>div{padding:16px}.driver-stats>div+div{border-left:1px solid var(--line)}.driver-stats b{font-size:24px;font-weight:600;display:block}.driver-stats span{font-size:11px;color:var(--muted)}.small-title{font-size:13px;font-weight:600;margin:22px 0 12px}.trip-route{border-left:1px solid #aab5a9;margin:16px 0 16px 5px;padding-left:14px;font-size:14px;line-height:1.6;overflow-wrap:anywhere}.trip-route span{font-size:10px;color:var(--muted);display:block}.trip-route>div+div{margin-top:15px}.offer-form{border-top:1px solid var(--line);margin-top:15px;padding-top:2px}.two-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}.two-fields .field{margin:10px 0}.offer-status{font-size:12px;color:var(--accent);margin:12px 0}.review-step{display:flex;gap:10px;align-items:baseline;padding:10px 0;border-bottom:1px solid var(--line);font-size:12px}.review-step small{color:var(--muted);font-size:10px;min-width:20px}.review-step strong{font-size:11px;margin-left:auto;font-weight:400;color:var(--muted)}.trip-status{font-size:11px;margin-bottom:12px;color:var(--muted)}.empty{padding:24px 16px;border:1px dashed var(--line);border-radius:12px;color:var(--muted);font-size:12px;line-height:1.8}.evidence-summary{font-size:11px;color:var(--muted);margin:15px 0}.inline-list{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:10px 0}.profile-info{overflow-wrap:anywhere}#passenger-preferences:empty{display:none}.booking-banner{margin-bottom:15px}.card h2{overflow-wrap:anywhere}.field textarea{width:100%;border:1px solid var(--line);border-radius:8px;font:inherit}#current-role{white-space:nowrap}@media(max-width:370px){.role-card{padding:20px 12px;gap:10px}.role-copy strong{font-size:17px}.brand{font-size:15px}.topbar{padding-left:16px;padding-right:12px}.top-actions{gap:3px}.panel{padding-left:16px;padding-right:16px}}
 
-#passenger-greeting{text-transform:none;letter-spacing:.02em}
+#passenger-greeting{text-transform:none;letter-spacing:.02em}.command-feedback{margin:0 20px 12px}.command-feedback h2{font-size:13px;margin-bottom:4px}.command-feedback p{margin:0}.command-feedback .secondary{margin-top:10px;min-height:42px;font-size:12px}
 </style></head>
 <body>
 <svg style="display:none" aria-hidden="true"><defs>
@@ -23,6 +23,7 @@
 </defs></svg>
 <main class="screen">
 <header class="topbar"><span class="brand">Taxi Protection</span><div class="top-actions"><span id="current-role" class="demo-tag">DEMO</span><button class="text-control" id="role-switch" hidden>役割選択</button><button class="icon-btn" id="settings-open" aria-label="設定"><svg class="icon"><use href="#i-menu"/></svg></button></div></header>
+<section id="command-feedback" class="banner command-feedback" role="status" aria-live="polite" hidden><h2 id="command-feedback-title"></h2><p id="command-feedback-message"></p><button class="secondary" id="command-feedback-action" hidden></button></section>
 
 <section id="role-page" class="page panel" hidden>
  <div class="welcome"><p class="eyebrow">TAXI PROTECTION</p><h1>どちらで<br>利用しますか？</h1><p class="muted">登録する情報と、その後の画面を分けています。</p></div>
@@ -85,7 +86,7 @@
   <p id="cancel-error" class="banner error" role="alert" hidden></p>
   <button class="secondary" data-close="cancel-dialog" autofocus>依頼を続ける</button>
   <div class="spacer"></div>
-  <button class="primary" id="confirm-cancel">この依頼を取り消す（デモ）</button>
+  <button class="primary" id="confirm-cancel" data-command-action>この依頼を取り消す（デモ）</button>
 </dialog>
 <div id="toast" role="status" hidden></div><script>/* Reference model for UI testing, NOT a regulator connection or authorization API.
  * In production, load this model only from authenticated server-owned records.
@@ -192,6 +193,29 @@
     if(!/^(?:0|[1-9]\d{0,4})(?:\.\d{1,2})?$/.test(value)||Number(value)<=0)throw Error('提示額は0より大きい金額を小数2桁までで入力してください。');
     if(!/^\d{1,3}$/.test(eta)||Number(eta)<1||Number(eta)>180)throw Error('到着予定は1〜180分で入力してください。');
     return {fareCents:Math.round(Number(value)*100),eta:Number(eta)};
+  }
+  function commandFeedback(role,outcome){
+    const viewer=role==='driver'?'運行':'依頼';
+    const states={
+      idle:{title:'',message:'',disableCommands:false,action:null},
+      pending:{title:viewer+'の状態を確認中',message:'完了するまで同じ操作を繰り返さないでください。',disableCommands:true,action:null},
+      confirmed:{title:'操作を確認しました',message:role==='driver'?'最新の運行状況を表示しています。':'最新の依頼状況を表示しています。',disableCommands:false,action:null},
+      unresolved:{title:'操作結果を確認できません',message:'同じ操作を繰り返さず、最新状態を確認してください。',disableCommands:true,action:'refresh'},
+      reauth:{title:'再ログインが必要です',message:'安全のため操作を停止しました。再ログイン後に最新状態を確認してください。',disableCommands:true,action:'reauth'},
+      conflict:{title:'別の更新を確認しました',message:'操作を繰り返さず、最新状態を確認してください。',disableCommands:true,action:'refresh'},
+      rejected:{title:'操作を完了できませんでした',message:role==='driver'?'運行条件と最新状態を確認してください。':'依頼条件と最新状態を確認してください。',disableCommands:false,action:'refresh'}
+    };
+    const value=states[outcome]||states.unresolved;
+    return Object.freeze({role:role==='driver'?'driver':'passenger',outcome:states[outcome]?outcome:'unresolved',...value});
+  }
+  function createCommandUiController(initialRole='passenger'){
+    let role=initialRole==='driver'?'driver':'passenger',current=commandFeedback(role,'idle');
+    const snapshot=()=>({...current});
+    const setRole=nextRole=>{const normalized=nextRole==='driver'?'driver':'passenger';if(normalized!==role){role=normalized;current=commandFeedback(role,'idle');}return snapshot();};
+    const begin=nextRole=>{setRole(nextRole);if(current.disableCommands)return {accepted:false,state:snapshot()};current=commandFeedback(role,'pending');return {accepted:true,state:snapshot()};};
+    const finish=outcome=>{current=commandFeedback(role,outcome);return snapshot();};
+    const clear=()=>{current=commandFeedback(role,'idle');return snapshot();};
+    return {snapshot,setRole,begin,finish,clear};
   }
   function create(){
     let seq=10;
@@ -350,7 +374,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-  const api={pages,route,fareInput,create};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -364,9 +388,25 @@ const model = R.create();
 let records = model.state.records;
 const names = {taxi_permit:'Taxi Permit（営業許可）',vehicle_licence:'車両登録・PSV車両資格',driver_licence:'運転免許',psv_driver_permit:'PSV運転手許可',fitness:'車両検査・適合証明',insurance:'営業利用を含む保険',operator_assignment:'名義人の同意・運転権限',airport_authorization:'空港側の営業承認'};
 const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
+const commandUi=R.createCommandUiController();
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let toastTimer;
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(()=> $('toast').hidden = true, 5000); }
+function renderCommandFeedback(){
+  const view=commandUi.snapshot(),box=$('command-feedback');
+  box.hidden=view.outcome==='idle';box.className='banner command-feedback'+(['unresolved','reauth','conflict'].includes(view.outcome)?' error':'');
+  $('command-feedback-title').textContent=view.title;$('command-feedback-message').textContent=view.message;
+  const action=$('command-feedback-action');action.hidden=!view.action;action.textContent=view.action==='reauth'?'役割選択へ戻る':'最新状態を確認する';
+  document.querySelectorAll('[data-command-action]').forEach(button=>button.disabled=view.disableCommands);
+}
+function commandOutcomeForError(error){const message=String(error?.message||'');if(/認証|ログイン|セッション/.test(message))return'reauth';if(/別の画面|最新状態/.test(message))return'conflict';return'rejected';}
+function runCommandAction(role,action){
+  const started=commandUi.begin(role);renderCommandFeedback();
+  if(!started.accepted){toast('前の操作結果を確認してから進めてください。');return {ok:false,busy:true};}
+  try{const value=action();commandUi.finish('confirmed');renderCommandFeedback();return {ok:true,value};}
+  catch(error){commandUi.finish(commandOutcomeForError(error));renderCommandFeedback();throw error;}
+}
+$('command-feedback-action').onclick=()=>{const view=commandUi.snapshot();commandUi.clear();if(view.action==='reauth')show('role');else show(state.page);renderCommandFeedback();};
 function show(target) {
   if(target==='role')model.leave();
   const page=R.route(model.state.activeRole,model.state.profile,target);
@@ -384,6 +424,8 @@ function show(target) {
   if(page==='driver-requests')renderDriverRequests();
   if(page==='driver-trips')renderDriverTrips();
   if(page==='driver-account')renderDriverProfile();
+  if(model.state.activeRole)commandUi.setRole(model.state.activeRole);else commandUi.clear();
+  renderCommandFeedback();
   try{history.replaceState(null,'','#'+page);}catch{}
   window.scrollTo({top:0,behavior:'instant'});
 }
@@ -453,9 +495,9 @@ function renderPassengerOffers(){
     const cards=offers.map(o=>{const r=records.find(r=>r.id===o.driverId),minutes=Math.max(1,Math.ceil((o.expiresAt-Date.now())/60000));return `<article class="card"><div class="row"><span class="price">FJ$${money(o.fareCents)} <small>提示・概算</small></span><span class="badge good">あと約${minutes}分</span></div><p class="muted">${request.pickupAt?'予約時刻への到着目安':'到着'} ${o.eta}分（デモ） · ${o.source==='driver-input'?'運転手側の入力から反映':'サンプル提示'}</p><h3>${esc(r.name)}</h3><p class="muted">${esc(r.vehicle)} / ${esc(r.color)} · ${esc(r.plate)}</p><p class="evidence-summary">期限内でも選択時に車両の営業資格を再確認します。提示額は概算の記録です。</p><button class="primary" data-select="${esc(o.id)}" data-revision="${request.revision}">この提示を選ぶ（デモ）</button></article>`;}).join('');
     const guidance=summary.expired?`<div class="banner"><strong>提示の有効期限が切れました</strong><br>古い金額は選べません。運転手からの再提示を待ち、下のボタンで更新してください。</div>`:summary.unavailable?`<div class="banner"><strong>現在選べる対象車両がありません</strong><br>営業資格・営業範囲を満たす新しい提示を待ってください。</div>`:`<div class="empty">まだ有効な提示がありません。運転手の入力を待ちます。</div>`;
     $('offers').innerHTML=cards+(offers.length?'':guidance)+`<button class="secondary" id="refresh-offers">最新の提示を確認する</button><p class="muted">自動通知・別端末同期は未接続のデモです。</p>`;
-    $('offers').querySelectorAll('[data-select]').forEach(b=>b.onclick=()=>{
-      try{const req=model.selectOffer(b.dataset.select,Number(b.dataset.revision));openVehicleCheck(req);toast('提示額をこの画面内に記録しました。実配車は行いません。');}catch(e){toast(e.message);renderPassengerOffers();}
-    });
+    $('offers').querySelectorAll('[data-select]').forEach(b=>{b.dataset.commandAction='';b.onclick=()=>{
+      try{const result=runCommandAction('passenger',()=>model.selectOffer(b.dataset.select,Number(b.dataset.revision)));if(!result.ok)return;openVehicleCheck(result.value);toast('提示額をこの画面内に記録しました。実配車は行いません。');}catch(e){toast(e.message);renderPassengerOffers();renderCommandFeedback();}
+    }});
     $('refresh-offers').onclick=()=>{renderPassengerOffers();toast('この画面内の最新状態を確認しました。');};
   }catch(e){$('offers').innerHTML='<div class="banner error">'+esc(e.message)+'</div>';}
 }
@@ -673,7 +715,7 @@ $('cancel-dialog').addEventListener('close',()=>{cancelRequest=null;});
 $('confirm-cancel').onclick=()=>{
   if(!cancelRequest)return;
   try{
-    const {id,revision}=cancelRequest;model.cancelRide(id,revision);
+    const {id,revision}=cancelRequest,result=runCommandAction('passenger',()=>model.cancelRide(id,revision));if(!result.ok)return;
     if(state.currentRequest===id){
       state.currentRequest=null;state.expectedId=null;state.selected=null;
       $('lookup-result').innerHTML='';
@@ -707,12 +749,12 @@ function renderDriverRequests(){
     const offerState=ownActive?`<p class="offer-status">FJ$${money(ownActive.fareCents)} を提示済み · 利用者の承諾待ち</p>`:ownStale?`<p class="banner"><strong>${ownStale.status==='expired'?'提示期限切れ':'現在の資格条件では提示不可'}</strong><br>古い提示は利用者が選べません。現在の条件で再提示してください。</p>`:'';
     return `<article class="card"><div class="row"><span class="badge">${r.airport?'空港からの迎車':'一般の乗車'}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<div class="inline-list"><span>${r.passengers}名</span><span>連絡：${r.language==='ja'?'日本語':'English'}</span><span>${r.payment==='card'?'カード希望':'現金希望'}</span></div><p class="muted">電話番号などの詳細は、予約確定後に必要な範囲だけ共有する設計です。</p>${offerState}<form class="offer-form" data-request="${esc(r.id)}"><div class="two-fields"><label class="field">提示額（FJD）<input name="fare" inputmode="decimal" placeholder="20.00" value="${own?money(own.fareCents):''}" required></label><label class="field">${r.pickupAt?'予約時刻への到着目安':'到着予定'}（分）<input name="eta" inputmode="numeric" placeholder="5" value="${own?own.eta:''}" required></label></div><p class="muted">概算の提示として15分間記録。期限切れ後の再提示は新しい記録になります。</p><button class="primary" type="submit">${ownActive?'提示額を更新する':ownStale?'料金を再提示する':'料金を提示する'}（デモ）</button><p class="banner error form-error" role="alert" hidden></p></form></article>`;
   }).join('')||'<div class="empty">現在、対象となる依頼はありません。</div>';
-  $('driver-request-list').querySelectorAll('form').forEach(f=>f.onsubmit=e=>{e.preventDefault();try{model.submitOffer(f.dataset.request,{fare:f.elements.fare.value,eta:f.elements.eta.value});renderDriverRequests();toast('利用者側の比較画面に反映しました。まだ迎車せず、選択を待ちます。');}catch(e){const el=f.querySelector('.form-error');el.hidden=false;el.textContent=e.message;}});
+  $('driver-request-list').querySelectorAll('form').forEach(f=>{const submit=f.querySelector('button[type="submit"]');submit.dataset.commandAction='';f.onsubmit=e=>{e.preventDefault();try{const result=runCommandAction('driver',()=>model.submitOffer(f.dataset.request,{fare:f.elements.fare.value,eta:f.elements.eta.value}));if(!result.ok)return;renderDriverRequests();renderCommandFeedback();toast('利用者側の比較画面に反映しました。まだ迎車せず、選択を待ちます。');}catch(e){const el=f.querySelector('.form-error');el.hidden=false;el.textContent=e.message;renderCommandFeedback();}}});
 }
 function renderDriverTrips(){
   const trips=model.driverTrips().slice().reverse();
   $('driver-trip-list').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge ${r.status==='cancelled'?'':'good'}">${esc(statusLabel(r.status))} · デモ</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong></p><p class="muted">利用者：${esc(r.passengerName)} · ${r.passengers}名<br>${r.status==='cancelled'?'取消済みの依頼の記録です。':'提示を承諾した依頼です。'}実際の配車は行っていません。</p>${r.status==='cancelled'?cancellationMarkup(r):r.status==='assigned'?`<button class="primary" data-advance="${r.id}" data-revision="${r.revision}">迎車に向かう（デモ）</button>`:r.status==='arriving'?`<p class="banner">${model.canStartTrip(r.id)?'利用者が車両照合を完了しました（デモ）。':'利用者の車両照合を待っています。役割選択から利用者画面に戻って照合を試せます。'}</p><button class="primary" data-advance="${r.id}" data-revision="${r.revision}" ${model.canStartTrip(r.id)?'':'disabled'}>乗車開始（デモ）</button>`:r.status==='on_trip'?`<button class="secondary" data-advance="${r.id}" data-revision="${r.revision}">運行を完了する（デモ）</button>`:'<p class="muted">決済は未接続です。金額は入金済み売上ではありません。</p>'}</article>`).join(''):'<div class="empty">まだ利用者が選択した依頼はありません。料金提示後、利用者の承諾を待ってください。</div>';
-  $('driver-trip-list').querySelectorAll('[data-advance]').forEach(b=>b.onclick=()=>{try{model.advanceTrip(b.dataset.advance,Number(b.dataset.revision));renderDriverTrips();}catch(e){toast(e.message);renderDriverTrips();}});
+  $('driver-trip-list').querySelectorAll('[data-advance]').forEach(b=>{b.dataset.commandAction='';b.onclick=()=>{try{const result=runCommandAction('driver',()=>model.advanceTrip(b.dataset.advance,Number(b.dataset.revision)));if(!result.ok)return;renderDriverTrips();renderCommandFeedback();}catch(e){toast(e.message);renderDriverTrips();renderCommandFeedback();}}});
 }
 function renderDriverProfile(){
   const p=model.state.profile,g=model.gate();
