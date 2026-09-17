@@ -322,3 +322,32 @@ test('offer-state guidance is limited to the owning passenger', () => {
   assert.throws(()=>m.offerSummary(ride.id),/閲覧できません/);
   m.state.profile=owner; assert.throws(()=>m.offerSummary('missing-ride'),/閲覧できません/);
 });
+
+test('offer selection advances the request revision and rejects a stale repeat', () => {
+  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
+  assert.equal(ride.revision,1); m.selectOffer(offer.id,1);
+  assert.equal(ride.status,'assigned'); assert.equal(ride.revision,2);
+  assert.throws(()=>m.selectOffer(offer.id,1),/別の画面で更新/);
+});
+test('cancellation wins an accept/cancel race and stale selection changes nothing', () => {
+  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
+  m.cancelRide(ride.id,1); const afterCancel=JSON.stringify(ride);
+  assert.equal(ride.revision,2); assert.throws(()=>m.selectOffer(offer.id,1),/別の画面で更新/);
+  assert.equal(JSON.stringify(ride),afterCancel);
+});
+test('selection wins an accept/cancel race and stale cancellation must refresh first', () => {
+  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
+  m.selectOffer(offer.id,1); const afterSelect=JSON.stringify(ride);
+  assert.throws(()=>m.cancelRide(ride.id,1),/別の画面で更新/); assert.equal(JSON.stringify(ride),afterSelect);
+  m.cancelRide(ride.id,2); assert.equal(ride.status,'cancelled'); assert.equal(ride.revision,3);
+});
+test('a cancellation retry is idempotent even with the original expected revision', () => {
+  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+  m.cancelRide(ride.id,1); const once=JSON.stringify(ride);
+  assert.equal(m.cancelRide(ride.id,1),ride); assert.equal(JSON.stringify(ride),once); assert.equal(ride.revision,2);
+});
+test('a stale driver transition cannot skip a newer trip state', () => {
+  const {m,ride}=selected(); assert.equal(ride.revision,2);
+  m.useReviewedFixture(); m.advanceTrip(ride.id,2); assert.equal(ride.status,'arriving'); assert.equal(ride.revision,3);
+  assert.throws(()=>m.advanceTrip(ride.id,2),/別の画面で更新/); assert.equal(ride.status,'arriving');
+});

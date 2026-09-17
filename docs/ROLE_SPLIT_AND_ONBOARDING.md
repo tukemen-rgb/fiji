@@ -4,7 +4,7 @@
 Select Passenger or Driver FIRST. Register the information required for that role. Route to the corresponding home using that registered information. Each role must see different information and input controls, not a shared mixed-role menu.
 
 ## Status and ownership
-Current update: the standalone HTML at `prototypes/role-split/index.html` now carries scheduled pickup time through both role-specific interfaces and handles offer expiry/re-quote, alongside pre-boarding cancellation and the vehicle-confirmation fix. All 54 reference tests pass; see `PROGRESS.md`. The original user-supplied bytes remain in the intake commit, and `HANDOVER_REVIEW_2026-09-16.md` preserves that earlier review. The prototype has not been integrated into the root application.
+Current update: the standalone HTML at `prototypes/role-split/index.html` now carries scheduled pickup time through both role-specific interfaces, handles offer expiry/re-quote and rejects stale ride commands by request revision, alongside pre-boarding cancellation and the vehicle-confirmation fix. All 59 reference tests pass; see `PROGRESS.md` and `API_CONTRACT.md`. The original user-supplied bytes remain in the intake commit, and `HANDOVER_REVIEW_2026-09-16.md` preserves that earlier review. The prototype has not been integrated into the root application.
 GDP / ChatGPT created and locally tested an interaction prototype, delivered in the conversation as `taxi_protection_role_test.html` and `taxi_protection_role_source.zip`. The complete UI source is in that downloadable archive, NOT in this repository's root application. This commit records the production implementation contract; it does not deploy the prototype or invoke Claude. Claude remains the requested production implementer.
 
 All accounts, permits, fares, vehicles, matches and approval records in the preview are fictional. State is in memory in one open document. No authentication, OTP, database persistence, cross-device synchronization, issuer verification, upload, notification, payment or real dispatch is connected. Existing optional Maps adapters were retained, but live Google Maps requests were not tested in this update.
@@ -94,6 +94,15 @@ The six added Node tests cover the model rules, not dialog events, locale format
 3. As the reviewed driver, reopen Requests. The stale fare/ETA should be shown with a re-quote action; submit a new amount, return as passenger and refresh to see only the new selectable offer.
 4. Suspend a quoted driver in the fictional record. The offer must become unavailable and must not revive merely by editing the record back; a fresh quote is required after eligibility is restored.
 The five added Node tests cover status transitions, re-quote and ownership. Countdown updates, focus behavior, real waiting, notifications and multi-device refresh remain unverified.
+
+## Stale-command and race acceptance (2026-09-17 Fiji)
+- Each request begins with `revision: 1`. Successful selection, cancellation and driver trip transitions increment it. UI buttons carry the revision that was rendered with the action.
+- If another action changed the request first, a select/cancel/trip command with the old revision is rejected without partial changes and the UI refreshes. This covers both cancellation-first and selection-first orderings.
+- An exact retry of an already completed cancellation returns the same cancelled record without another timestamp or revision increment. Production additionally requires a persisted Idempotency-Key; the browser-memory prototype does not implement HTTP replay storage.
+- A stale driver screen cannot skip a newer trip state. Vehicle-confirmation binding remains a separate condition for `arriving -> on_trip`.
+- `docs/API_CONTRACT.md` defines the production endpoints, authenticated actor derivation, server clock, expected revision, idempotency, atomic invariants and safe error codes.
+
+The five race tests execute sequential orderings in the reference model. They are not evidence of real database locks, simultaneous HTTP requests, authentication, persistence or multi-device behavior.
 
 ## Production authorization acceptance criteria
 - Separate account/membership, passenger_profile, driver_profile and reviewer permissions.
