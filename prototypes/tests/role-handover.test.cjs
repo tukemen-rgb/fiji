@@ -165,10 +165,13 @@ test('restart guard clears markers and fails safely when storage is unavailable'
   assert.equal(unavailable.mark('passenger','pending'),false);
   assert.equal(unavailable.restore(),null);
 });
-function startupRecovery(R,role,readState) {
+function currentRideView(role,overrides={}) {
+  return {id:FIXTURE.requestId,status:role==='driver'?'assigned':'collecting',revision:2,viewerRole:role,nextAction:role==='driver'?'start_pickup':'compare_offers',updatedAt:'2026-09-17T03:00:00.000Z',...overrides};
+}
+function startupRecovery(R,role,readCurrentRide) {
   const storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
   guard.mark(role,'pending');
-  return {storage,guard,controller:R.createStartupRecoveryController({guard,role,readState})};
+  return {storage,guard,controller:R.createStartupRecoveryController({guard,role,readCurrentRide})};
 }
 test('startup network failure retains the marker without replaying a command', async () => {
   const {R}=setup();let reads=0;
@@ -184,7 +187,7 @@ test('startup network failure retains the marker without replaying a command', a
 });
 test('connectivity recovery permits one explicit state reread and then clears the marker', async () => {
   const {R}=setup();let reads=0;
-  const {guard,controller}=startupRecovery(R,'driver',async()=>{reads+=1;if(reads===1)throw Error('offline');return {status:200,body:{private:'not retained'}};});
+  const {guard,controller}=startupRecovery(R,'driver',async()=>{reads+=1;if(reads===1)throw Error('offline');return {status:200,body:currentRideView('driver')};});
   await controller.reconcile();
   const recovered=await controller.reconcile('connectivity');
   assert.equal(recovered.requested,true);
@@ -196,7 +199,7 @@ test('connectivity recovery permits one explicit state reread and then clears th
 });
 test('authentication recovery waits for explicit reauthentication and rereads once', async () => {
   const {R}=setup();let reads=0;
-  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:++reads===1?401:200}));
+  const {guard,controller}=startupRecovery(R,'passenger',async()=>++reads===1?{status:401}:{status:200,body:currentRideView('passenger')});
   const expired=await controller.reconcile();
   assert.equal(expired.state.outcome,'reauth');
   assert.equal(expired.state.markerRetained,true);
@@ -230,7 +233,7 @@ test('startup recovery does not treat a bodyless 304 as restored state', async (
 test('startup recovery discards a marker for another role before any read', async () => {
   const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});let reads=0;
   guard.mark('passenger','pending');
-  const controller=R.createStartupRecoveryController({guard,role:'driver',readState:async()=>{reads+=1;return {status:200};}});
+  const controller=R.createStartupRecoveryController({guard,role:'driver',readCurrentRide:async()=>{reads+=1;return {status:200,body:currentRideView('driver')};}});
   const result=await controller.reconcile();
   assert.equal(result.requested,false);
   assert.equal(result.state.markerRetained,false);
@@ -245,8 +248,87 @@ test('startup recovery rejects duplicate reads while one is in flight', async ()
   assert.equal(duplicate.requested,false);
   assert.equal(duplicate.reason,'in_flight');
   assert.equal(reads,1);
-  release({status:200});
+  release({status:200,body:currentRideView('passenger')});
   assert.equal((await first).state.outcome,'confirmed');
+});
+test('startup discovery restores a passenger ride to the passenger history without a caller-supplied ride id', async () => {
+  const {R}=setup(),requests=[];
+  const {guard,controller}=startupRecovery(R,'passenger',async request=>{requests.push(request);return {status:200,body:currentRideView('passenger')};});
+  const result=await controller.reconcile();
+  assert.equal(requests.length,1);
+  assert.equal(requests[0].method,'GET');
+  assert.equal(requests[0].path,'/v1/rides/current');
+  assert.equal(requests[0].reason,'startup');
+  assert.equal(result.state.outcome,'confirmed');
+  assert.equal(result.view.kind,'ride');
+  assert.equal(result.view.page,'passenger-history');
+  assert.deepEqual(Object.keys(result.view.ride),['id','status','revision','viewerRole','nextAction','updatedAt']);
+  assert.equal(result.view.ride.viewerRole,'passenger');
+  assert.equal(guard.restore(),null);
+  assert.equal(Object.hasOwn(requests[0],'rideId'),false);
+  assert.equal(Object.hasOwn(requests[0],'role'),false);
+});
+test('startup discovery restores an assigned driver ride to the driver trips screen', async () => {
+  const {R}=setup();
+  const {guard,controller}=startupRecovery(R,'driver',async()=>({status:200,body:currentRideView('driver',{status:'arriving',nextAction:'start_trip'})}));
+  const result=await controller.reconcile();
+  assert.equal(result.state.outcome,'confirmed');
+  assert.equal(result.view.kind,'ride');
+  assert.equal(result.view.page,'driver-trips');
+  assert.equal(result.view.ride.viewerRole,'driver');
+  assert.equal(result.view.ride.status,'arriving');
+  assert.equal(guard.restore(),null);
+});
+test('startup discovery clears the recovery lock and returns each role to its own home when no ride exists', async () => {
+  const {R}=setup();
+  for(const [role,page] of [['passenger','home'],['driver','driver-home']]){
+    const {guard,controller}=startupRecovery(R,role,async()=>({status:204}));
+    const result=await controller.reconcile();
+    assert.equal(result.state.outcome,'empty');
+    assert.equal(result.state.markerRetained,false);
+    assert.equal(result.view.kind,'empty');
+    assert.equal(result.view.page,page);
+    assert.equal(result.view.ride,null);
+    assert.equal(guard.restore(),null);
+  }
+});
+test('startup discovery keeps commands locked when current-ride lookup is ambiguous', async () => {
+  const {R}=setup(),body={code:'ambiguous_current_ride',message:'Current ride is ambiguous',requestId:'trace-only'};
+  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:409,body}));
+  const result=await controller.reconcile();
+  assert.equal(result.state.outcome,'conflict');
+  assert.equal(result.state.markerRetained,true);
+  assert.equal(result.state.canRetry,false);
+  assert.equal(result.view.kind,'blocked');
+  assert.equal(result.view.page,null);
+  assert.equal(result.view.ride,null);
+  assert.equal(result.view.reason,'ambiguous_current_ride');
+  assert.equal(guard.restore().resumedFrom,'conflict');
+  assert.equal((await controller.reconcile()).requested,false);
+  assert.equal(JSON.stringify(result).includes(FIXTURE.requestId),false);
+});
+test('startup discovery rejects extended current-ride bodies instead of exposing private fields', async () => {
+  const {R}=setup(),extended={...currentRideView('passenger'),assignedDriverId:'private-driver'};
+  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:200,body:extended}));
+  const result=await controller.reconcile();
+  assert.equal(result.state.outcome,'conflict');
+  assert.equal(result.state.markerRetained,true);
+  assert.equal(result.view.kind,'blocked');
+  assert.equal(result.view.page,null);
+  assert.equal(result.view.ride,null);
+  assert.equal(result.view.reason,'invalid_current_ride');
+  assert.equal(JSON.stringify(result).includes('private-driver'),false);
+  assert.equal(guard.restore().resumedFrom,'conflict');
+});
+test('startup discovery rejects a valid shape for the other role without navigating or exposing the ride', async () => {
+  const {R}=setup();
+  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:200,body:currentRideView('driver')}));
+  const result=await controller.reconcile();
+  assert.equal(result.state.outcome,'conflict');
+  assert.equal(result.view.kind,'blocked');
+  assert.equal(result.view.page,null);
+  assert.equal(result.view.ride,null);
+  assert.equal(guard.restore().role,'passenger');
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);

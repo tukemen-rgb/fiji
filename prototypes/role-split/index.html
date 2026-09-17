@@ -238,9 +238,20 @@
     };
     return Object.freeze({key,mark,restore,clear});
   }
-  function createStartupRecoveryController({guard,role,readState}){
+  const currentRideFields=['id','status','revision','viewerRole','nextAction','updatedAt'];
+  function currentRideRecoveryView(role,response){
+    const status=Number(response?.status),home=role==='driver'?'driver-home':'home',active=role==='driver'?new Set(['assigned','arriving','on_trip']):new Set(['collecting','assigned','arriving','on_trip']);
+    if(status===204)return Object.freeze({kind:'empty',page:home,ride:null,reason:'no_current_ride'});
+    if(status===409)return Object.freeze({kind:'blocked',page:null,ride:null,reason:response?.body?.code==='ambiguous_current_ride'?'ambiguous_current_ride':'conflict'});
+    if(status!==200)return null;
+    const body=response?.body,keys=body&&typeof body==='object'&&!Array.isArray(body)?Object.keys(body).sort():[];
+    if(keys.join(',')!==[...currentRideFields].sort().join(',')||body.viewerRole!==role||typeof body.id!=='string'||!body.id||!active.has(body.status)||!Number.isInteger(body.revision)||body.revision<1||typeof body.nextAction!=='string'||!body.nextAction||typeof body.updatedAt!=='string'||!Number.isFinite(Date.parse(body.updatedAt)))return Object.freeze({kind:'blocked',page:null,ride:null,reason:'invalid_current_ride'});
+    const ride=Object.freeze(Object.fromEntries(currentRideFields.map(field=>[field,body[field]])));
+    return Object.freeze({kind:'ride',page:role==='driver'?'driver-trips':'passenger-history',ride,reason:'current_ride'});
+  }
+  function createStartupRecoveryController({guard,role,readCurrentRide}){
     const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
-    if(!normalized||!guard||typeof guard.restore!=='function'||typeof readState!=='function')throw Error('起動時復旧の設定が不正です。');
+    if(!normalized||!guard||typeof guard.restore!=='function'||typeof readCurrentRide!=='function')throw Error('起動時復旧の設定が不正です。');
     let marker=guard.restore(),outcome=marker?'unresolved':'idle',attempts=0,retryUsed=false,busy=false,done=!marker;
     if(marker&&marker.role!==normalized){guard.clear();marker=null;outcome='idle';done=true;}
     const retryReason=()=>outcome==='reauth'?'reauth':outcome==='unresolved'?'connectivity':null;
@@ -254,15 +265,19 @@
         retryUsed=true;
       }
       busy=true;attempts+=1;
+      let view=null;
       try{
-        const response=await readState(Object.freeze({role:normalized,reason})),status=Number(response?.status);
-        if(status===200){guard.clear();marker=null;outcome='confirmed';done=true;}
-        else if(status===401||status===403)outcome='reauth';
+        const response=await readCurrentRide(Object.freeze({method:'GET',path:'/v1/rides/current',reason})),status=Number(response?.status);
+        view=currentRideRecoveryView(normalized,response);
+        if(status===200&&view?.kind==='ride'){guard.clear();marker=null;outcome='confirmed';done=true;}
+        else if(status===204){guard.clear();marker=null;outcome='empty';done=true;}
+        else if(status===401||status===403){guard.mark(normalized,'reauth');marker=guard.restore();outcome='reauth';}
         else if(status===404){guard.clear();marker=null;outcome='rejected';done=true;}
-        else outcome='unresolved';
-      }catch{outcome='unresolved';}
+        else if(status===409||status===422||(status===200&&view?.kind==='blocked')){guard.mark(normalized,'conflict');marker=guard.restore();outcome='conflict';done=true;}
+        else{guard.mark(normalized,'unresolved');marker=guard.restore();outcome='unresolved';}
+      }catch{guard.mark(normalized,'unresolved');marker=guard.restore();outcome='unresolved';}
       finally{busy=false;}
-      return {requested:true,state:snapshot()};
+      return {requested:true,state:snapshot(),view};
     }
     return Object.freeze({snapshot,reconcile});
   }
