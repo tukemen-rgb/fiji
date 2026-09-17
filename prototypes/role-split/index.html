@@ -258,31 +258,44 @@
     };
     if(!normalized||!guard||typeof guard.restore!=='function'||typeof readCurrentRide!=='function')throw Error('起動時復旧の設定が不正です。');
     let binding=normalizePrincipal(principal),generation=1;
-    let marker=guard.restore(),outcome=marker?'unresolved':'idle',attempts=0,retryUsed=false,busy=false,done=!marker;
+    let marker=guard.restore(),outcome=marker?'unresolved':'idle',attempts=0,retryUsed=false,done=!marker;
+    let initializedGeneration=marker?generation:0;
     const inflight=new Set();
-    if(marker&&(marker.role!==normalized||!binding||binding.viewerRole!==normalized)){guard.clear();marker=null;outcome=binding?'idle':'session_changed';done=true;}
+    if(marker&&(marker.role!==normalized||!binding||binding.viewerRole!==normalized)){guard.clear();marker=null;outcome=binding?'idle':'session_changed';done=true;initializedGeneration=0;}
     const retryReason=()=>outcome==='reauth'?'reauth':outcome==='unresolved'?'connectivity':null;
-    const snapshot=()=>Object.freeze({role:normalized,outcome,attempts,retryUsed,busy,markerRetained:Boolean(marker),canRetry:Boolean(marker&&!busy&&!done&&attempts>0&&!retryUsed&&retryReason()),autoCommandReplay:false,sessionActive:Boolean(binding&&binding.viewerRole===normalized),sessionGeneration:generation,inFlight:inflight.size});
+    const snapshot=()=>Object.freeze({role:normalized,outcome,attempts,retryUsed,busy:inflight.size>0,markerRetained:Boolean(marker),canRetry:Boolean(marker&&inflight.size===0&&!done&&attempts>0&&!retryUsed&&retryReason()),autoCommandReplay:false,sessionActive:Boolean(binding&&binding.viewerRole===normalized),sessionGeneration:generation,sessionRecoveryInitialized:initializedGeneration===generation,inFlight:inflight.size});
     const abortController=()=>typeof AbortController==='function'?new AbortController():(()=>{const signal={aborted:false};return {signal,abort(){signal.aborted=true;}};})();
     const current=handle=>Boolean(handle)&&!handle.signal.aborted&&handle.generation===generation&&handle.binding===binding;
-    const replacePrincipal=nextPrincipal=>{
+    const samePrincipal=(left,right)=>Boolean(left&&right&&left.accountRef===right.accountRef&&left.viewerRole===right.viewerRole);
+    const switchPrincipal=nextBinding=>{
       generation+=1;
       for(const handle of inflight)handle.controller.abort();
       inflight.clear();
-      binding=normalizePrincipal(nextPrincipal);
-      guard.clear();marker=null;outcome='session_changed';done=true;busy=false;
+      binding=nextBinding;
+      guard.clear();marker=null;outcome='session_changed';done=true;attempts=0;retryUsed=false;initializedGeneration=0;
       return snapshot();
+    };
+    const replacePrincipal=nextPrincipal=>switchPrincipal(normalizePrincipal(nextPrincipal));
+    const beginSessionRecovery=nextPrincipal=>{
+      const nextBinding=normalizePrincipal(nextPrincipal);
+      if(!nextBinding||nextBinding.viewerRole!==normalized){switchPrincipal(nextBinding);return {started:false,reason:nextBinding?'role_mismatch':'invalid_principal',state:snapshot()};}
+      if(!samePrincipal(binding,nextBinding))switchPrincipal(nextBinding);
+      if(initializedGeneration===generation)return {started:false,reason:'already_initialized',state:snapshot()};
+      guard.clear();guard.mark(normalized,'unresolved');
+      marker=guard.restore()||Object.freeze({role:normalized,outcome:'unresolved',resumedFrom:'unresolved',autoResend:false});
+      outcome='unresolved';attempts=0;retryUsed=false;done=false;initializedGeneration=generation;
+      return {started:true,reason:'initialized',state:snapshot()};
     };
     async function reconcile(reason='startup'){
       if(!marker||done)return {requested:false,reason:'no_recovery',state:snapshot()};
       if(!binding||binding.viewerRole!==normalized){guard.clear();marker=null;outcome='session_changed';done=true;return {requested:false,reason:'no_session',state:snapshot()};}
-      if(busy)return {requested:false,reason:'in_flight',state:snapshot()};
+      if(inflight.size>0)return {requested:false,reason:'in_flight',state:snapshot()};
       if(attempts===0&&reason!=='startup')return {requested:false,reason:'startup_required',state:snapshot()};
       if(attempts>0){
         if(retryUsed||reason!==retryReason())return {requested:false,reason:'retry_not_allowed',state:snapshot()};
         retryUsed=true;
       }
-      busy=true;attempts+=1;
+      attempts+=1;
       let view=null;
       const controller=abortController(),handle=Object.freeze({binding,generation,controller,signal:controller.signal});
       inflight.add(handle);
@@ -301,10 +314,10 @@
         if(!current(handle))return {requested:true,reason:'stale_session',state:snapshot(),view:null};
         guard.mark(normalized,'unresolved');marker=guard.restore();outcome='unresolved';
       }
-      finally{inflight.delete(handle);busy=false;}
+      finally{inflight.delete(handle);}
       return {requested:true,state:snapshot(),view};
     }
-    return Object.freeze({snapshot,reconcile,replacePrincipal});
+    return Object.freeze({snapshot,reconcile,replacePrincipal,beginSessionRecovery});
   }
   function create(){
     let seq=10;
