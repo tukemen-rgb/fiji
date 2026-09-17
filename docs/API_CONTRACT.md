@@ -6,6 +6,8 @@ Machine-readable companion: `docs/openapi.json`. Run `node prototypes/api-contra
 
 HTTP acceptance runner: `node prototypes/http-contract-runner.cjs`. Its default mode starts an ephemeral server on `127.0.0.1`, sends real HTTP requests, then closes it. Fourteen scenarios cover unauthenticated access, passenger/driver role confusion, pending-driver denial, foreign passenger resources, unassigned-driver transitions, caller-supplied identity, missing idempotency keys and three positive controls. `runHttpContract(baseUrl, tokens)` is transport-reusable for a future authorized test environment, but no remote base URL or real token is configured or contacted here.
 
+The same command also sends offer selection and cancellation concurrently from revision 2 with different idempotency keys. Exactly one returns 200 and revision 3; the loser returns `409 stale_revision`. An exact retry of the winner returns the frozen original response without another state change, while the same key with changed content returns `409 idempotency_conflict`. This loopback mock serializes with an in-memory promise lock and stores replay records in a Map; it is executable acceptance behavior, not evidence of database locks, multi-process safety or persistent idempotency storage.
+
 ## Common rules
 
 - Prefix examples with `/v1`. HTTPS and authenticated sessions are mandatory in production.

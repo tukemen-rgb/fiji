@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {scenarios: httpScenarios, runHttpContract, runMockContract} = require('../http-contract-runner.cjs');
+const {scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 function setup() {
@@ -407,4 +407,25 @@ test('HTTP contract scenarios conceal foreign resources instead of leaking owner
 test('HTTP contract runner fails when a permissive transport returns success for every request', async () => {
   const permissiveFetch=async()=>({status:200,json:async()=>({})});
   await assert.rejects(runHttpContract('http://mock.invalid',undefined,permissiveFetch),/no session cannot read offers/);
+});
+test('concurrent offer selection and cancellation produce exactly one HTTP winner', async () => {
+  const race=await runConcurrencyContract();
+  assert.deepEqual(race.pair.map(result=>result.status).sort((a,b)=>a-b),[200,409]);
+  assert.equal(race.loser.body.code,'stale_revision');
+  assert.equal(race.loser.body.revision,3);
+  assert.equal(race.state.revision,3);
+  assert.equal(race.state.status,race.winner.body.status);
+});
+test('exact Idempotency-Key replay returns the frozen first success without another change', async () => {
+  const race=await runConcurrencyContract();
+  assert.equal(race.replay.status,200);
+  assert.deepEqual(race.replay.body,race.winner.body);
+  assert.equal(race.state.revision,3);
+  assert.equal(race.storedKeys,2);
+});
+test('reusing an Idempotency-Key with changed content is rejected', async () => {
+  const race=await runConcurrencyContract();
+  assert.equal(race.conflict.status,409);
+  assert.equal(race.conflict.body.code,'idempotency_conflict');
+  assert.match(race.conflict.body.requestId,/^trace-mock-/);
 });
