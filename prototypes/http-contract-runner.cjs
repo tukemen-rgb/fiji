@@ -655,6 +655,7 @@ function createSessionBoundCommandClient(initialBinding = null) {
       binding,
       generation,
       action: command.action,
+      idempotencyKey: command.idempotencyKey,
       scopedKey: idempotencyScopeKey(binding.accountRef, command.idempotencyKey),
       controller,
       signal: controller.signal
@@ -680,7 +681,65 @@ function createSessionBoundCommandClient(initialBinding = null) {
     }
     return {committed: false, reason: 'rejected', autoRetry: false, needsRecovery: false};
   };
-  return {snapshot, resetSession, startCommand, finishCommand};
+  const recoverUnknownOutcome = async (handle, options = {}) => {
+    const {baselineRevision, recover, isApplied, resend} = options;
+    const handleIsCurrent = () => Boolean(handle) && !handle.signal.aborted &&
+      handle.generation === generation && handle.binding === binding;
+    if (!handleIsCurrent()) return {committed: false, reason: 'stale_session', resent: false};
+    if (!Number.isInteger(baselineRevision) || baselineRevision < 1 ||
+        typeof recover !== 'function' || typeof isApplied !== 'function' || typeof resend !== 'function') {
+      return {committed: false, reason: 'invalid_recovery', resent: false};
+    }
+    const controller = new AbortController();
+    const recoveryHandle = Object.freeze({binding: handle.binding, generation: handle.generation, controller, signal: controller.signal});
+    const recoveryIsCurrent = () => !recoveryHandle.signal.aborted &&
+      recoveryHandle.generation === generation && recoveryHandle.binding === binding;
+    inflight.add(recoveryHandle);
+    try {
+      let recovered;
+      try {
+        recovered = await recover({signal: recoveryHandle.signal});
+      } catch (error) {
+        return recoveryIsCurrent()
+          ? {committed: false, reason: 'recovery_failed', resent: false}
+          : {committed: false, reason: 'stale_session', resent: false};
+      }
+      if (!recoveryIsCurrent()) return {committed: false, reason: 'stale_session', resent: false};
+      if ([401, 403, 404].includes(recovered?.status)) {
+        return {committed: false, reason: 'access_lost', resent: false};
+      }
+      if (recovered?.status !== 200 || !Number.isInteger(recovered.body?.revision)) {
+        return {committed: false, reason: 'recovery_unresolved', resent: false};
+      }
+      if (isApplied(recovered.body)) {
+        return {committed: true, reason: 'confirmed_by_recovery', resent: false, state: recovered.body};
+      }
+      if (recovered.body.revision !== baselineRevision) {
+        return {committed: false, reason: 'state_changed', resent: false, state: recovered.body};
+      }
+      let replay;
+      try {
+        replay = await resend({
+          action: handle.action,
+          idempotencyKey: handle.idempotencyKey,
+          scopedKey: handle.scopedKey,
+          signal: recoveryHandle.signal
+        });
+      } catch (error) {
+        return recoveryIsCurrent()
+          ? {committed: false, reason: 'replay_outcome_unknown', resent: true}
+          : {committed: false, reason: 'stale_session', resent: true};
+      }
+      if (!recoveryIsCurrent()) return {committed: false, reason: 'stale_session', resent: true};
+      if ([200, 201].includes(replay?.status)) {
+        return {committed: true, reason: 'committed_by_replay', resent: true, response: replay.body ?? null};
+      }
+      return {committed: false, reason: 'replay_unresolved', resent: true, response: replay?.body ?? null};
+    } finally {
+      inflight.delete(recoveryHandle);
+    }
+  };
+  return {snapshot, resetSession, startCommand, finishCommand, recoverUnknownOutcome};
 }
 
 async function runHttpContract(baseUrl, tokens = FIXTURE.tokens, fetchImpl = fetch) {
@@ -1159,8 +1218,93 @@ function runCommandSessionContract() {
   return {loggedOut, logoutAborted: logoutHandle.signal.aborted, delayedSuccess, sessionExpired, outcomeUnknown, delayedAccountA, accountBCommitted, accountAScope, reauthScope, accountBScope, accountAHandleScope: accountAHandle.scopedKey, accountBHandleScope: accountBHandle.scopedKey, delimiterA, delimiterB};
 }
 
+async function runCommandRecoveryContract() {
+  const snapshot = (revision, status, viewerRole, nextAction) => ({
+    id: FIXTURE.requestId,
+    status,
+    revision,
+    viewerRole,
+    nextAction,
+    updatedAt: new Date(Date.parse('2026-09-17T04:00:00Z') + revision * 1000).toISOString()
+  });
+  const accountA = {sessionId: 'session-recovery-a', accountRef: 'account-passenger-a', viewerRole: 'passenger'};
+  const accountB = {sessionId: 'session-recovery-b', accountRef: 'account-passenger-b', viewerRole: 'passenger'};
+  const command = {action: 'cancel_ride', idempotencyKey: 'recover-cancel-key'};
+  const applied = state => state?.id === FIXTURE.requestId && state?.viewerRole === 'passenger' && state?.status === 'cancelled';
+  const beginUnknown = client => {
+    const handle = client.startCommand(command);
+    const result = client.finishCommand(handle, {status: 0, body: null});
+    if (result.reason !== 'outcome_unknown') throw new Error('expected an unknown command outcome');
+    return handle;
+  };
+
+  let appliedReplayCalls = 0;
+  const appliedClient = createSessionBoundCommandClient(accountA);
+  const appliedHandle = beginUnknown(appliedClient);
+  const alreadyApplied = await appliedClient.recoverUnknownOutcome(appliedHandle, {
+    baselineRevision: 4,
+    recover: async () => ({status: 200, body: snapshot(5, 'cancelled', 'passenger', 'show_cancelled_history')}),
+    isApplied: applied,
+    resend: async () => { appliedReplayCalls += 1; return {status: 200}; }
+  });
+
+  const replayCalls = [];
+  const replayClient = createSessionBoundCommandClient(accountA);
+  const replayHandle = beginUnknown(replayClient);
+  const replayed = await replayClient.recoverUnknownOutcome(replayHandle, {
+    baselineRevision: 4,
+    recover: async () => ({status: 200, body: snapshot(4, 'assigned', 'passenger', 'track_driver')}),
+    isApplied: applied,
+    resend: async request => { replayCalls.push(request); return {status: 200, body: {status: 'cancelled'}}; }
+  });
+
+  let changedReplayCalls = 0;
+  const changedClient = createSessionBoundCommandClient(accountA);
+  const changedHandle = beginUnknown(changedClient);
+  const changed = await changedClient.recoverUnknownOutcome(changedHandle, {
+    baselineRevision: 4,
+    recover: async () => ({status: 200, body: snapshot(5, 'on_trip', 'passenger', 'show_on_trip')}),
+    isApplied: applied,
+    resend: async () => { changedReplayCalls += 1; return {status: 200}; }
+  });
+
+  let deniedReplayCalls = 0;
+  const deniedClient = createSessionBoundCommandClient(accountA);
+  const deniedHandle = beginUnknown(deniedClient);
+  const denied = await deniedClient.recoverUnknownOutcome(deniedHandle, {
+    baselineRevision: 4,
+    recover: async () => ({status: 401, body: errorBody('authentication_required', 'Authentication is required.', 'recover-denied')}),
+    isApplied: applied,
+    resend: async () => { deniedReplayCalls += 1; return {status: 200}; }
+  });
+
+  let unknownReplayCalls = 0;
+  const unknownClient = createSessionBoundCommandClient(accountA);
+  const unknownHandle = beginUnknown(unknownClient);
+  const replayUnknown = await unknownClient.recoverUnknownOutcome(unknownHandle, {
+    baselineRevision: 4,
+    recover: async () => ({status: 200, body: snapshot(4, 'assigned', 'passenger', 'track_driver')}),
+    isApplied: applied,
+    resend: async () => { unknownReplayCalls += 1; return {status: 503, body: errorBody('temporarily_unavailable', 'Try later.', 'replay-unknown')}; }
+  });
+
+  let staleReplayCalls = 0;
+  const staleClient = createSessionBoundCommandClient(accountA);
+  const staleHandle = beginUnknown(staleClient);
+  const staleSession = await staleClient.recoverUnknownOutcome(staleHandle, {
+    baselineRevision: 4,
+    recover: async () => {
+      staleClient.resetSession(accountB);
+      return {status: 200, body: snapshot(4, 'assigned', 'passenger', 'track_driver')};
+    },
+    isApplied: applied,
+    resend: async () => { staleReplayCalls += 1; return {status: 200}; }
+  });
+  return {alreadyApplied, appliedReplayCalls, replayed, replayCalls, changed, changedReplayCalls, denied, deniedReplayCalls, replayUnknown, unknownReplayCalls, staleSession, staleReplayCalls};
+}
+
 if (require.main === module) {
-  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract()]).then(([results, audit, retry, notification]) => {
+  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract(), runCommandRecoveryContract()]).then(([results, audit, retry, notification, commandRecovery]) => {
     const {race, validity, rideSafety, boardingRace} = audit;
     const merge = runRevisionMergeContract();
     const session = runSessionIsolationContract();
@@ -1176,6 +1320,7 @@ if (require.main === module) {
     console.log(`Notification hint OK: ${notification.authorized.calls} authorized recovery applied revision ${notification.authorized.state.revision}; private, stale and foreign hints made ${notification.rejectedCalls} requests`);
     console.log(`Session isolation OK: logout and role/account switches cleared cache, cancelled retry, aborted old reads and accepted only ${session.driverState.viewerRole} recovery`);
     console.log(`Command session OK: expired and stale-session results stopped without auto-retry; same raw key separated ${commandSession.accountAScope !== commandSession.accountBScope ? 'by account' : 'incorrectly'}`);
+    console.log(`Command recovery OK: applied state skipped replay; unchanged state replayed once; changed/access-lost/stale sessions stopped (${commandRecovery.replayCalls.length} explicit replay)`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -1183,4 +1328,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};

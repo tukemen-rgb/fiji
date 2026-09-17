@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
@@ -25,6 +25,8 @@ let sessionIsolationContract;
 function sessionIsolationResults() { return sessionIsolationContract ||= runSessionIsolationContract(); }
 let commandSessionContract;
 function commandSessionResults() { return commandSessionContract ||= runCommandSessionContract(); }
+let commandRecoveryContract;
+function commandRecoveryResults() { return commandRecoveryContract ||= runCommandRecoveryContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -944,4 +946,50 @@ test('the same raw Idempotency-Key is isolated by authenticated account', () => 
 test('structured idempotency scoping avoids delimiter collisions', () => {
   const {delimiterA,delimiterB}=commandSessionResults();
   assert.notEqual(delimiterA,delimiterB);
+});
+test('an already-applied unknown command completes from recovered state without replay', async () => {
+  const {alreadyApplied,appliedReplayCalls}=await commandRecoveryResults();
+  assert.equal(alreadyApplied.committed,true);
+  assert.equal(alreadyApplied.reason,'confirmed_by_recovery');
+  assert.equal(alreadyApplied.resent,false);
+  assert.equal(alreadyApplied.state.status,'cancelled');
+  assert.equal(appliedReplayCalls,0);
+});
+test('an unchanged recovered state permits exactly one explicit same-key replay', async () => {
+  const {replayed,replayCalls}=await commandRecoveryResults();
+  assert.equal(replayed.committed,true);
+  assert.equal(replayed.reason,'committed_by_replay');
+  assert.equal(replayed.resent,true);
+  assert.equal(replayCalls.length,1);
+  assert.equal(replayCalls[0].action,'cancel_ride');
+  assert.equal(replayCalls[0].idempotencyKey,'recover-cancel-key');
+});
+test('a newer conflicting state stops recovery without replaying the command', async () => {
+  const {changed,changedReplayCalls}=await commandRecoveryResults();
+  assert.equal(changed.committed,false);
+  assert.equal(changed.reason,'state_changed');
+  assert.equal(changed.resent,false);
+  assert.equal(changed.state.status,'on_trip');
+  assert.equal(changedReplayCalls,0);
+});
+test('loss of recovery access stops the command without replay', async () => {
+  const {denied,deniedReplayCalls}=await commandRecoveryResults();
+  assert.equal(denied.committed,false);
+  assert.equal(denied.reason,'access_lost');
+  assert.equal(denied.resent,false);
+  assert.equal(deniedReplayCalls,0);
+});
+test('an unknown replay outcome stops after the single explicit replay', async () => {
+  const {replayUnknown,unknownReplayCalls}=await commandRecoveryResults();
+  assert.equal(replayUnknown.committed,false);
+  assert.equal(replayUnknown.reason,'replay_unresolved');
+  assert.equal(replayUnknown.resent,true);
+  assert.equal(unknownReplayCalls,1);
+});
+test('a session switch during recovery discards the result and prevents replay', async () => {
+  const {staleSession,staleReplayCalls}=await commandRecoveryResults();
+  assert.equal(staleSession.committed,false);
+  assert.equal(staleSession.reason,'stale_session');
+  assert.equal(staleSession.resent,false);
+  assert.equal(staleReplayCalls,0);
 });

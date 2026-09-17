@@ -30,6 +30,8 @@ Ride state, role-scoped ETag, scheduled retry and in-flight recovery all belong 
 
 State-changing commands are bound to the authenticated account and session generation at send time. Logout or account change aborts the client request and any late success is discarded from the new UI. A 401/403 response never triggers an automatic command retry: require reauthentication and an authorized state read. A network/5xx outcome is unknown, not a failure proof; reconcile state first and only an explicit same-account retry may reuse the same key. Server idempotency storage is scoped by the authenticated account plus raw key as a structured pair, so another account using the same raw key cannot receive or conflict with the first account's result. This reference does not prove durable idempotency or transactional reconciliation.
 
+Unknown command outcomes use a bounded reconcile-before-replay flow. Read the authorized current ride state in the same session. If the intended transition is present, finish without replay. If the state is still exactly at the command's baseline revision, one explicit replay may reuse the original action and idempotency key. If the revision changed differently, access is lost, the session changes, recovery is incomplete or that single replay is also inconclusive, stop and require another state read or support path. Never generate a fresh key, loop replays or infer success from a notification.
+
 ## Common rules
 
 - Prefix examples with `/v1`. HTTPS and authenticated sessions are mandatory in production.
@@ -105,6 +107,7 @@ Acceptance:
 - Treat Push/WebSocket input only as a three-field non-sensitive hint. Never render it directly; obtain the role-shaped display through this authenticated endpoint and clear cached state if access is lost.
 - Scope state, ETag, retry and in-flight reads to an authenticated session generation. Logout or account/role change clears and aborts them; late completions from an older generation never enter the new view.
 - Bind state-changing commands and idempotency records to the authenticated account. Do not auto-retry after session expiry or an unknown outcome; reconcile first, discard old-session completions and never share a raw key's result across accounts.
+- After an unknown command result, confirm the authorized current state. Complete without replay when already applied; replay once with the original key only when the baseline revision is unchanged, and stop on any conflicting revision, access/session loss or second unknown outcome.
 
 ### `POST /v1/rides/{requestId}/vehicle-confirmations` — owning passenger
 
@@ -169,5 +172,6 @@ Error bodies contain a stable `code`, safe localized message, `requestId` for su
 16. notification hints allow only type/ride ID/revision, reject private or display fields, avoid reads for stale/foreign hints, and derive all visible state from an authorized recovery response.
 17. logout and account/role switches clear cached state, ETag and retry work, abort old reads, reject late completions, and accept only the new role-bound response.
 18. command completion after logout/account change is discarded, 401/403 and unknown outcomes do not auto-retry, and idempotency scope is stable for same-account reauth but distinct and collision-safe across accounts.
+19. an unknown command outcome is resolved from authorized current state when already applied, replayed exactly once with its original key only when the baseline is unchanged, and stopped on conflict, access/session loss or another unknown result.
 
 These are sequential reference-model tests, not proof of database locking, real concurrency, HTTP authentication or cross-device behavior. Claude's production PR must add integration tests that send concurrent commands to the real persistence layer and verify one winner, stable idempotent replay and complete audit events.
