@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract} = require('../http-contract-runner.cjs');
+const {scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 function setup() {
@@ -428,4 +428,34 @@ test('reusing an Idempotency-Key with changed content is rejected', async () => 
   assert.equal(race.conflict.status,409);
   assert.equal(race.conflict.body.code,'idempotency_conflict');
   assert.match(race.conflict.body.requestId,/^trace-mock-/);
+});
+test('server clock rejects an expired offer without changing the ride', async () => {
+  const validity=await runOfferValidityContract();
+  assert.equal(validity.expired.result.status,409);
+  assert.equal(validity.expired.result.body.code,'offer_expired');
+  assert.equal(validity.expired.result.body.revision,2);
+  assert.equal(validity.expired.offer.status,'expired');
+  assert.deepEqual(validity.expired.ride,{id:'ride-owner-1',status:'collecting',revision:2});
+});
+test('offer is expired at the exact server-side expiry boundary', async () => {
+  const validity=await runOfferValidityContract();
+  assert.equal(validity.boundary.result.body.code,'offer_expired');
+  assert.equal(validity.boundary.offer.statusReason,'time');
+  assert.equal(validity.valid.result.status,200,'one millisecond before expiry remains selectable');
+  assert.equal(validity.valid.ride.selectedQuote.selectedAt,'2026-09-17T03:00:00.000Z');
+});
+test('selection rechecks current driver eligibility and invalidates the offer', async () => {
+  const validity=await runOfferValidityContract();
+  assert.equal(validity.ineligible.result.status,409);
+  assert.equal(validity.ineligible.result.body.code,'driver_unavailable');
+  assert.equal(validity.ineligible.offer.status,'unavailable');
+  assert.equal(validity.ineligible.offer.statusReason,'eligibility');
+  assert.equal(validity.ineligible.ride.revision,2);
+});
+test('client cannot override the trusted offer-selection clock', async () => {
+  const validity=await runOfferValidityContract();
+  assert.equal(validity.clientClock.result.status,422);
+  assert.equal(validity.clientClock.result.body.code,'invalid_request');
+  assert.equal(validity.clientClock.ride.status,'collecting');
+  assert.equal(validity.clientClock.offer.status,'active');
 });

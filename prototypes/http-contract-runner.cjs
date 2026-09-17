@@ -55,9 +55,20 @@ function actorFrom(req) {
   return match ? ACTORS.get(match[1]) : null;
 }
 
-function createMockState() {
+function createMockState(options = {}) {
+  const clockMs = options.clockMs ?? Date.parse('2026-09-17T03:00:00Z');
   return {
     ride: {id: FIXTURE.requestId, status: 'collecting', revision: FIXTURE.revision},
+    offer: {
+      id: FIXTURE.offerId,
+      driverId: 'driver-reviewed',
+      status: 'active',
+      fareCents: 2300,
+      etaMinutes: 7,
+      expiresAtMs: options.offerExpiresAtMs ?? clockMs + 15 * 60 * 1000
+    },
+    driverEligibility: {'driver-reviewed': options.offerDriverEligible ?? true},
+    clockMs,
     idempotency: new Map(),
     lock: Promise.resolve()
   };
@@ -121,10 +132,20 @@ function createMockHandler(state = createMockState()) {
     if (req.method === 'POST' && url.pathname === selectPath) {
       if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
       if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
+      if (Object.keys(body).some(key => key !== 'expectedRequestRevision')) return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
       const response = await atomicCommand(state, actor, req, url, body, () => {
         if (Number(body.expectedRequestRevision) !== state.ride.revision) return {status: 409, body: {...errorBody('stale_revision', 'The request changed. Refresh before retrying.', 'stale'), revision: state.ride.revision}};
         if (state.ride.status !== 'collecting') return {status: 409, body: errorBody('invalid_transition', 'The request can no longer accept an offer.', 'transition')};
-        state.ride.status = 'assigned'; state.ride.revision += 1; state.ride.selectedOfferId = FIXTURE.offerId;
+        if (state.offer.status === 'expired' || state.clockMs >= state.offer.expiresAtMs) {
+          state.offer.status = 'expired'; state.offer.statusReason = 'time';
+          return {status: 409, body: {...errorBody('offer_expired', 'The offer has expired. Request a new quote.', 'expired'), revision: state.ride.revision}};
+        }
+        if (state.offer.status === 'unavailable' || !state.driverEligibility[state.offer.driverId]) {
+          state.offer.status = 'unavailable'; state.offer.statusReason = 'eligibility';
+          return {status: 409, body: {...errorBody('driver_unavailable', 'The driver is no longer eligible or available.', 'eligibility'), revision: state.ride.revision}};
+        }
+        state.ride.status = 'assigned'; state.ride.revision += 1; state.ride.selectedOfferId = FIXTURE.offerId; state.offer.status = 'selected';
+        state.ride.selectedQuote = {fareCents: state.offer.fareCents, etaMinutes: state.offer.etaMinutes, selectedAt: new Date(state.clockMs).toISOString()};
         return {status: 200, body: structuredClone(state.ride)};
       });
       return send(res, response.status, response.body);
@@ -198,8 +219,8 @@ async function runHttpContract(baseUrl, tokens = FIXTURE.tokens, fetchImpl = fet
   return results;
 }
 
-async function startMockServer() {
-  const state = createMockState();
+async function startMockServer(options = {}) {
+  const state = createMockState(options);
   const server = http.createServer(createMockHandler(state));
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -211,6 +232,42 @@ async function startMockServer() {
     state,
     close: () => new Promise(resolve => server.close(resolve))
   };
+}
+
+async function selectOnFreshMock(options, suffix, body = {expectedRequestRevision: FIXTURE.revision}) {
+  const mock = await startMockServer(options);
+  try {
+    const result = await requestJson(mock.baseUrl, {
+      method: 'POST',
+      path: `/v1/offers/${FIXTURE.offerId}/select`,
+      token: FIXTURE.tokens.owner,
+      headers: {'Idempotency-Key': `validity-key-${suffix}-0001`},
+      body
+    }, fetch);
+    return {result, ride: structuredClone(mock.state.ride), offer: structuredClone(mock.state.offer)};
+  } finally {
+    await mock.close();
+  }
+}
+
+async function runOfferValidityContract() {
+  const clockMs = Date.parse('2026-09-17T03:00:00Z');
+  const [expired, boundary, ineligible, valid, clientClock] = await Promise.all([
+    selectOnFreshMock({clockMs, offerExpiresAtMs: clockMs - 1}, 'expired'),
+    selectOnFreshMock({clockMs, offerExpiresAtMs: clockMs}, 'boundary'),
+    selectOnFreshMock({clockMs, offerDriverEligible: false}, 'ineligible'),
+    selectOnFreshMock({clockMs, offerExpiresAtMs: clockMs + 1}, 'valid'),
+    selectOnFreshMock({clockMs, offerExpiresAtMs: clockMs - 1}, 'client-clock', {expectedRequestRevision: FIXTURE.revision, clientNow: new Date(clockMs - 60_000).toISOString()})
+  ]);
+  if (expired.result.status !== 409 || expired.result.body?.code !== 'offer_expired') throw new Error('server clock did not reject an expired offer');
+  if (boundary.result.status !== 409 || boundary.result.body?.code !== 'offer_expired') throw new Error('offer remained selectable at its exact expiry instant');
+  if (ineligible.result.status !== 409 || ineligible.result.body?.code !== 'driver_unavailable') throw new Error('selection did not recheck current driver eligibility');
+  if (valid.result.status !== 200 || valid.ride.status !== 'assigned' || valid.ride.revision !== 3) throw new Error('a current eligible offer could not be selected');
+  if (clientClock.result.status !== 422 || clientClock.result.body?.code !== 'invalid_request') throw new Error('client-controlled clock input was not rejected');
+  for (const rejected of [expired, boundary, ineligible]) {
+    if (rejected.ride.status !== 'collecting' || rejected.ride.revision !== FIXTURE.revision) throw new Error('invalid offer selection changed the ride');
+  }
+  return {expired, boundary, ineligible, valid, clientClock};
 }
 
 async function runMockContract() {
@@ -257,14 +314,15 @@ async function runConcurrencyContract() {
 }
 
 if (require.main === module) {
-  Promise.all([runMockContract(), runConcurrencyContract()]).then(([results, race]) => {
+  Promise.all([runMockContract(), runConcurrencyContract(), runOfferValidityContract()]).then(([results, race, validity]) => {
     const denied = results.filter(r => r.status >= 400).length;
     console.log(`HTTP contract OK: ${results.length} scenarios (${denied} safe denials, ${results.length - denied} positive controls)`);
     console.log(`HTTP race OK: ${race.winner.command} won, ${race.loser.command} received stale_revision, exact replay was stable, changed replay was rejected`);
+    console.log(`HTTP validity OK: ${validity.expired.result.body.code}, exact-boundary expiry, ${validity.ineligible.result.body.code}, client clock rejected, current offer selected`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
     process.exitCode = 1;
   });
 }
 
-module.exports = {FIXTURE, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, startMockServer};
+module.exports = {FIXTURE, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, startMockServer};

@@ -8,6 +8,8 @@ HTTP acceptance runner: `node prototypes/http-contract-runner.cjs`. Its default 
 
 The same command also sends offer selection and cancellation concurrently from revision 2 with different idempotency keys. Exactly one returns 200 and revision 3; the loser returns `409 stale_revision`. An exact retry of the winner returns the frozen original response without another state change, while the same key with changed content returns `409 idempotency_conflict`. This loopback mock serializes with an in-memory promise lock and stores replay records in a Map; it is executable acceptance behavior, not evidence of database locks, multi-process safety or persistent idempotency storage.
 
+Offer-selection validity scenarios use an injected trusted server clock. A quote is rejected with `409 offer_expired` when server time is equal to or later than `expiresAt`; one millisecond before expiry is accepted. Current driver eligibility is rechecked inside the same serialized selection and returns `409 driver_unavailable` without assigning or incrementing the ride when eligibility has been lost. A caller-supplied `clientNow` is rejected as an unknown input rather than influencing the decision. This deterministic clock is a test fixture, not a live time service, background expiry worker or regulator check.
+
 ## Common rules
 
 - Prefix examples with `/v1`. HTTPS and authenticated sessions are mandatory in production.
