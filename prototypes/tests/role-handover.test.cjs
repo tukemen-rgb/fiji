@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
@@ -21,6 +21,8 @@ let revisionMergeContract;
 function revisionMergeResults() { return revisionMergeContract ||= runRevisionMergeContract(); }
 let notificationHintContract;
 function notificationHintResults() { return notificationHintContract ||= runNotificationHintContract(); }
+let sessionIsolationContract;
+function sessionIsolationResults() { return sessionIsolationContract ||= runSessionIsolationContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -849,4 +851,52 @@ test('a notification can request but cannot itself establish an initial display 
   assert.equal(initial.state.revision,4);
   assert.equal(initial.state.status,'assigned');
   assert.equal(initial.state.viewerRole,'passenger');
+});
+test('logout clears ride state, ETag and scheduled retry state', () => {
+  const {loggedOut,retryCancelled}=sessionIsolationResults();
+  assert.equal(retryCancelled,1);
+  assert.equal(loggedOut.active,false);
+  assert.equal(loggedOut.state,null);
+  assert.equal(loggedOut.etag,null);
+  assert.equal(loggedOut.retryScheduled,false);
+  assert.equal(loggedOut.inFlight,0);
+});
+test('logout aborts an in-flight recovery request', () => {
+  const {logoutSignalAborted}=sessionIsolationResults();
+  assert.equal(logoutSignalAborted,true);
+});
+test('a recovery response completing after logout cannot restore cached state', () => {
+  const {delayedAfterLogout}=sessionIsolationResults();
+  assert.equal(delayedAfterLogout.applied,false);
+  assert.equal(delayedAfterLogout.reason,'stale_session');
+  assert.equal(delayedAfterLogout.state,null);
+});
+test('role switching clears passenger cache and rejects its delayed response', () => {
+  const {afterRoleSwitch,passengerSignalAborted,delayedPassenger}=sessionIsolationResults();
+  assert.equal(afterRoleSwitch.active,true);
+  assert.equal(afterRoleSwitch.viewerRole,'driver');
+  assert.equal(afterRoleSwitch.state,null);
+  assert.equal(afterRoleSwitch.etag,null);
+  assert.equal(passengerSignalAborted,true);
+  assert.equal(delayedPassenger.reason,'stale_session');
+  assert.equal(delayedPassenger.state,null);
+});
+test('the new role can apply only its own authorized recovery response', () => {
+  const {driverRecovery,driverState}=sessionIsolationResults();
+  assert.equal(driverRecovery.applied,true);
+  assert.equal(driverRecovery.state.viewerRole,'driver');
+  assert.equal(driverState.viewerRole,'driver');
+  assert.equal(driverState.state.status,'on_trip');
+  assert.equal(driverState.state.nextAction,'continue_trip');
+  assert.equal(driverState.etag,'"driver-etag"');
+});
+test('switching accounts rejects an old response even when role and ride ID match', () => {
+  const {delayedAccountA,accountBState}=sessionIsolationResults();
+  assert.equal(delayedAccountA.applied,false);
+  assert.equal(delayedAccountA.reason,'stale_session');
+  assert.equal(delayedAccountA.state,null);
+  assert.equal(accountBState.active,true);
+  assert.equal(accountBState.viewerRole,'passenger');
+  assert.equal(accountBState.state,null);
+  assert.equal(accountBState.etag,null);
 });

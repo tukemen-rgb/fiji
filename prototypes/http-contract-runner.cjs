@@ -540,6 +540,91 @@ async function handleRideNotificationHint(options) {
   return {...merged, fetched: true};
 }
 
+function createRideSessionClient(initialBinding = null) {
+  const normalizeBinding = value => {
+    if (!value || typeof value.sessionId !== 'string' || !value.sessionId ||
+        !['passenger', 'driver'].includes(value.viewerRole) || typeof value.rideId !== 'string' || !value.rideId) return null;
+    return Object.freeze({sessionId: value.sessionId, viewerRole: value.viewerRole, rideId: value.rideId});
+  };
+  let binding = normalizeBinding(initialBinding);
+  let generation = 1;
+  let state = null;
+  let etag = null;
+  let retryCancel = null;
+  const inflight = new Set();
+
+  const clearRetry = () => {
+    if (!retryCancel) return;
+    const cancel = retryCancel;
+    retryCancel = null;
+    cancel();
+  };
+  const resetSession = nextBinding => {
+    generation += 1;
+    for (const handle of inflight) handle.controller.abort();
+    inflight.clear();
+    clearRetry();
+    state = null;
+    etag = null;
+    binding = normalizeBinding(nextBinding);
+    return snapshot();
+  };
+  const snapshot = () => ({
+    active: Boolean(binding),
+    viewerRole: binding?.viewerRole ?? null,
+    rideId: binding?.rideId ?? null,
+    state: state ? structuredClone(state) : null,
+    etag,
+    generation,
+    inFlight: inflight.size,
+    retryScheduled: Boolean(retryCancel)
+  });
+  const setCache = (nextState, nextEtag = null) => {
+    if (!binding || nextState?.id !== binding.rideId || nextState?.viewerRole !== binding.viewerRole) return false;
+    state = structuredClone(nextState);
+    etag = typeof nextEtag === 'string' ? nextEtag : null;
+    return true;
+  };
+  const scheduleRetry = cancel => {
+    if (!binding || typeof cancel !== 'function') return false;
+    clearRetry();
+    retryCancel = cancel;
+    return true;
+  };
+  const startRecovery = () => {
+    if (!binding) return null;
+    const controller = new AbortController();
+    const handle = Object.freeze({binding, generation, controller, signal: controller.signal});
+    inflight.add(handle);
+    return handle;
+  };
+  const finishRecovery = (handle, response) => {
+    if (!handle) return {state, applied: false, reason: 'no_session'};
+    inflight.delete(handle);
+    if (handle.signal.aborted || handle.generation !== generation || handle.binding !== binding) {
+      return {state, applied: false, reason: 'stale_session'};
+    }
+    if ([401, 403, 404].includes(response?.status)) {
+      state = null;
+      etag = null;
+      clearRetry();
+      return {state, applied: false, reason: 'access_lost'};
+    }
+    if (response?.status === 304) return {state, applied: false, reason: 'not_modified'};
+    if (response?.status !== 200 || !response.body) return {state, applied: false, reason: 'recovery_failed'};
+    if (response.body.id !== binding.rideId || response.body.viewerRole !== binding.viewerRole) {
+      return {state, applied: false, reason: 'scope_mismatch'};
+    }
+    const merged = mergeRideStateUpdate(state, response.body, 'recovery');
+    if (merged.applied) {
+      state = structuredClone(merged.state);
+      etag = typeof response.headers?.etag === 'string' ? response.headers.etag : null;
+    }
+    return {...merged, state};
+  };
+  return {snapshot, resetSession, setCache, scheduleRetry, startRecovery, finishRecovery};
+}
+
 async function runHttpContract(baseUrl, tokens = FIXTURE.tokens, fetchImpl = fetch) {
   const results = [];
   for (const scenario of scenarios(tokens)) {
@@ -942,10 +1027,51 @@ async function runNotificationHintContract() {
   return {base, authorized: {...authorized, calls: authorizedCalls, recoveredFrom}, sensitive, stale, duplicate, foreign, rejectedCalls, accessLost, notYetVisible, initial};
 }
 
+function runSessionIsolationContract() {
+  const snapshot = (revision, status, viewerRole, nextAction) => ({
+    id: FIXTURE.requestId,
+    status,
+    revision,
+    viewerRole,
+    nextAction,
+    updatedAt: new Date(Date.parse('2026-09-17T03:00:00Z') + revision * 1000).toISOString()
+  });
+  const passengerBinding = {sessionId: 'session-passenger-a', viewerRole: 'passenger', rideId: FIXTURE.requestId};
+  const driverBinding = {sessionId: 'session-driver-a', viewerRole: 'driver', rideId: FIXTURE.requestId};
+  const otherPassengerBinding = {sessionId: 'session-passenger-b', viewerRole: 'passenger', rideId: FIXTURE.requestId};
+
+  let retryCancelled = 0;
+  const logoutClient = createRideSessionClient(passengerBinding);
+  logoutClient.setCache(snapshot(8, 'cancelled', 'passenger', 'show_cancelled_history'), '"passenger-etag"');
+  logoutClient.scheduleRetry(() => { retryCancelled += 1; });
+  const logoutHandle = logoutClient.startRecovery();
+  const loggedOut = logoutClient.resetSession(null);
+  const delayedAfterLogout = logoutClient.finishRecovery(logoutHandle, {status: 200, body: snapshot(9, 'on_trip', 'passenger', 'show_on_trip'), headers: {etag: '"late"'}});
+
+  const roleClient = createRideSessionClient(passengerBinding);
+  roleClient.setCache(snapshot(8, 'cancelled', 'passenger', 'show_cancelled_history'), '"passenger-etag"');
+  const passengerHandle = roleClient.startRecovery();
+  const afterRoleSwitch = roleClient.resetSession(driverBinding);
+  const delayedPassenger = roleClient.finishRecovery(passengerHandle, {status: 200, body: snapshot(9, 'on_trip', 'passenger', 'show_on_trip'), headers: {etag: '"passenger-late"'}});
+  const driverHandle = roleClient.startRecovery();
+  const driverRecovery = roleClient.finishRecovery(driverHandle, {status: 200, body: snapshot(9, 'on_trip', 'driver', 'continue_trip'), headers: {etag: '"driver-etag"'}});
+  const driverState = roleClient.snapshot();
+
+  const accountClient = createRideSessionClient(passengerBinding);
+  accountClient.setCache(snapshot(8, 'cancelled', 'passenger', 'show_cancelled_history'), '"account-a"');
+  const accountAHandle = accountClient.startRecovery();
+  accountClient.resetSession(otherPassengerBinding);
+  const delayedAccountA = accountClient.finishRecovery(accountAHandle, {status: 200, body: snapshot(9, 'on_trip', 'passenger', 'show_on_trip'), headers: {etag: '"account-a-late"'}});
+  const accountBState = accountClient.snapshot();
+
+  return {loggedOut, logoutSignalAborted: logoutHandle.signal.aborted, retryCancelled, delayedAfterLogout, afterRoleSwitch, passengerSignalAborted: passengerHandle.signal.aborted, delayedPassenger, driverRecovery, driverState, delayedAccountA, accountBState};
+}
+
 if (require.main === module) {
   Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract()]).then(([results, audit, retry, notification]) => {
     const {race, validity, rideSafety, boardingRace} = audit;
     const merge = runRevisionMergeContract();
+    const session = runSessionIsolationContract();
     const denied = results.filter(r => r.status >= 400).length;
     console.log(`HTTP contract OK: ${results.length} scenarios (${denied} safe denials, ${results.length - denied} positive controls)`);
     console.log(`HTTP race OK: ${race.winner.command} won, ${race.loser.command} received stale_revision, exact replay was stable, changed replay was rejected`);
@@ -955,6 +1081,7 @@ if (require.main === module) {
     console.log(`HTTP recovery retry OK: Retry-After ${retry.rateLimited.delays[0]}ms, exponential ${retry.unavailable.delays.join('/')}ms, capped and access/visibility stops`);
     console.log(`Client revision merge OK: revision ${merge.newerNotification.state.revision} resisted delayed recovery, gaps/conflicts requested recovery, scope mismatches were rejected`);
     console.log(`Notification hint OK: ${notification.authorized.calls} authorized recovery applied revision ${notification.authorized.state.revision}; private, stale and foreign hints made ${notification.rejectedCalls} requests`);
+    console.log(`Session isolation OK: logout and role/account switches cleared cache, cancelled retry, aborted old reads and accepted only ${session.driverState.viewerRole} recovery`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -962,4 +1089,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
