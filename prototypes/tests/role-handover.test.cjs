@@ -1362,6 +1362,36 @@ test('one explicit reconnect verifies the latest authorized state before unlocki
   assert.equal(duplicate.reason,'action_in_progress');assert.equal(subscriptions,2);assert.equal(verifications,1);assert.equal(bridge.snapshot().guidance,'verifying');assert.equal(bridge.snapshot().commandsLocked,true);
   verifyResolve({verified:true});const result=await reconnecting;assert.equal(result.reconnected,true);assert.equal(bridge.snapshot().guidance,'connected');assert.equal(bridge.snapshot().commandsLocked,false);assert.equal(bridge.snapshot().reconnects,1);
 });
+test('network, status 0, 429 and 5xx after reconnect offer one explicit latest-state refresh', async () => {
+  const {R}=setup(),failures=[()=>{throw Error('offline');},()=>({status:0}),()=>({status:429}),()=>({status:503})];
+  for(const failure of failures){
+    let disconnect,verifications=0;const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'passenger',subscribe:async input=>{disconnect=input.onDisconnect;return()=>{};},onHint:async()=>({processed:true}),verifyLatest:async()=>{verifications+=1;return verifications===1?failure():{verified:true};}});
+    bridge.attach();await bridge.idle();disconnect();const reconnect=await bridge.reconnect(),state=bridge.snapshot();
+    assert.equal(reconnect.reason,'connectivity_required');assert.equal(state.connected,true);assert.equal(state.guidance,'verification_connectivity');assert.equal(state.commandsLocked,true);assert.equal(state.action,'refresh');assert.match(state.feedback.title,/依頼/);assert.equal(verifications,1);
+    const refreshing=bridge.refresh(),duplicate=await bridge.refresh();assert.equal(duplicate.reason,'action_in_progress');const refreshed=await refreshing;
+    assert.equal(refreshed.reason,'verification_refreshed');assert.equal(bridge.snapshot().commandsLocked,false);assert.equal(bridge.snapshot().guidance,'connected');assert.equal(verifications,2);assert.equal((await bridge.refresh()).reason,'refresh_unavailable');
+  }
+});
+test('401 and 403 after reconnect require role-specific reauthentication without retry', async () => {
+  const {R}=setup();
+  for(const [role,status,subject] of [['passenger',401,'依頼'],['driver',403,'運行']]){
+    let disconnect,verifications=0;const bridge=R.createRecoverableNotificationSubscriptionBridge({role,subscribe:async input=>{disconnect=input.onDisconnect;return()=>{};},onHint:async()=>({processed:true}),verifyLatest:async()=>{verifications+=1;return {status};}});
+    bridge.attach();await bridge.idle();disconnect();const result=await bridge.reconnect(),state=bridge.snapshot();
+    assert.equal(result.reason,'reauthentication_required');assert.equal(state.guidance,'reauth');assert.equal(state.commandsLocked,true);assert.equal(state.action,'reauth');assert.match(state.feedback.message,new RegExp(subject));assert.equal(verifications,1);await bridge.idle();assert.equal(verifications,1);assert.equal((await bridge.refresh()).reason,'refresh_unavailable');
+  }
+});
+test('404 after reconnect clears the role lock into a safe empty state', async () => {
+  const {R}=setup();let disconnect;
+  const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'driver',subscribe:async input=>{disconnect=input.onDisconnect;return()=>{};},onHint:async()=>({processed:true}),verifyLatest:async()=>({status:404})});
+  bridge.attach();await bridge.idle();disconnect();const result=await bridge.reconnect(),state=bridge.snapshot();
+  assert.equal(result.reason,'ride_not_found');assert.equal(state.connected,true);assert.equal(state.guidance,'empty');assert.equal(state.commandsLocked,false);assert.equal(state.action,null);assert.match(state.feedback.title,/運行/);assert.equal(state.feedback.disableCommands,false);
+});
+test('unexpected reconnect verification stays locked without leaking its response', async () => {
+  const {R}=setup();let disconnect;
+  const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'passenger',subscribe:async input=>{disconnect=input.onDisconnect;return()=>{};},onHint:async()=>({processed:true}),verifyLatest:async()=>({status:200,body:{token:'private',rideId:'private'}})});
+  bridge.attach();await bridge.idle();disconnect();const result=await bridge.reconnect(),state=bridge.snapshot();
+  assert.equal(result.reason,'verification_failed');assert.equal(state.guidance,'retry_failed');assert.equal(state.commandsLocked,true);assert.equal(state.action,null);for(const secret of ['body','token','rideId','response'])assert.equal(JSON.stringify(state).includes(secret),false);
+});
 test('failed explicit reconnect stops without an automatic connection loop', async () => {
   const {R}=setup();let subscriptions=0;
   const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'driver',subscribe:async()=>{subscriptions+=1;throw Error('offline');},onHint:async()=>({processed:true}),verifyLatest:async()=>({verified:true})});

@@ -132,3 +132,12 @@ These counts were reported in the earlier handoff. This intake independently rer
 - Public state and feedback exclude session references, credentials, endpoints, abort signals, notification bodies and verification responses.
 
 The five executable acceptance cases raise the current total to 285 passing tests (20 verification + 265 role/lifecycle/API/HTTP-contract), with no TODOs. They use injected subscriptions and reads, not real Push/WebSocket, authentication, browser/Android lifecycle or mobile-network recovery.
+
+## Post-reconnect verification classification — 2026-09-19 Fiji
+- Reconnecting the notification transport alone never unlocks state-changing controls; the authorized latest-state read must return an explicit verified result.
+- Network exceptions, status 0, 429 and 5xx retain the passenger-request or driver-operation lock and expose one explicit latest-state refresh. Duplicate and repeated refreshes stop before I/O.
+- 401/403 retains the lock and exposes only role-specific reauthentication. 404 clears the stale view into an unlocked role-specific empty state.
+- A 2xx-shaped response without explicit verification fails closed, exposes no retry action and never enters an automatic loop.
+- Verification response bodies, ride identifiers, session references and credentials are excluded from public state and feedback.
+
+Four executable cases raise the current total to 289 passing tests (20 verification + 269 role/lifecycle/API/HTTP-contract), with no TODOs. Real authentication, HTTP, Push/WebSocket, browser/Android lifecycle and cross-device synchronization remain unverified.
