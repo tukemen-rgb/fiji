@@ -725,7 +725,7 @@ function roleFeedbackLifecycleFixture(R,{notificationRead=async()=>({status:304}
     createFeedbackBridge({role,generation}){
       const current=currentRideView(role,{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle,role,currentRide:current,recover:hint=>notificationRead({role,generation,hint})}),commandUi=R.createCommandUiController(role),flow=R.createNotificationFeedbackFlow({role,recovery,commandUi,onReauthenticate:context=>onReauthenticate({...context,generation})}),target=recoveryEventTarget(),renders=[];
       const inner=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});
-      const bridge={snapshot:()=>inner.snapshot(),attach(){events.push(`attach:${role}:${generation}`);return inner.attach();},activate:()=>inner.activate(),detach(){events.push(`detach:${role}:${generation}`);return inner.detach();},idle:()=>inner.idle()};
+      const bridge={snapshot:()=>inner.snapshot(),attach(){events.push(`attach:${role}:${generation}`);return inner.attach();},activate:()=>inner.activate(),handleNotification:hint=>inner.handleNotification(hint),detach(){events.push(`detach:${role}:${generation}`);return inner.detach();},idle:()=>inner.idle()};
       feedbacks.push({role,generation,current,recovery,commandUi,flow,target,renders,bridge,inner});return bridge;
     }
   });
@@ -1212,6 +1212,35 @@ test('a delayed old notification action cannot render into a switched role gener
   await fixture.lifecycle.enter('passenger');const old=fixture.feedbacks[0];await old.flow.handle({type:'ride.changed',rideId:old.current.id,revision:9});const pending=old.inner.activate();await Promise.resolve();const oldRenderCount=old.renders.length;
   await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[1];release();const result=await pending;await old.inner.idle();
   assert.equal(result.reason,'bridge_stale');assert.equal(old.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().role,'driver');assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(current.target.listenerCount('click'),1);
+});
+test('the active role generation accepts a notification hint through its owned bridge', async () => {
+  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async({role,hint})=>{reads+=1;return {status:200,body:currentRideView(role,{revision:hint.revision,status:'assigned'})};}});
+  await fixture.lifecycle.enter('passenger');const generation=fixture.lifecycle.snapshot().generation,current=fixture.feedbacks[0].current;
+  const result=await fixture.lifecycle.handleNotification({role:'passenger',generation,hint:{type:'ride.changed',rideId:current.id,revision:9}});
+  assert.equal(result.processed,true);assert.equal(reads,1);assert.equal(fixture.feedbacks[0].recovery.snapshot().revision,9);assert.equal(fixture.feedbacks[0].commandUi.snapshot().role,'passenger');
+});
+test('cross-role and stale-generation notification hints stop before feedback or reads', async () => {
+  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
+  await fixture.lifecycle.enter('passenger');const generation=fixture.lifecycle.snapshot().generation,current=fixture.feedbacks[0].current,hint={type:'ride.changed',rideId:current.id,revision:9};
+  assert.equal((await fixture.lifecycle.handleNotification({role:'driver',generation,hint})).reason,'stale_role_generation');assert.equal((await fixture.lifecycle.handleNotification({role:'passenger',generation:generation+1,hint})).reason,'stale_role_generation');assert.equal(reads,0);assert.equal(fixture.feedbacks[0].inner.snapshot().handledEvents,0);
+});
+test('notification hints after role exit stop before the detached bridge', async () => {
+  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
+  await fixture.lifecycle.enter('driver');const generation=fixture.lifecycle.snapshot().generation,current=fixture.feedbacks[0].current;fixture.lifecycle.leave();
+  const result=await fixture.lifecycle.handleNotification({role:'driver',generation,hint:{type:'ride.changed',rideId:current.id,revision:9}});
+  assert.equal(result.reason,'not_entered');assert.equal(reads,0);assert.equal(fixture.feedbacks[0].inner.snapshot().handledEvents,0);
+});
+test('same-role re-entry accepts only the fresh notification generation', async () => {
+  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async({role,hint})=>{reads+=1;return {status:200,body:currentRideView(role,{revision:hint.revision,status:'assigned'})};}});
+  await fixture.lifecycle.enter('passenger');const old=fixture.feedbacks[0];fixture.lifecycle.leave();await fixture.lifecycle.enter('passenger');const fresh=fixture.feedbacks[1],hint={type:'ride.changed',rideId:fresh.current.id,revision:9};
+  assert.equal((await fixture.lifecycle.handleNotification({role:'passenger',generation:old.generation,hint})).reason,'stale_role_generation');assert.equal(reads,0);
+  assert.equal((await fixture.lifecycle.handleNotification({role:'passenger',generation:fresh.generation,hint})).processed,true);assert.equal(reads,1);assert.equal(old.inner.snapshot().handledEvents,0);assert.equal(fresh.inner.snapshot().handledEvents,1);
+});
+test('a delayed notification hint from a departed role cannot render into the new role', async () => {
+  const {R}=setup();let release;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:({role,hint})=>role==='passenger'?new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});}):Promise.resolve({status:304})});
+  await fixture.lifecycle.enter('passenger');const old=fixture.feedbacks[0],pending=fixture.lifecycle.handleNotification({role:'passenger',generation:old.generation,hint:{type:'ride.changed',rideId:old.current.id,revision:9}});await Promise.resolve();await Promise.resolve();const oldRenderCount=old.renders.length;
+  await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[1];release();const result=await pending;await old.inner.idle();
+  assert.equal(result.reason,'stale_notification');assert.equal(old.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().role,'driver');assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(current.inner.snapshot().handledEvents,0);
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);

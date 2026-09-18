@@ -513,7 +513,7 @@
         if(started?.started!==true)throw Error('bridge_start');
         if(createFeedbackBridge){
           feedbackBridge=createFeedbackBridge({role:normalized,generation:entryGeneration,flow});
-          if(!feedbackBridge||typeof feedbackBridge.attach!=='function'||typeof feedbackBridge.detach!=='function'||typeof feedbackBridge.idle!=='function')throw Error('feedback_bridge');
+          if(!feedbackBridge||typeof feedbackBridge.attach!=='function'||typeof feedbackBridge.handleNotification!=='function'||typeof feedbackBridge.detach!=='function'||typeof feedbackBridge.idle!=='function')throw Error('feedback_bridge');
           const feedbackStarted=feedbackBridge.attach();
           if(feedbackStarted?.started!==true)throw Error('feedback_bridge_start');
         }
@@ -567,13 +567,26 @@
       });
       handle=Object.freeze({entry,task});recoveryAction=handle;operations.add(task);return task;
     };
+    const handleNotification=({role,generation:expectedGeneration,hint}={})=>{
+      const entry=active;
+      if(!entry)return Promise.resolve({processed:false,reason:'not_entered',state:snapshot()});
+      if(role!==entry.role||expectedGeneration!==entry.generation)return Promise.resolve({processed:false,reason:'stale_role_generation',state:snapshot()});
+      if(!entry.feedbackBridge)return Promise.resolve({processed:false,reason:'feedback_unavailable',state:snapshot()});
+      lastAction='notification_hint';let task;
+      task=Promise.resolve(entry.feedbackBridge.handleNotification(hint)).then(result=>{
+        if(active!==entry)return {processed:false,reason:'stale_notification',result,state:snapshot()};
+        const processed=result?.processed===true;lastAction=result?.reason||'notification_rejected';
+        return {processed,reason:lastAction,result,state:snapshot()};
+      },()=>({processed:false,reason:'notification_failed',state:snapshot()})).finally(()=>operations.delete(task));
+      operations.add(task);return task;
+    };
     const idle=async()=>{
       while(operations.size>0)await Promise.all([...operations]);
       if(active?.feedbackBridge)await active.feedbackBridge.idle();
       if(active)await active.bridge.idle();
       return snapshot();
     };
-    return Object.freeze({snapshot,enter,leave,requestRecovery,requestNotificationRecovery,idle});
+    return Object.freeze({snapshot,enter,leave,requestRecovery,requestNotificationRecovery,handleNotification,idle});
   }
   function createRoleRoutingBoundary({lifecycle}){
     if(!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.enter!=='function'||typeof lifecycle.leave!=='function'||typeof lifecycle.requestRecovery!=='function'||typeof lifecycle.idle!=='function')throw Error('役割別ルーティング境界の設定が不正です。');
@@ -826,6 +839,18 @@
       }).finally(()=>operations.delete(task));
       operations.add(task);paint(token);return task;
     };
+    const handleNotification=hint=>{
+      if(detached||!attached)return reject('bridge_inactive');
+      const token=version;handledEvents+=1;lastEvent='notification';
+      let task;task=Promise.resolve(flow.handle(hint)).then(result=>{
+        if(attached&&!detached&&token===version){lastEvent=result.reason||'notification';paint(token);return {...result,state:snapshot()};}
+        return {processed:false,reason:'bridge_stale',result,state:snapshot()};
+      },()=>{
+        if(attached&&!detached&&token===version){lastEvent='notification_failed';paint(token);}
+        return {processed:false,reason:attached&&!detached&&token===version?'notification_failed':'bridge_stale',state:snapshot()};
+      }).finally(()=>operations.delete(task));
+      operations.add(task);paint(token);return task;
+    };
     const click=event=>{event?.preventDefault?.();void activate();};
     const attach=()=>{
       if(detached)return {started:false,reason:'bridge_detached',state:snapshot()};
@@ -838,7 +863,7 @@
       eventTarget.removeEventListener('click',click);attached=false;detached=true;version+=1;flow.dispose();lastEvent='detached';return snapshot();
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
-    return Object.freeze({snapshot,attach,activate,detach,idle});
+    return Object.freeze({snapshot,attach,activate,handleNotification,detach,idle});
   }
   function create(){
     let seq=10;
