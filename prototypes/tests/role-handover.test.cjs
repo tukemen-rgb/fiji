@@ -1134,6 +1134,42 @@ test('a not-found explicit refresh updates the shared driver banner to an unlock
   await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const empty=await flow.trigger('refresh'),view=commandUi.snapshot();
   assert.equal(empty.processed,true);assert.equal(calls,3);assert.equal(view.outcome,'confirmed');assert.equal(view.disableCommands,false);assert.equal(view.action,null);assert.match(view.title,/運行/);assert.match(view.message,/運転手ホーム/);
 });
+test('notification feedback button bridge attaches one click listener and removes it on role exit', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),renders=[];
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>({status:304})}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi}),bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});
+  assert.equal(bridge.attach().started,true);assert.equal(bridge.attach().reason,'already_attached');assert.equal(target.listenerCount('click'),1);assert.equal(target.addCount('click'),1);assert.equal(renders.length,1);
+  bridge.detach();assert.equal(target.listenerCount('click'),0);assert.equal(bridge.snapshot().detached,true);target.dispatch('click');assert.equal(renders.length,1);
+});
+test('a double click on the notification refresh button starts one read only', async () => {
+  const {R}=setup();let calls=0,release;const target=recoveryEventTarget(),renders=[];
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async hint=>{calls+=1;if(calls<3)return {status:304};return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});});}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
+  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});bridge.attach();
+  const first=bridge.activate();await Promise.resolve();const duplicate=await bridge.activate();assert.equal(duplicate.reason,'action_in_progress');assert.equal(calls,3);release();const completed=await first;
+  assert.equal(completed.processed,true);assert.equal(calls,3);assert.equal(commandUi.snapshot().disableCommands,false);assert.ok(renders.some(view=>view.outcome==='pending'));assert.equal(renders.at(-1).action,null);
+});
+test('detaching the notification button during a read drops its delayed render', async () => {
+  const {R}=setup();let calls=0,release;const target=recoveryEventTarget(),renders=[];
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
+  const current=currentRideView('driver',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async hint=>{calls+=1;if(calls<3)return {status:304};return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('driver',{revision:hint.revision,status:'arriving'})});});}}),commandUi=R.createCommandUiController('driver'),flow=R.createNotificationFeedbackFlow({role:'driver',recovery,commandUi});
+  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});bridge.attach();const pending=bridge.activate();await Promise.resolve();const before=renders.length;bridge.detach();release();const stale=await pending;
+  assert.equal(stale.reason,'bridge_stale');assert.equal(renders.length,before);assert.equal(target.listenerCount('click'),0);assert.equal(calls,3);
+});
+test('an old notification button cannot act after the command UI switches role', async () => {
+  const {R}=setup();let calls=0;const target=recoveryEventTarget();
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return {status:304};}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
+  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:()=>{}});bridge.attach();commandUi.setRole('driver');const rejected=await bridge.activate();
+  assert.equal(rejected.reason,'action_not_available');assert.equal(calls,2);assert.equal(commandUi.snapshot().role,'driver');assert.equal(commandUi.snapshot().outcome,'idle');
+});
+test('the reauthentication button event is single-flight and remains locked until a new session', async () => {
+  const {R}=setup();let calls=0,reauthCalls=0,release;const target=recoveryEventTarget();
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
+  const current=currentRideView('driver',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:403}:{status:304};}}),commandUi=R.createCommandUiController('driver'),flow=R.createNotificationFeedbackFlow({role:'driver',recovery,commandUi,onReauthenticate:()=>{reauthCalls+=1;return new Promise(resolve=>{release=resolve;});}});
+  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});await flow.trigger('refresh');const bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:()=>{}});bridge.attach();const first=bridge.activate();await Promise.resolve();const duplicate=await bridge.activate();
+  assert.equal(duplicate.reason,'action_in_progress');assert.equal(reauthCalls,1);release({requested:true});await first;assert.equal(reauthCalls,1);assert.equal(commandUi.snapshot().action,'reauth');assert.equal(commandUi.snapshot().disableCommands,true);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');

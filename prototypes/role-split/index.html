@@ -795,6 +795,43 @@
     const dispose=()=>{active=false;lastReason='disposed';return snapshot();};
     return Object.freeze({snapshot,sync,handle,trigger,dispose});
   }
+  function createNotificationFeedbackEventBridge({flow,eventTarget,render}){
+    if(!flow||typeof flow.snapshot!=='function'||typeof flow.sync!=='function'||typeof flow.trigger!=='function'||typeof flow.dispose!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||typeof render!=='function')throw Error('通知フィードバックイベント接続の設定が不正です。');
+    let attached=false,detached=false,version=0,handledEvents=0,lastEvent='idle';const operations=new Set();
+    const snapshot=()=>Object.freeze({attached,detached,busy:operations.size>0,handledEvents,lastEvent});
+    const paint=token=>{
+      if(!attached||detached||token!==version)return false;
+      try{render(flow.snapshot().command);return true;}catch{lastEvent='render_failed';return false;}
+    };
+    const reject=reason=>Promise.resolve({processed:false,reason,state:snapshot()});
+    const activate=()=>{
+      if(detached||!attached)return reject('bridge_inactive');
+      if(operations.size>0)return reject('action_in_progress');
+      const action=flow.snapshot().command.action;if(!['refresh','reauth'].includes(action))return reject('action_not_available');
+      const token=version;handledEvents+=1;lastEvent=action;
+      let task;task=Promise.resolve(flow.trigger(action)).then(result=>{
+        if(attached&&!detached&&token===version){lastEvent=result.reason||action;paint(token);return {...result,state:snapshot()};}
+        return {processed:false,reason:'bridge_stale',result,state:snapshot()};
+      },()=>{
+        if(attached&&!detached&&token===version){lastEvent='action_failed';paint(token);}
+        return {processed:false,reason:attached&&!detached&&token===version?'action_failed':'bridge_stale',state:snapshot()};
+      }).finally(()=>operations.delete(task));
+      operations.add(task);paint(token);return task;
+    };
+    const click=event=>{event?.preventDefault?.();void activate();};
+    const attach=()=>{
+      if(detached)return {started:false,reason:'bridge_detached',state:snapshot()};
+      if(attached)return {started:false,reason:'already_attached',state:snapshot()};
+      attached=true;version+=1;eventTarget.addEventListener('click',click);flow.sync();paint(version);lastEvent='attached';
+      return {started:true,reason:'attached',state:snapshot()};
+    };
+    const detach=()=>{
+      if(!attached){detached=true;flow.dispose();lastEvent='detached';return snapshot();}
+      eventTarget.removeEventListener('click',click);attached=false;detached=true;version+=1;flow.dispose();lastEvent='detached';return snapshot();
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
+    return Object.freeze({snapshot,attach,activate,detach,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -952,7 +989,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
