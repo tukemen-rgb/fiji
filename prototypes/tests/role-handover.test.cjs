@@ -1060,6 +1060,44 @@ test('role exit clears a locked notification target and rejects its explicit ref
   await boundary.navigate('driver-home','driver');const rejected=await notifications.refresh(),state=notifications.snapshot();
   assert.equal(rejected.reason,'inactive_role');assert.equal(calls,2);assert.equal(state.pendingRevision,null);assert.equal(state.needsRefresh,false);assert.equal(state.commandsLocked,false);
 });
+test('a network failure during explicit refresh keeps the passenger request safely locked', async () => {
+  const {R}=setup();let calls=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;if(calls===3)throw Error('offline');return {status:304};}});
+  await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});const failed=await notifications.refresh(),state=notifications.snapshot();
+  assert.equal(failed.reason,'connectivity_required');assert.equal(calls,3);assert.equal(state.guidance,'connectivity');assert.equal(state.commandsLocked,true);assert.equal(state.action,'refresh');assert.equal(state.pendingRevision,9);assert.match(state.feedback.title,/依頼/);assert.match(state.feedback.message,/通信/);
+});
+test('a 503 explicit refresh keeps the driver operation locked without retrying', async () => {
+  const {R}=setup();let calls=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
+  const current=currentRideView('driver',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:503}:{status:304};}});
+  await notifications.handle({type:'ride.changed',rideId:current.id,revision:10});const failed=await notifications.refresh(),state=notifications.snapshot();
+  assert.equal(failed.reason,'connectivity_required');assert.equal(calls,3);assert.equal(state.commandsLocked,true);assert.equal(state.pendingRevision,10);assert.match(state.feedback.title,/運行/);
+});
+test('401 and 403 explicit refreshes clear cached state and require reauthentication', async () => {
+  for(const status of [401,403]){
+    const {R}=setup();let calls=0;
+    const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+    const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status}:{status:304};}});
+    await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});const failed=await notifications.refresh(),state=notifications.snapshot();
+    assert.equal(failed.reason,'reauthentication_required');assert.equal(calls,3);assert.equal(state.hasRide,false);assert.equal(state.guidance,'reauth');assert.equal(state.commandsLocked,true);assert.equal(state.action,'reauth');assert.equal(state.pendingRevision,null);assert.match(state.feedback.message,/依頼/);
+  }
+});
+test('a 404 explicit refresh clears the stale ride and returns to an unlocked empty state', async () => {
+  const {R}=setup();let calls=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
+  const current=currentRideView('driver',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:404}:{status:304};}});
+  await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});const empty=await notifications.refresh(),state=notifications.snapshot();
+  assert.equal(empty.reason,'ride_not_found');assert.equal(calls,3);assert.equal(state.hasRide,false);assert.equal(state.guidance,'empty');assert.equal(state.commandsLocked,false);assert.equal(state.action,null);assert.equal(state.pendingRevision,null);assert.match(state.feedback.title,/運行/);
+});
+test('new hints after a connectivity failure update only the retained maximum', async () => {
+  const {R}=setup();let calls=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:503}:{status:304};}});
+  await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await notifications.refresh();
+  const queued=await notifications.handle({type:'ride.changed',rideId:current.id,revision:12}),state=notifications.snapshot();
+  assert.equal(queued.reason,'explicit_refresh_required');assert.equal(calls,3);assert.equal(state.pendingRevision,12);assert.equal(state.guidance,'connectivity');assert.equal(state.commandsLocked,true);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');

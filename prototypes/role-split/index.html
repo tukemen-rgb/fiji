@@ -619,7 +619,7 @@
       const view=currentRideRecoveryView(normalized,{status:200,body:value});
       return view?.kind==='ride'?view.ride:null;
     };
-    let current=normalizeRide(currentRide),busy=0,lastReason='idle',notificationCycle=null,pendingRevision=null,needsRefresh=false;
+    let current=normalizeRide(currentRide),busy=0,lastReason='idle',notificationCycle=null,pendingRevision=null,needsRefresh=false,guidance='idle';
     if(currentRide!==null&&!current)throw Error('通知復旧の現在状態が不正です。');
     const hintFields=['type','rideId','revision'],hintTypes=new Set(['ride.changed','ride.access_changed']);
     const parseHint=value=>{
@@ -630,15 +630,22 @@
     const feedback=()=>{
       const subject=normalized==='driver'?'運行':'依頼';
       if(busy>0)return Object.freeze({title:subject+'の最新状態を確認中',message:'確認が終わるまで状態を変更しないでください。',disableCommands:true,action:null});
+      if(guidance==='reauth')return Object.freeze({title:'再ログインが必要です',message:subject+'の最新状態を確認するため、再ログインしてください。',disableCommands:true,action:'reauth'});
+      if(guidance==='connectivity')return Object.freeze({title:subject+'の最新状態を取得できません',message:'通信を確認し、「最新状態を確認する」を押してください。',disableCommands:true,action:'refresh'});
+      if(guidance==='empty')return Object.freeze({title:'現在の'+subject+'はありません',message:normalized==='driver'?'運転手ホームへ戻って新しい依頼を確認できます。':'利用者ホームから新しい依頼を開始できます。',disableCommands:false,action:null});
       if(needsRefresh)return Object.freeze({title:subject+'の最新状態を確認してください',message:'自動確認を停止しました。「最新状態を確認する」を押してください。',disableCommands:true,action:'refresh'});
       return Object.freeze({title:'',message:'',disableCommands:false,action:null});
     };
-    const snapshot=()=>{const ui=feedback();return Object.freeze({role:normalized,hasRide:Boolean(current),revision:current?.revision||null,status:current?.status||null,busy:busy>0,pendingRevision,needsRefresh,commandsLocked:ui.disableCommands,action:ui.action,feedback:ui,lastReason});};
+    const snapshot=()=>{const ui=feedback();return Object.freeze({role:normalized,hasRide:Boolean(current),revision:current?.revision||null,status:current?.status||null,busy:busy>0,pendingRevision,needsRefresh,guidance,commandsLocked:ui.disableCommands,action:ui.action,feedback:ui,lastReason});};
     const reject=reason=>{lastReason=reason;return Promise.resolve({processed:false,reason,state:snapshot()});};
     const readHint=async(hint,generation)=>{
       const coordinated=await lifecycle.requestNotificationRecovery({role:normalized,generation,execute:async()=>{
-        const response=await recover(hint),status=Number(response?.status);
-        if([401,403,404].includes(status))return Object.freeze({fetched:true,applied:false,clear:true,reason:'access_lost'});
+        let response;
+        try{response=await recover(hint);}catch{return Object.freeze({fetched:false,applied:false,reason:'connectivity_required'});}
+        const status=Number(response?.status);
+        if([401,403].includes(status))return Object.freeze({fetched:true,applied:false,clear:true,reason:'reauthentication_required'});
+        if(status===404)return Object.freeze({fetched:true,applied:false,clear:true,reason:'ride_not_found'});
+        if(status===429||status>=500)return Object.freeze({fetched:false,applied:false,reason:'connectivity_required'});
         if(status===304)return Object.freeze({fetched:true,applied:false,reason:'hint_not_yet_visible'});
         const view=currentRideRecoveryView(normalized,response);
         if(view?.kind!=='ride'||view.ride.id!==current?.id)return Object.freeze({fetched:true,applied:false,reason:'invalid_recovery'});
@@ -672,24 +679,36 @@
         return Promise.resolve({processed:false,reason:'explicit_refresh_required',queued:true,state:snapshot()});
       }
       const generation=active.generation,cycle={generation,targetRevision:hint.revision,followupUsed:false};
-      notificationCycle=cycle;busy+=1;lastReason='notification_pending';
+      notificationCycle=cycle;busy+=1;guidance='idle';lastReason='notification_pending';
       return (async()=>{
         let result=await readHint(hint,generation);
-        if(result.reason==='stale_recovery'||!current){pendingRevision=null;needsRefresh=false;return result;}
+        if(result.reason==='reauthentication_required'){pendingRevision=null;needsRefresh=false;guidance='reauth';return {...result,followup:false,state:snapshot()};}
+        if(result.reason==='ride_not_found'){pendingRevision=null;needsRefresh=false;guidance='empty';lastReason='ride_not_found';return {...result,followup:false,state:snapshot()};}
+        if(result.reason==='connectivity_required'){
+          pendingRevision=Math.max(cycle.targetRevision,pendingRevision||0);needsRefresh=true;guidance='connectivity';lastReason='connectivity_required';
+          return {...result,processed:false,followup:false,pendingRevision,state:snapshot()};
+        }
+        if(result.reason==='stale_recovery'||!current){pendingRevision=null;needsRefresh=false;guidance='idle';return result;}
         if(result.fetched!==true){pendingRevision=null;needsRefresh=false;return {...result,followup:false,state:snapshot()};}
         let requiredRevision=Math.max(cycle.targetRevision,pendingRevision||0);
-        if(current.revision>=requiredRevision){pendingRevision=null;needsRefresh=false;return {...result,followup:false,state:snapshot()};}
+        if(current.revision>=requiredRevision){pendingRevision=null;needsRefresh=false;guidance='idle';return {...result,followup:false,state:snapshot()};}
         pendingRevision=requiredRevision;
         if(!cycle.followupUsed){
           const revision=pendingRevision;pendingRevision=null;cycle.targetRevision=revision;cycle.followupUsed=true;
           result=await readHint(Object.freeze({type:'ride.changed',rideId:current.id,revision}),generation);
-          if(result.reason==='stale_recovery'||!current){pendingRevision=null;needsRefresh=false;return {...result,followup:true};}
+          if(result.reason==='reauthentication_required'){pendingRevision=null;needsRefresh=false;guidance='reauth';return {...result,followup:true,state:snapshot()};}
+          if(result.reason==='ride_not_found'){pendingRevision=null;needsRefresh=false;guidance='empty';lastReason='ride_not_found';return {...result,followup:true,state:snapshot()};}
+          if(result.reason==='connectivity_required'){
+            pendingRevision=Math.max(cycle.targetRevision,pendingRevision||0);needsRefresh=true;guidance='connectivity';lastReason='connectivity_required';
+            return {...result,processed:false,followup:true,pendingRevision,state:snapshot()};
+          }
+          if(result.reason==='stale_recovery'||!current){pendingRevision=null;needsRefresh=false;guidance='idle';return {...result,followup:true};}
           if(result.fetched!==true){pendingRevision=null;needsRefresh=false;return {...result,followup:true,state:snapshot()};}
           requiredRevision=Math.max(cycle.targetRevision,pendingRevision||0);
-          if(current.revision>=requiredRevision){pendingRevision=null;needsRefresh=false;return {...result,followup:true,state:snapshot()};}
+          if(current.revision>=requiredRevision){pendingRevision=null;needsRefresh=false;guidance='idle';return {...result,followup:true,state:snapshot()};}
           pendingRevision=requiredRevision;
         }
-        needsRefresh=true;lastReason='explicit_refresh_required';
+        needsRefresh=true;guidance='refresh';lastReason='explicit_refresh_required';
         return {...result,processed:false,reason:'explicit_refresh_required',followup:cycle.followupUsed,pendingRevision,state:snapshot()};
       })().catch(()=>{lastReason='recovery_failed';return {processed:false,reason:'recovery_failed',state:snapshot()};}).finally(()=>{
         if(notificationCycle===cycle)notificationCycle=null;busy=Math.max(0,busy-1);
@@ -697,18 +716,28 @@
     };
     const refresh=()=>{
       const active=lifecycle.snapshot();
-      if(active.activeRole!==normalized){pendingRevision=null;needsRefresh=false;return reject('inactive_role');}
-      if(!current){pendingRevision=null;needsRefresh=false;return reject('missing_baseline');}
+      if(active.activeRole!==normalized){pendingRevision=null;needsRefresh=false;guidance='idle';return reject('inactive_role');}
+      if(!current){
+        if(guidance==='reauth')return reject('reauthentication_required');
+        if(guidance==='empty')return reject('ride_not_found');
+        pendingRevision=null;needsRefresh=false;guidance='idle';return reject('missing_baseline');
+      }
       if(notificationCycle)return reject('recovery_in_progress');
       if(!needsRefresh||pendingRevision===null)return reject('refresh_not_required');
       const generation=active.generation,revision=pendingRevision,cycle={generation,targetRevision:revision,followupUsed:true,manual:true};
       notificationCycle=cycle;busy+=1;lastReason='manual_refresh_pending';
       return (async()=>{
         const result=await readHint(Object.freeze({type:'ride.changed',rideId:current.id,revision}),generation);
-        if(result.reason==='stale_recovery'||!current){pendingRevision=null;needsRefresh=false;return {...result,manual:true};}
+        if(result.reason==='reauthentication_required'){pendingRevision=null;needsRefresh=false;guidance='reauth';return {...result,manual:true,state:snapshot()};}
+        if(result.reason==='ride_not_found'){pendingRevision=null;needsRefresh=false;guidance='empty';lastReason='ride_not_found';return {...result,manual:true,state:snapshot()};}
+        if(result.reason==='connectivity_required'){
+          pendingRevision=Math.max(revision,pendingRevision||0);needsRefresh=true;guidance='connectivity';lastReason='connectivity_required';
+          return {...result,processed:false,manual:true,pendingRevision,state:snapshot()};
+        }
+        if(result.reason==='stale_recovery'||!current){pendingRevision=null;needsRefresh=false;guidance='idle';return {...result,manual:true};}
         const requiredRevision=Math.max(revision,pendingRevision||0);
-        if(current.revision>=requiredRevision){pendingRevision=null;needsRefresh=false;lastReason='notification_recovered';return {...result,processed:true,reason:'notification_recovered',manual:true,state:snapshot()};}
-        pendingRevision=requiredRevision;needsRefresh=true;lastReason='explicit_refresh_required';
+        if(current.revision>=requiredRevision){pendingRevision=null;needsRefresh=false;guidance='idle';lastReason='notification_recovered';return {...result,processed:true,reason:'notification_recovered',manual:true,state:snapshot()};}
+        pendingRevision=requiredRevision;needsRefresh=true;guidance='refresh';lastReason='explicit_refresh_required';
         return {...result,processed:false,reason:'explicit_refresh_required',manual:true,pendingRevision,state:snapshot()};
       })().catch(()=>{lastReason='recovery_failed';return {processed:false,reason:'recovery_failed',manual:true,state:snapshot()};}).finally(()=>{
         if(notificationCycle===cycle)notificationCycle=null;busy=Math.max(0,busy-1);
