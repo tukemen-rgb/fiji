@@ -769,6 +769,51 @@ test('a delayed online result from a departed entry cannot affect a re-entered r
   releaseOld({status:200,body:currentRideView('passenger')});await fixture.bridges[0].bridge.idle();
   assert.deepEqual(fixture.bundles[0].pages,[]);assert.deepEqual(fixture.bundles[1].pages,['home']);assert.equal(fixture.lifecycle.snapshot().generation,2);
 });
+test('passenger bottom navigation and registration keep one recovery generation', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  assert.equal((await boundary.navigate('home','passenger')).reason,'role_entered');
+  for(const page of ['offers','verify','passenger-history','passenger-account','passenger-register'])assert.equal((await boundary.navigate(page,'passenger')).reason,'within_role');
+  assert.equal(reads,1);assert.equal(fixture.bundles.length,1);assert.equal(fixture.lifecycle.snapshot().generation,1);assert.equal(boundary.snapshot().page,'passenger-register');
+});
+test('driver bottom navigation and pending registration keep one recovery generation', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('driver-home','driver');
+  for(const page of ['driver-requests','driver-trips','driver-account','register','driver-home'])await boundary.navigate(page,'driver');
+  assert.equal(reads,1);assert.equal(fixture.bundles.length,1);assert.equal(fixture.lifecycle.snapshot().generation,1);assert.equal(boundary.snapshot().page,'driver-home');
+});
+test('returning to the role chooser detaches recovery and blocks a delayed page restoration', async () => {
+  const {R}=setup();let release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>new Promise(resolve=>{release=resolve;})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  const entering=boundary.navigate('home','passenger');await Promise.resolve();await Promise.resolve();
+  const chooser=await boundary.navigate('role');assert.equal(chooser.reason,'role_chooser');assert.equal(boundary.snapshot().page,'role');
+  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),0);
+  release({status:200,body:currentRideView('passenger')});assert.equal((await entering).reason,'stale_navigation');assert.equal(boundary.snapshot().page,'role');assert.deepEqual(fixture.bundles[0].pages,[]);
+});
+test('routing from passenger to driver creates a new generation after detaching passenger', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('home','passenger');const passenger=fixture.bundles[0];
+  const driver=await boundary.navigate('driver-home','driver');assert.equal(driver.reason,'role_entered');
+  assert.equal(reads,2);assert.equal(passenger.flow.snapshot().disposed,true);assert.equal(fixture.lifecycle.snapshot().generation,2);assert.equal(boundary.snapshot().page,'driver-home');
+  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),1);
+});
+test('rapid same-role route changes during startup keep the last page without another read', async () => {
+  const {R}=setup();let reads=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  const home=boundary.navigate('home','passenger');await Promise.resolve();await Promise.resolve();
+  const history=await boundary.navigate('passenger-history','passenger');assert.equal(history.reason,'within_role');assert.equal(boundary.snapshot().page,'passenger-history');assert.equal(reads,1);
+  release({status:204});assert.equal((await home).reason,'stale_navigation');assert.equal(boundary.snapshot().page,'passenger-history');assert.equal(reads,1);
+});
+test('unknown pages and cross-role route hints fail without changing the active role', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('home','passenger');const generation=fixture.lifecycle.snapshot().generation;
+  assert.equal((await boundary.navigate('admin','passenger')).reason,'unknown_page');
+  assert.equal((await boundary.navigate('driver-trips','passenger')).reason,'role_mismatch');
+  assert.equal(reads,1);assert.equal(fixture.lifecycle.snapshot().activeRole,'passenger');assert.equal(fixture.lifecycle.snapshot().generation,generation);assert.equal(boundary.snapshot().page,'home');
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');

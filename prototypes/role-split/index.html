@@ -524,6 +524,43 @@
     };
     return Object.freeze({snapshot,enter,leave,idle});
   }
+  function createRoleRoutingBoundary({lifecycle}){
+    if(!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.enter!=='function'||typeof lifecycle.leave!=='function'||typeof lifecycle.idle!=='function')throw Error('役割別ルーティング境界の設定が不正です。');
+    let page='role',navigationRevision=0,lastAction='idle';
+    const operations=new Set();
+    const ownerOf=target=>Object.entries(pages).find(([,list])=>list.includes(target))?.[0]||null;
+    const snapshot=()=>Object.freeze({page,activeRole:lifecycle.snapshot().activeRole,navigationRevision,busy:operations.size>0,lastAction});
+    const track=work=>{
+      let task;
+      task=Promise.resolve(work).catch(()=>({navigated:false,reason:'navigation_failed',state:snapshot()})).finally(()=>operations.delete(task));
+      operations.add(task);return task;
+    };
+    const navigate=(target,requestedRole=null)=>{
+      const revision=++navigationRevision;
+      if(target==='role'){
+        lifecycle.leave();page='role';lastAction='left_role';
+        return Promise.resolve({navigated:true,reason:'role_chooser',state:snapshot()});
+      }
+      const targetRole=ownerOf(target);
+      if(!targetRole||requestedRole&&!['passenger','driver'].includes(requestedRole)||requestedRole&&requestedRole!==targetRole){
+        lastAction='rejected';return Promise.resolve({navigated:false,reason:targetRole?'role_mismatch':'unknown_page',state:snapshot()});
+      }
+      if(lifecycle.snapshot().activeRole===targetRole){
+        page=target;lastAction='within_role';
+        return Promise.resolve({navigated:true,reason:'within_role',state:snapshot()});
+      }
+      page='role';lastAction='entering_role';
+      return track((async()=>{
+        const entry=await lifecycle.enter(targetRole);
+        if(revision!==navigationRevision)return {navigated:false,reason:'stale_navigation',entry,state:snapshot()};
+        if(lifecycle.snapshot().activeRole!==targetRole){lastAction='entry_failed';return {navigated:false,reason:'entry_failed',entry,state:snapshot()};}
+        page=target;lastAction='role_entered';
+        return {navigated:true,reason:'role_entered',entry,state:snapshot()};
+      })());
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);await lifecycle.idle();return snapshot();};
+    return Object.freeze({snapshot,navigate,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -681,7 +718,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
