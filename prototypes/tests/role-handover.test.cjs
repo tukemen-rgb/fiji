@@ -728,9 +728,9 @@ function roleFeedbackLifecycleFixture(R,{notificationRead=async()=>({status:304}
       const bridge={snapshot:()=>inner.snapshot(),attach(){events.push(`attach:${role}:${generation}`);return inner.attach();},activate:()=>inner.activate(),handleNotification:hint=>inner.handleNotification(hint),detach(){events.push(`detach:${role}:${generation}`);return inner.detach();},idle:()=>inner.idle()};
       feedbacks.push({role,generation,current,recovery,commandUi,flow,target,renders,bridge,inner});return bridge;
     },
-    createNotificationBridge({role,generation,onHint}){
+    createNotificationBridge({role,generation,sessionBinding,onHint}){
       const inner=R.createNotificationHintEventBridge({eventTarget:notificationTarget,onHint});
-      notificationBridges.push({role,generation,inner});return inner;
+      notificationBridges.push({role,generation,sessionBinding,inner});return inner;
     }
   });
   return {lifecycle,feedbacks,notificationBridges,events,startupTarget,notificationTarget};
@@ -1274,6 +1274,33 @@ test('a delayed notification event cannot update after its listener generation i
   await fixture.lifecycle.enter('passenger');const oldNotification=fixture.notificationBridges[0],oldFeedback=fixture.feedbacks[0],hint={type:'ride.changed',rideId:oldFeedback.current.id,revision:9},pending=oldNotification.inner.receive(hint);await Promise.resolve();await Promise.resolve();const oldRenderCount=oldFeedback.renders.length;
   await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[1];release();const result=await pending;await oldNotification.inner.idle();await oldFeedback.inner.idle();
   assert.equal(result.reason,'bridge_stale');assert.equal(oldFeedback.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().role,'driver');assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(fixture.notificationTarget.listenerCount('notification'),1);
+});
+test('an authenticated session binding stays private and duplicate entry does not resubscribe', async () => {
+  const {R}=setup(),sessionBinding=Object.freeze({accountRef:'private-passenger-a'}),fixture=roleFeedbackLifecycleFixture(R);
+  await fixture.lifecycle.enter('passenger',{sessionBinding});const duplicate=await fixture.lifecycle.enter('passenger',{sessionBinding});
+  assert.equal(duplicate.reason,'already_entered');assert.equal(fixture.notificationBridges.length,1);assert.equal(fixture.notificationBridges[0].sessionBinding,sessionBinding);assert.equal(fixture.notificationTarget.addCount('notification'),1);
+  assert.deepEqual(Object.keys(fixture.lifecycle.snapshot()).sort(),['activeRole','busy','entered','generation','lastAction']);assert.deepEqual(Object.keys(fixture.notificationBridges[0].inner.snapshot()).sort(),['attached','busy','detached','handledEvents','lastEvent']);
+});
+test('same-role account switch replaces the notification subscription generation', async () => {
+  const {R}=setup(),firstSession={},secondSession={},fixture=roleFeedbackLifecycleFixture(R);
+  await fixture.lifecycle.enter('driver',{sessionBinding:firstSession});const old=fixture.notificationBridges[0];await fixture.lifecycle.enter('driver',{sessionBinding:secondSession});const fresh=fixture.notificationBridges[1];
+  assert.equal(old.inner.snapshot().detached,true);assert.equal(fresh.sessionBinding,secondSession);assert.equal(old.generation+1,fresh.generation);assert.equal(fixture.notificationTarget.listenerCount('notification'),1);assert.equal(fixture.notificationTarget.addCount('notification'),2);
+});
+test('an old account subscription cannot process another hint after same-role switch', async () => {
+  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
+  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});const old=fixture.notificationBridges[0],hint={type:'ride.changed',rideId:fixture.feedbacks[0].current.id,revision:9};await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});
+  assert.equal((await old.inner.receive(hint)).reason,'bridge_inactive');assert.equal(reads,0);assert.equal(old.inner.snapshot().handledEvents,0);assert.equal(fixture.lifecycle.snapshot().generation,2);
+});
+test('logout removes the session notification subscription before later events', async () => {
+  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
+  await fixture.lifecycle.enter('driver',{sessionBinding:{account:'driver-a'}});const current=fixture.feedbacks[0].current;fixture.lifecycle.leave();fixture.notificationTarget.dispatch('notification',{detail:{type:'ride.changed',rideId:current.id,revision:9}});await fixture.notificationBridges[0].inner.idle();
+  assert.equal(fixture.notificationTarget.listenerCount('notification'),0);assert.equal(reads,0);assert.equal(fixture.lifecycle.snapshot().activeRole,null);assert.equal(fixture.notificationBridges[0].inner.snapshot().detached,true);
+});
+test('a delayed old-account notification result cannot update the replacement session', async () => {
+  const {R}=setup();let release;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:({generation,role,hint})=>generation===1?new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView(role,{revision:hint.revision,status:'on_trip'})});}):Promise.resolve({status:304})});
+  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});const oldNotification=fixture.notificationBridges[0],oldFeedback=fixture.feedbacks[0],pending=oldNotification.inner.receive({type:'ride.changed',rideId:oldFeedback.current.id,revision:9});await Promise.resolve();await Promise.resolve();const oldRenderCount=oldFeedback.renders.length;
+  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});const current=fixture.feedbacks[1];release();const result=await pending;await oldNotification.inner.idle();await oldFeedback.inner.idle();
+  assert.equal(result.reason,'bridge_stale');assert.equal(oldFeedback.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(current.inner.snapshot().handledEvents,0);assert.equal(fixture.notificationTarget.listenerCount('notification'),1);
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);

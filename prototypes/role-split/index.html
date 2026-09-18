@@ -497,28 +497,32 @@
       const previous=active;active=null;if(recoveryAction?.entry===previous)recoveryAction=null;lastAction='left';previous.notificationBridge?.detach();previous.feedbackBridge?.detach();previous.bridge.detach();
       return {left:true,reason:'left',role:previous.role,state:snapshot()};
     };
-    const enter=role=>{
+    const enter=(role,options)=>{
       const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
       if(!normalized)return Promise.resolve({entered:false,reason:'invalid_role',state:snapshot()});
-      if(active?.role===normalized)return Promise.resolve({entered:false,reason:'already_entered',state:snapshot()});
+      const hasSessionBinding=options!==undefined&&options!==null&&Object.prototype.hasOwnProperty.call(options,'sessionBinding');
+      if(options!==undefined&&(options===null||typeof options!=='object'||Array.isArray(options)))return Promise.resolve({entered:false,reason:'invalid_session_binding',state:snapshot()});
+      const requestedSession=hasSessionBinding?options.sessionBinding:active?.role===normalized?active.sessionBinding:null;
+      if(requestedSession!==null&&(typeof requestedSession!=='object'||Array.isArray(requestedSession)))return Promise.resolve({entered:false,reason:'invalid_session_binding',state:snapshot()});
+      if(active?.role===normalized&&active.sessionBinding===requestedSession)return Promise.resolve({entered:false,reason:'already_entered',state:snapshot()});
       if(active)leave();
       generation+=1;const entryGeneration=generation;
       let flow,bridge,feedbackBridge,notificationBridge;
       try{
-        flow=createRoleFlow({role:normalized,generation:entryGeneration});
+        flow=createRoleFlow({role:normalized,generation:entryGeneration,sessionBinding:requestedSession});
         if(!flow||typeof flow.snapshot!=='function'||typeof flow.recoverOnStartup!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function')throw Error('flow');
-        bridge=createEventBridge({role:normalized,generation:entryGeneration,flow,requestRecovery:reason=>requestRecovery({role:normalized,generation:entryGeneration,reason})});
+        bridge=createEventBridge({role:normalized,generation:entryGeneration,sessionBinding:requestedSession,flow,requestRecovery:reason=>requestRecovery({role:normalized,generation:entryGeneration,reason})});
         if(!bridge||typeof bridge.start!=='function'||typeof bridge.detach!=='function'||typeof bridge.idle!=='function')throw Error('bridge');
         const started=bridge.start();
         if(started?.started!==true)throw Error('bridge_start');
         if(createFeedbackBridge){
-          feedbackBridge=createFeedbackBridge({role:normalized,generation:entryGeneration,flow});
+          feedbackBridge=createFeedbackBridge({role:normalized,generation:entryGeneration,sessionBinding:requestedSession,flow});
           if(!feedbackBridge||typeof feedbackBridge.attach!=='function'||typeof feedbackBridge.handleNotification!=='function'||typeof feedbackBridge.detach!=='function'||typeof feedbackBridge.idle!=='function')throw Error('feedback_bridge');
           const feedbackStarted=feedbackBridge.attach();
           if(feedbackStarted?.started!==true)throw Error('feedback_bridge_start');
         }
         if(createNotificationBridge){
-          notificationBridge=createNotificationBridge({role:normalized,generation:entryGeneration,onHint:hint=>handleNotification({role:normalized,generation:entryGeneration,hint})});
+          notificationBridge=createNotificationBridge({role:normalized,generation:entryGeneration,sessionBinding:requestedSession,onHint:hint=>handleNotification({role:normalized,generation:entryGeneration,hint})});
           if(!notificationBridge||typeof notificationBridge.attach!=='function'||typeof notificationBridge.detach!=='function'||typeof notificationBridge.idle!=='function')throw Error('notification_bridge');
           const notificationStarted=notificationBridge.attach();
           if(notificationStarted?.started!==true)throw Error('notification_bridge_start');
@@ -531,7 +535,7 @@
         lastAction='entry_rejected';
         return Promise.resolve({entered:false,reason:'entry_rejected',state:snapshot()});
       }
-      const entry=Object.freeze({role:normalized,generation:entryGeneration,flow,bridge,feedbackBridge,notificationBridge});active=entry;lastAction='entered';
+      const entry=Object.freeze({role:normalized,generation:entryGeneration,sessionBinding:requestedSession,flow,bridge,feedbackBridge,notificationBridge});active=entry;lastAction='entered';
       return track((async()=>{
         const startup=await flow.recoverOnStartup();
         if(active!==entry)return {entered:false,reason:'stale_entry',startup,state:snapshot()};
