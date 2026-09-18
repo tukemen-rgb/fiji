@@ -477,7 +477,7 @@
   }
   function createRoleRecoveryLifecycle({createRoleFlow,createEventBridge}){
     if(typeof createRoleFlow!=='function'||typeof createEventBridge!=='function')throw Error('役割別復旧ライフサイクルの設定が不正です。');
-    let active=null,generation=0,lastAction='idle';
+    let active=null,generation=0,lastAction='idle',recoveryAction=null;
     const operations=new Set();
     const snapshot=()=>Object.freeze({activeRole:active?.role||null,generation,entered:Boolean(active),busy:operations.size>0,lastAction});
     const track=work=>{
@@ -487,7 +487,7 @@
     };
     const leave=()=>{
       if(!active)return {left:false,reason:'not_entered',state:snapshot()};
-      const previous=active;active=null;lastAction='left';previous.bridge.detach();
+      const previous=active;active=null;if(recoveryAction?.entry===previous)recoveryAction=null;lastAction='left';previous.bridge.detach();
       return {left:true,reason:'left',role:previous.role,state:snapshot()};
     };
     const enter=role=>{
@@ -499,7 +499,7 @@
       let flow,bridge;
       try{
         flow=createRoleFlow({role:normalized,generation:entryGeneration});
-        if(!flow||typeof flow.snapshot!=='function'||typeof flow.recoverOnStartup!=='function'||typeof flow.dispose!=='function')throw Error('flow');
+        if(!flow||typeof flow.snapshot!=='function'||typeof flow.recoverOnStartup!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function')throw Error('flow');
         bridge=createEventBridge({role:normalized,generation:entryGeneration,flow});
         if(!bridge||typeof bridge.start!=='function'||typeof bridge.detach!=='function'||typeof bridge.idle!=='function')throw Error('bridge');
         const started=bridge.start();
@@ -517,15 +517,33 @@
         return {entered:true,reason:'entered',startup,state:snapshot()};
       })());
     };
+    const requestRecovery=({role,generation:expectedGeneration,reason}={})=>{
+      if(!['connectivity','reauth'].includes(reason))return Promise.resolve({recovered:false,reason:'invalid_recovery_reason',state:snapshot()});
+      const entry=active;
+      if(!entry)return Promise.resolve({recovered:false,reason:'not_entered',state:snapshot()});
+      if(role!==entry.role||expectedGeneration!==entry.generation)return Promise.resolve({recovered:false,reason:'stale_role_generation',state:snapshot()});
+      if(recoveryAction?.entry===entry)return Promise.resolve({recovered:false,reason:'recovery_in_progress',state:snapshot()});
+      lastAction=reason==='reauth'?'reauthentication':'latest_state';
+      let handle;
+      const task=(async()=>{
+        const recovery=await entry.flow.resume(reason);
+        if(active!==entry)return {recovered:false,reason:'stale_recovery',recovery,state:snapshot()};
+        const recovered=recovery?.processed===true;lastAction=recovered?'recovered':recovery?.reason||'recovery_blocked';
+        return {recovered,reason:recovered?'recovered':lastAction,recovery,state:snapshot()};
+      })().catch(()=>({recovered:false,reason:'recovery_failed',state:snapshot()})).finally(()=>{
+        operations.delete(task);if(recoveryAction===handle)recoveryAction=null;
+      });
+      handle=Object.freeze({entry,task});recoveryAction=handle;operations.add(task);return task;
+    };
     const idle=async()=>{
       while(operations.size>0)await Promise.all([...operations]);
       if(active)await active.bridge.idle();
       return snapshot();
     };
-    return Object.freeze({snapshot,enter,leave,idle});
+    return Object.freeze({snapshot,enter,leave,requestRecovery,idle});
   }
   function createRoleRoutingBoundary({lifecycle}){
-    if(!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.enter!=='function'||typeof lifecycle.leave!=='function'||typeof lifecycle.idle!=='function')throw Error('役割別ルーティング境界の設定が不正です。');
+    if(!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.enter!=='function'||typeof lifecycle.leave!=='function'||typeof lifecycle.requestRecovery!=='function'||typeof lifecycle.idle!=='function')throw Error('役割別ルーティング境界の設定が不正です。');
     let page='role',navigationRevision=0,lastAction='idle';
     const operations=new Set();
     const ownerOf=target=>Object.entries(pages).find(([,list])=>list.includes(target))?.[0]||null;
@@ -558,8 +576,22 @@
         return {navigated:true,reason:'role_entered',entry,state:snapshot()};
       })());
     };
+    const recover=action=>{
+      const reason=action==='refresh'?'connectivity':action==='reauth'?'reauth':null;
+      if(!reason){lastAction='recovery_rejected';return Promise.resolve({recovered:false,reason:'invalid_recovery_action',state:snapshot()});}
+      const current=lifecycle.snapshot(),role=ownerOf(page),revision=navigationRevision;
+      if(!role||current.activeRole!==role){lastAction='recovery_rejected';return Promise.resolve({recovered:false,reason:'no_active_role',state:snapshot()});}
+      lastAction=action==='reauth'?'reauthentication':'latest_state';
+      return track((async()=>{
+        const recovery=await lifecycle.requestRecovery({role,generation:current.generation,reason});
+        const latest=lifecycle.snapshot();
+        if(revision!==navigationRevision||latest.activeRole!==role||latest.generation!==current.generation)return {recovered:false,reason:'stale_recovery',recovery,state:snapshot()};
+        lastAction=recovery.recovered?'recovered':recovery.reason;
+        return {recovered:recovery.recovered,reason:recovery.reason,recovery,state:snapshot()};
+      })());
+    };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);await lifecycle.idle();return snapshot();};
-    return Object.freeze({snapshot,navigate,idle});
+    return Object.freeze({snapshot,navigate,recover,idle});
   }
   function create(){
     let seq=10;

@@ -814,6 +814,60 @@ test('unknown pages and cross-role route hints fail without changing the active 
   assert.equal((await boundary.navigate('driver-trips','passenger')).reason,'role_mismatch');
   assert.equal(reads,1);assert.equal(fixture.lifecycle.snapshot().activeRole,'passenger');assert.equal(fixture.lifecycle.snapshot().generation,generation);assert.equal(boundary.snapshot().page,'home');
 });
+test('latest-state action is limited to one request in the active passenger generation', async () => {
+  const {R}=setup();let reads=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('home','passenger');const generation=fixture.lifecycle.snapshot().generation;
+  const first=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();assert.equal(reads,2);
+  const duplicate=await boundary.recover('refresh');assert.equal(duplicate.recovered,false);assert.equal(duplicate.reason,'recovery_in_progress');assert.equal(reads,2);
+  release({status:204});const recovered=await first;
+  assert.equal(recovered.recovered,true);assert.equal(recovered.reason,'recovered');assert.equal(fixture.lifecycle.snapshot().generation,generation);assert.deepEqual(fixture.bundles[0].pages,['home']);
+});
+test('reauthentication action rereads once inside the active driver generation', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return reads===1?{status:401}:{status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('driver-home','driver');const generation=fixture.lifecycle.snapshot().generation;
+  const recovered=await boundary.recover('reauth');
+  assert.equal(recovered.recovered,true);assert.equal(reads,2);assert.equal(fixture.lifecycle.snapshot().generation,generation);assert.deepEqual(fixture.bundles[0].pages,['driver-home']);
+});
+test('recovery actions without an active role or with an unknown action send no read', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  assert.equal((await boundary.recover('refresh')).reason,'no_active_role');
+  assert.equal((await boundary.recover('retry-everything')).reason,'invalid_recovery_action');
+  assert.equal(reads,0);assert.equal(fixture.lifecycle.snapshot().generation,0);assert.equal(boundary.snapshot().page,'role');
+});
+test('leaving for role selection makes an in-flight latest-state result stale', async () => {
+  const {R}=setup();let reads=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('home','passenger');const recovery=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();
+  await boundary.navigate('role');release({status:204});const stale=await recovery;
+  assert.equal(stale.recovered,false);assert.equal(stale.reason,'stale_recovery');assert.equal(boundary.snapshot().page,'role');assert.equal(fixture.lifecycle.snapshot().activeRole,null);assert.deepEqual(fixture.bundles[0].pages,[]);
+});
+test('role switch permits a fresh action while the departed role action is still pending', async () => {
+  const {R}=setup();const reads={passenger:0,driver:0};let releasePassenger;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:({role})=>{
+    reads[role]+=1;
+    if(role==='passenger'&&reads.passenger===1)throw Error('offline');
+    if(role==='passenger')return new Promise(resolve=>{releasePassenger=resolve;});
+    if(reads.driver===1)throw Error('offline');
+    return Promise.resolve({status:204});
+  }}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('home','passenger');const oldAction=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();
+  await boundary.navigate('driver-home','driver');const fresh=await boundary.recover('refresh');
+  assert.equal(fresh.recovered,true);assert.deepEqual(reads,{passenger:2,driver:2});assert.deepEqual(fixture.bundles[1].pages,['driver-home']);
+  releasePassenger({status:204});const stale=await oldAction;
+  assert.equal(stale.reason,'stale_recovery');assert.equal(boundary.snapshot().page,'driver-home');assert.equal(fixture.lifecycle.snapshot().activeRole,'driver');assert.deepEqual(fixture.bundles[0].pages,[]);
+});
+test('lifecycle rejects a stale role or generation before starting recovery', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;throw Error('offline');}});
+  await fixture.lifecycle.enter('passenger');const generation=fixture.lifecycle.snapshot().generation;
+  assert.equal((await fixture.lifecycle.requestRecovery({role:'driver',generation,reason:'connectivity'})).reason,'stale_role_generation');
+  assert.equal((await fixture.lifecycle.requestRecovery({role:'passenger',generation:generation-1,reason:'connectivity'})).reason,'stale_role_generation');
+  assert.equal((await fixture.lifecycle.requestRecovery({role:'passenger',generation,reason:'force'})).reason,'invalid_recovery_reason');
+  assert.equal(reads,1);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');
