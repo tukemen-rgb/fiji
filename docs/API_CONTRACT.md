@@ -167,6 +167,7 @@ Acceptance:
 - Disable duplicate state-changing controls while confirmation is pending. Keep unresolved, reauthentication and conflict states locked until explicit recovery, and never carry one role's command feedback into the other role.
 - Across reload/restart, persist only an allowlisted, expiring unresolved marker. Never persist or reconstruct a command or idempotency key from it, and never auto-replay; authorize and reconcile current state first.
 - Bound startup reconciliation to one initial read plus at most one explicit reason-matched reread after connectivity or authentication recovery. Keep the marker on inconclusive results, clear it on 200/404, reject duplicate reads and never interpret 304 as restored state after restart.
+- Own the notification transport and its reconnect, latest-state and reauthentication actions inside the active authenticated role-screen generation. Detach the old transport before role/account replacement, reject stale-generation actions before I/O and require a new authenticated generation after reauthentication rather than unlocking the old screen.
 
 ### `POST /v1/rides/{requestId}/vehicle-confirmations` — owning passenger
 

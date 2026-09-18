@@ -482,8 +482,8 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,start,detach,idle});
   }
-  function createRoleRecoveryLifecycle({createRoleFlow,createEventBridge,createFeedbackBridge=null,createNotificationBridge=null}){
-    if(typeof createRoleFlow!=='function'||typeof createEventBridge!=='function'||createFeedbackBridge!==null&&typeof createFeedbackBridge!=='function'||createNotificationBridge!==null&&typeof createNotificationBridge!=='function')throw Error('役割別復旧ライフサイクルの設定が不正です。');
+  function createRoleRecoveryLifecycle({createRoleFlow,createEventBridge,createFeedbackBridge=null,createNotificationBridge=null,createSubscriptionBridge=null}){
+    if(typeof createRoleFlow!=='function'||typeof createEventBridge!=='function'||createFeedbackBridge!==null&&typeof createFeedbackBridge!=='function'||createNotificationBridge!==null&&typeof createNotificationBridge!=='function'||createSubscriptionBridge!==null&&typeof createSubscriptionBridge!=='function')throw Error('役割別復旧ライフサイクルの設定が不正です。');
     let active=null,generation=0,lastAction='idle',recoveryAction=null;
     const operations=new Set();
     const snapshot=()=>Object.freeze({activeRole:active?.role||null,generation,entered:Boolean(active),busy:operations.size>0,lastAction});
@@ -494,7 +494,7 @@
     };
     const leave=()=>{
       if(!active)return {left:false,reason:'not_entered',state:snapshot()};
-      const previous=active;active=null;if(recoveryAction?.entry===previous)recoveryAction=null;lastAction='left';previous.notificationBridge?.detach();previous.feedbackBridge?.detach();previous.bridge.detach();
+      const previous=active;active=null;if(recoveryAction?.entry===previous)recoveryAction=null;lastAction='left';previous.subscriptionBridge?.detach();previous.notificationBridge?.detach();previous.feedbackBridge?.detach();previous.bridge.detach();
       return {left:true,reason:'left',role:previous.role,state:snapshot()};
     };
     const enter=(role,options)=>{
@@ -507,7 +507,7 @@
       if(active?.role===normalized&&active.sessionBinding===requestedSession)return Promise.resolve({entered:false,reason:'already_entered',state:snapshot()});
       if(active)leave();
       generation+=1;const entryGeneration=generation;
-      let flow,bridge,feedbackBridge,notificationBridge;
+      let flow,bridge,feedbackBridge,notificationBridge,subscriptionBridge;
       try{
         flow=createRoleFlow({role:normalized,generation:entryGeneration,sessionBinding:requestedSession});
         if(!flow||typeof flow.snapshot!=='function'||typeof flow.recoverOnStartup!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function')throw Error('flow');
@@ -527,7 +527,14 @@
           const notificationStarted=notificationBridge.attach();
           if(notificationStarted?.started!==true)throw Error('notification_bridge_start');
         }
+        if(createSubscriptionBridge){
+          subscriptionBridge=createSubscriptionBridge({role:normalized,generation:entryGeneration,sessionBinding:requestedSession});
+          if(!subscriptionBridge||typeof subscriptionBridge.snapshot!=='function'||typeof subscriptionBridge.attach!=='function'||typeof subscriptionBridge.reconnect!=='function'||typeof subscriptionBridge.refresh!=='function'||typeof subscriptionBridge.reauthenticate!=='function'||typeof subscriptionBridge.detach!=='function'||typeof subscriptionBridge.idle!=='function')throw Error('subscription_bridge');
+          const subscriptionStarted=subscriptionBridge.attach();
+          if(subscriptionStarted?.started!==true)throw Error('subscription_bridge_start');
+        }
       }catch{
+        try{subscriptionBridge?.detach();}catch{}
         try{notificationBridge?.detach();}catch{}
         try{feedbackBridge?.detach();}catch{}
         try{bridge?.detach();}catch{}
@@ -535,7 +542,7 @@
         lastAction='entry_rejected';
         return Promise.resolve({entered:false,reason:'entry_rejected',state:snapshot()});
       }
-      const entry=Object.freeze({role:normalized,generation:entryGeneration,sessionBinding:requestedSession,flow,bridge,feedbackBridge,notificationBridge});active=entry;lastAction='entered';
+      const entry=Object.freeze({role:normalized,generation:entryGeneration,sessionBinding:requestedSession,flow,bridge,feedbackBridge,notificationBridge,subscriptionBridge});active=entry;lastAction='entered';
       return track((async()=>{
         const startup=await flow.recoverOnStartup();
         if(active!==entry)return {entered:false,reason:'stale_entry',startup,state:snapshot()};
@@ -591,14 +598,34 @@
       },()=>({processed:false,reason:'notification_failed',state:snapshot()})).finally(()=>operations.delete(task));
       operations.add(task);return task;
     };
+    const handleSubscriptionAction=({role,generation:expectedGeneration,action}={})=>{
+      if(!['reconnect','refresh','reauth'].includes(action))return Promise.resolve({handled:false,reason:'invalid_subscription_action',state:snapshot()});
+      const entry=active;
+      if(!entry)return Promise.resolve({handled:false,reason:'not_entered',state:snapshot()});
+      if(role!==entry.role||expectedGeneration!==entry.generation)return Promise.resolve({handled:false,reason:'stale_role_generation',state:snapshot()});
+      if(!entry.subscriptionBridge)return Promise.resolve({handled:false,reason:'subscription_unavailable',state:snapshot()});
+      if(recoveryAction?.entry===entry)return Promise.resolve({handled:false,reason:'recovery_in_progress',state:snapshot()});
+      if(entry.subscriptionBridge.snapshot().action!==action)return Promise.resolve({handled:false,reason:'action_not_available',state:snapshot()});
+      lastAction=action==='reconnect'?'notification_reconnect':action==='refresh'?'latest_state':'reauthentication';
+      let handle;
+      const task=Promise.resolve(entry.subscriptionBridge[action==='reauth'?'reauthenticate':action]()).then(result=>{
+        if(active!==entry)return {handled:false,reason:'stale_subscription_action',result,state:snapshot()};
+        lastAction=result?.reason||'subscription_action_failed';
+        return {handled:true,reason:lastAction,result,state:snapshot()};
+      },()=>({handled:false,reason:'subscription_action_failed',state:snapshot()})).finally(()=>{
+        operations.delete(task);if(recoveryAction===handle)recoveryAction=null;
+      });
+      handle=Object.freeze({entry,task});recoveryAction=handle;operations.add(task);return task;
+    };
     const idle=async()=>{
       while(operations.size>0)await Promise.all([...operations]);
+      if(active?.subscriptionBridge)await active.subscriptionBridge.idle();
       if(active?.notificationBridge)await active.notificationBridge.idle();
       if(active?.feedbackBridge)await active.feedbackBridge.idle();
       if(active)await active.bridge.idle();
       return snapshot();
     };
-    return Object.freeze({snapshot,enter,leave,requestRecovery,requestNotificationRecovery,handleNotification,idle});
+    return Object.freeze({snapshot,enter,leave,requestRecovery,requestNotificationRecovery,handleNotification,handleSubscriptionAction,idle});
   }
   function createRoleRoutingBoundary({lifecycle}){
     if(!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.enter!=='function'||typeof lifecycle.leave!=='function'||typeof lifecycle.requestRecovery!=='function'||typeof lifecycle.idle!=='function')throw Error('役割別ルーティング境界の設定が不正です。');
@@ -957,9 +984,9 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,attach,receive:hint=>receive(version,hint),detach,idle});
   }
-  function createRecoverableNotificationSubscriptionBridge({role,subscribe,onHint,verifyLatest,render=()=>{}}){
-    if(!['passenger','driver'].includes(role)||typeof subscribe!=='function'||typeof onHint!=='function'||typeof verifyLatest!=='function'||typeof render!=='function')throw Error('通知再接続の設定が不正です。');
-    const subject=role==='passenger'?'依頼':'運行';let attached=false,detached=false,commandsLocked=false,action=null,guidance='idle',reconnects=0,verificationRefreshes=0,lastEvent='idle',version=0,current=null;const operations=new Set();
+  function createRecoverableNotificationSubscriptionBridge({role,subscribe,onHint,verifyLatest,onReauthenticate=async()=>({requested:true}),render=()=>{}}){
+    if(!['passenger','driver'].includes(role)||typeof subscribe!=='function'||typeof onHint!=='function'||typeof verifyLatest!=='function'||typeof onReauthenticate!=='function'||typeof render!=='function')throw Error('通知再接続の設定が不正です。');
+    const subject=role==='passenger'?'依頼':'運行';let attached=false,detached=false,commandsLocked=false,action=null,guidance='idle',reconnects=0,verificationRefreshes=0,reauthentications=0,lastEvent='idle',version=0,current=null;const operations=new Set();
     const feedback=()=>{
       if(guidance==='connecting')return Object.freeze({title:`${subject}の通知へ接続中`,message:'接続が終わるまで状態を変更しないでください。',disableCommands:true,action:null});
       if(guidance==='connectivity')return Object.freeze({title:`${subject}の通知に接続できません`,message:'状態変更を止めています。「通知を再接続する」を押してください。',disableCommands:true,action:'reconnect'});
@@ -967,6 +994,8 @@
       if(guidance==='verifying')return Object.freeze({title:`${subject}の最新状態を確認中`,message:'確認が終わるまで状態を変更しないでください。',disableCommands:true,action:null});
       if(guidance==='verification_connectivity')return Object.freeze({title:`${subject}の最新状態を取得できません`,message:'通信を確認し、「最新状態を確認する」を押してください。',disableCommands:true,action:'refresh'});
       if(guidance==='reauth')return Object.freeze({title:'再ログインが必要です',message:`${subject}の最新状態を確認するため、再ログインしてください。`,disableCommands:true,action:'reauth'});
+      if(guidance==='reauthenticating')return Object.freeze({title:'再ログインへ移動中',message:'安全な認証画面を開いています。状態を変更しないでください。',disableCommands:true,action:null});
+      if(guidance==='reauth_pending')return Object.freeze({title:'再ログインを完了してください',message:'完了後に役割画面へ入り直すまで状態変更を停止します。',disableCommands:true,action:null});
       if(guidance==='empty')return Object.freeze({title:`現在の${subject}はありません`,message:role==='driver'?'運転手ホームへ戻って新しい依頼を確認できます。':'利用者ホームから新しい依頼を開始できます。',disableCommands:false,action:null});
       if(guidance==='retry_failed')return Object.freeze({title:`${subject}の通知を再接続できません`,message:'自動再接続は停止しました。通信を確認してサポートへ連絡してください。',disableCommands:true,action:null});
       return Object.freeze({title:'',message:'',disableCommands:false,action:null});
@@ -1029,12 +1058,26 @@
       if(guidance!=='verification_connectivity'||action!=='refresh'||verificationRefreshes!==0||!current?.bridge.snapshot().connected)return Promise.resolve({verified:false,reason:'refresh_unavailable',state:snapshot()});
       verificationRefreshes=1;return tracked(verifyConnection(current.token,current.bridge,true));
     };
+    const reauthenticate=()=>{
+      if(!attached||detached)return Promise.resolve({requested:false,reason:'bridge_inactive',state:snapshot()});
+      if(operations.size>0)return Promise.resolve({requested:false,reason:'action_in_progress',state:snapshot()});
+      if(guidance!=='reauth'||action!=='reauth'||reauthentications!==0)return Promise.resolve({requested:false,reason:'reauthentication_unavailable',state:snapshot()});
+      reauthentications=1;commandsLocked=true;action=null;guidance='reauthenticating';lastEvent='reauthenticating';paint();const token=version;
+      return tracked(Promise.resolve().then(()=>onReauthenticate(Object.freeze({role}))).then(result=>{
+        if(!attached||detached||token!==version)return {requested:false,reason:'subscription_stale',state:snapshot()};
+        if(result?.requested!==true){guidance='retry_failed';lastEvent='reauthentication_failed';paint();return {requested:false,reason:'reauthentication_failed',state:snapshot()};}
+        guidance='reauth_pending';lastEvent='reauthentication_requested';paint();return {requested:true,reason:'reauthentication_requested',state:snapshot()};
+      },()=>{
+        if(!attached||detached||token!==version)return {requested:false,reason:'subscription_stale',state:snapshot()};
+        guidance='retry_failed';lastEvent='reauthentication_failed';paint();return {requested:false,reason:'reauthentication_failed',state:snapshot()};
+      }));
+    };
     const detach=()=>{
       if(detached)return snapshot();
       attached=false;detached=true;version+=1;current?.bridge.detach();commandsLocked=false;action=null;guidance='detached';lastEvent='detached';paint();return snapshot();
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(current)await current.bridge.idle();return snapshot();};
-    return Object.freeze({snapshot,attach,reconnect,refresh,detach,idle});
+    return Object.freeze({snapshot,attach,reconnect,refresh,reauthenticate,detach,idle});
   }
   function create(){
     let seq=10;

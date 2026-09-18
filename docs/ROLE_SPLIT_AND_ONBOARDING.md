@@ -141,3 +141,11 @@ The five executable acceptance cases raise the current total to 285 passing test
 - Verification response bodies, ride identifiers, session references and credentials are excluded from public state and feedback.
 
 Four executable cases raise the current total to 289 passing tests (20 verification + 269 role/lifecycle/API/HTTP-contract), with no TODOs. Real authentication, HTTP, Push/WebSocket, browser/Android lifecycle and cross-device synchronization remain unverified.
+
+## Notification recovery lifecycle integration — 2026-09-19 Fiji
+- Each authenticated role-screen generation owns one recoverable notification subscription. Duplicate entry does not reconnect, while role/account replacement detaches the old subscription first.
+- Reconnect, latest-state refresh and reauthentication actions are accepted only from the current role and generation. Cross-role, stale-generation, departed and unavailable actions stop before subscription, read or authentication work.
+- Each action is single-flight. A delayed reconnect, verification or reauthentication result from a replaced generation cannot change the new role's feedback or command lock.
+- Reauthentication is requested once and the old generation stays locked until a new authenticated role-screen generation is entered. A verified 404 unlocks only the current generation into its role-specific empty state.
+
+Four executable cases raise the current total to 293 passing tests (20 verification + 273 role/lifecycle/API/HTTP-contract), with no TODOs. Real DOM routing, authentication, HTTP, Push/WebSocket, browser/Android lifecycle and cross-device synchronization remain unverified.
