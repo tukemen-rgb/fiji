@@ -1582,6 +1582,55 @@ test('same-role account re-entry replaces the prototype DOM subscription generat
   const {R}=setup();let connections=0;const fixture=roleSubscriptionDomLifecycleFixture(R,{subscribe:async()=>{connections+=1;throw Error('offline');}});await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});await fixture.lifecycle.idle();const old=fixture.subscriptions[0];await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});await fixture.lifecycle.idle();const fresh=fixture.subscriptions[1];
   old.elements.action.dispatch('click');await Promise.resolve();assert.equal(connections,2);assert.equal(old.elements.action.listenerCount('click'),0);assert.equal(fresh.elements.action.listenerCount('click'),1);assert.equal(fresh.elements.action.textContent,'通知を再接続する');assert.equal(old.bridge.snapshot().detached,true);assert.equal(fresh.bridge.snapshot().detached,false);assert.ok(fresh.generation>old.generation);
 });
+test('role-page runtime stops safely when injected services are not configured', async () => {
+  const {R}=setup(),views=[];let factories=0;
+  const runtime=R.createRolePageRuntime({services:null,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
+  const result=await runtime.enter('home','passenger');
+  assert.equal(result.entered,false);assert.equal(result.reason,'services_unavailable');assert.equal(factories,0);assert.equal(views.length,1);assert.equal(views[0].role,'passenger');assert.equal(views[0].disableCommands,true);assert.equal(views[0].action,null);assert.match(views[0].title,/未設定/);assert.match(views[0].message,/通信は行っていません/);
+  assert.deepEqual(Object.keys(runtime.snapshot()).sort(),['activeRole','busy','lastAction','page','revision','serviceState']);assert.equal(runtime.snapshot().serviceState,'unconfigured');
+});
+test('partial role service injection cannot be mistaken for a live connection', async () => {
+  const {R}=setup(),views=[];let sessions=0,factories=0;
+  const services={configured:true,sessionForRole(){sessions+=1;return {viewerRole:'driver'};}};
+  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
+  const result=await runtime.enter('driver-home','driver');
+  assert.equal(result.reason,'services_unavailable');assert.equal(runtime.snapshot().serviceState,'unconfigured');assert.equal(sessions,0);assert.equal(factories,0);assert.equal(views[0].action,null);
+});
+test('configured role-page runtime enters once and preserves its generation across role navigation', async () => {
+  const {R}=setup(),session={account:'private-passenger'},calls=[];let factories=0,clears=0;
+  const lifecycle={snapshot:()=>({activeRole:'passenger'}),enter:async(role,options)=>{calls.push(['enter',role,options.sessionBinding]);return {entered:true,reason:'entered'};},leave:()=>{calls.push(['leave']);return {left:true};},idle:async()=>({})};
+  const services={configured:true,sessionForRole:()=>session,createRoleLifecycle(){}};
+  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>{factories+=1;assert.equal(injected,services);return lifecycle;},clearUnavailable:()=>{clears+=1;}});
+  assert.equal((await runtime.enter('home','passenger')).reason,'entered');assert.equal((await runtime.enter('passenger-history','passenger')).reason,'within_role');
+  assert.equal(factories,1);assert.equal(calls.length,1);assert.equal(calls[0][2],session);assert.equal(runtime.snapshot().page,'passenger-history');assert.equal(runtime.snapshot().activeRole,'passenger');assert.ok(clears>=2);assert.equal(JSON.stringify(runtime.snapshot()).includes('private-passenger'),false);
+  const left=runtime.leave();assert.equal(left.left,true);assert.equal(calls.at(-1)[0],'leave');assert.equal(runtime.snapshot().activeRole,null);
+});
+test('missing authenticated session blocks lifecycle creation and all service I/O', async () => {
+  const {R}=setup(),views=[];let factories=0;
+  const services={configured:true,sessionForRole:()=>null,createRoleLifecycle(){}};
+  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
+  const result=await runtime.enter('driver-trips','driver');
+  assert.equal(result.reason,'session_unavailable');assert.equal(factories,0);assert.equal(views[0].role,'driver');assert.match(views[0].title,/認証セッション/);assert.equal(views[0].disableCommands,true);assert.equal(views[0].action,null);
+});
+test('configured lifecycle entry failure stops and cannot be reused as an active page', async () => {
+  const {R}=setup(),session={account:'private'},views=[];let entries=0,leaves=0;
+  const lifecycle={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:false,reason:'entry_rejected'};},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
+  const services={configured:true,sessionForRole:()=>session,createRoleLifecycle(){}};
+  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle,renderUnavailable:view=>views.push(view)});
+  const first=await runtime.enter('home','passenger'),second=await runtime.enter('passenger-history','passenger');
+  assert.equal(first.reason,'services_unavailable');assert.equal(second.reason,'services_unavailable');assert.equal(entries,2);assert.equal(leaves,2);assert.equal(views.length,2);assert.equal(runtime.snapshot().lastAction,'services_unavailable');
+});
+test('role switch rejects a delayed old runtime entry without exposing session bindings', async () => {
+  const {R}=setup(),passengerSession={account:'private-a'},driverSession={account:'private-b'};let releasePassenger;
+  const lifecycle={snapshot:()=>({}),enter:role=>role==='passenger'?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({entered:true,reason:'entered'}),leave:()=>({left:true}),idle:async()=>({})};
+  const services={configured:true,sessionForRole:role=>role==='passenger'?passengerSession:driverSession,createRoleLifecycle(){}};
+  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle});
+  const old=runtime.enter('home','passenger');while(!releasePassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await runtime.enter('driver-home','driver');releasePassenger({entered:true,reason:'entered'});const stale=await old;
+  assert.equal(fresh.entered,true);assert.equal(stale.reason,'stale_entry');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().page,'driver-home');const publicState=JSON.stringify(runtime.snapshot());assert.equal(publicState.includes('private-a'),false);assert.equal(publicState.includes('private-b'),false);
+});
+test('prototype show path is wired to the explicit role-page dependency runtime', () => {
+  assert.match(source,/window\.FijiPrototypeServices\|\|null/);assert.match(source,/rolePageRuntime\.enter\(page,model\.state\.activeRole\)/);assert.match(source,/rolePageRuntime\.leave\(\)/);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');

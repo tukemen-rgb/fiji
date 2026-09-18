@@ -1174,6 +1174,54 @@
     const idle=async()=>{await Promise.resolve();await feedback.idle();await Promise.resolve();if(attached&&!detached)dom.render();return snapshot();};
     return Object.freeze({snapshot,attach,activate,reconnect,refresh,reauthenticate,detach,idle});
   }
+  function createRolePageRuntime({services=null,createLifecycle,renderUnavailable=()=>{},clearUnavailable=()=>{}}={}){
+    if(createLifecycle!==undefined&&typeof createLifecycle!=='function'||typeof renderUnavailable!=='function'||typeof clearUnavailable!=='function')throw Error('役割ページランタイムの設定が不正です。');
+    const serviceState=services?.configured===true&&typeof services.sessionForRole==='function'&&typeof services.createRoleLifecycle==='function'&&typeof createLifecycle==='function'?'ready':'unconfigured';
+    let lifecycle=null,active=null,page='role',revision=0,lastAction='idle';const operations=new Set();
+    const ownerOf=target=>Object.entries(pages).find(([,list])=>list.includes(target))?.[0]||null;
+    const snapshot=()=>Object.freeze({page,activeRole:active?.role||null,serviceState,busy:operations.size>0,revision,lastAction});
+    const feedback=(role,reason)=>Object.freeze({role,outcome:'unresolved',title:reason==='session_unavailable'?'認証セッションを確認できません':'接続サービスは未設定です',message:reason==='session_unavailable'?'安全のため通信と状態変更を停止しました。再ログイン後に開き直してください。':'認証・通知・最新状態の通信は行っていません。試作画面の確認だけ利用できます。',disableCommands:true,action:null});
+    const stop=(role,reason)=>{
+      try{lifecycle?.leave();}catch{}
+      active=Object.freeze({role,sessionBinding:null});lastAction=reason;
+      try{renderUnavailable(feedback(role,reason));}catch{lastAction='unavailable_render_failed';}
+      return {entered:false,reason,state:snapshot()};
+    };
+    const ensureLifecycle=()=>{
+      if(lifecycle)return lifecycle;
+      const created=createLifecycle(services);
+      if(!created||typeof created.snapshot!=='function'||typeof created.enter!=='function'||typeof created.leave!=='function'||typeof created.idle!=='function')throw Error('lifecycle');
+      lifecycle=created;return lifecycle;
+    };
+    const enter=(target,role)=>{
+      const requestRevision=++revision,normalized=role==='driver'?'driver':role==='passenger'?'passenger':null,targetRole=ownerOf(target);
+      if(!normalized||targetRole!==normalized){lastAction=targetRole?'role_mismatch':'unknown_page';return Promise.resolve({entered:false,reason:lastAction,state:snapshot()});}
+      page=target;
+      if(serviceState!=='ready')return Promise.resolve(stop(normalized,'services_unavailable'));
+      let sessionBinding;
+      try{sessionBinding=services.sessionForRole(normalized);}catch{return Promise.resolve(stop(normalized,'session_unavailable'));}
+      if(!sessionBinding||typeof sessionBinding!=='object'||Array.isArray(sessionBinding))return Promise.resolve(stop(normalized,'session_unavailable'));
+      if(active?.role===normalized&&active.sessionBinding===sessionBinding){lastAction='within_role';try{clearUnavailable();}catch{}return Promise.resolve({entered:true,reason:'within_role',state:snapshot()});}
+      let runtime;
+      try{runtime=ensureLifecycle();}catch{return Promise.resolve(stop(normalized,'services_unavailable'));}
+      active=Object.freeze({role:normalized,sessionBinding});lastAction='entering';try{clearUnavailable();}catch{}
+      let task;
+      task=Promise.resolve(runtime.enter(normalized,{sessionBinding})).then(result=>{
+        if(requestRevision!==revision||active?.role!==normalized||active?.sessionBinding!==sessionBinding)return {entered:false,reason:'stale_entry',result,state:snapshot()};
+        const entered=result?.entered===true||result?.reason==='already_entered';lastAction=entered?'entered':result?.reason||'entry_failed';
+        if(!entered)return {...stop(normalized,'services_unavailable'),result};
+        return {entered,reason:lastAction,result,state:snapshot()};
+      },()=>stop(normalized,'services_unavailable')).finally(()=>operations.delete(task));
+      operations.add(task);return task;
+    };
+    const leave=()=>{
+      revision+=1;const previous=active;active=null;page='role';lastAction=previous?'left':'not_entered';
+      try{lifecycle?.leave();}catch{}try{clearUnavailable();}catch{}
+      return {left:Boolean(previous),reason:lastAction,state:snapshot()};
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(lifecycle)await lifecycle.idle();return snapshot();};
+    return Object.freeze({snapshot,enter,leave,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1331,7 +1379,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,createRolePageRuntime};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1366,6 +1414,16 @@ function runCommandAction(role,action){
 const commandFeedbackDom=R.createCommandFeedbackDomBridge({commandUi,elements:{box:$('command-feedback'),title:$('command-feedback-title'),message:$('command-feedback-message'),action:$('command-feedback-action'),commandButtons:document.querySelectorAll('[data-command-action]')},activate:async action=>{
   restartGuard.clear();startupRecovery=null;commandUi.clear();if(action==='reauth')show('role');else show(state.page);return {processed:true,reason:action};
 }});
+const injectedRoleServices=window.FijiPrototypeServices||null;
+const rolePageRuntime=R.createRolePageRuntime({
+  services:injectedRoleServices,
+  createLifecycle:services=>services.createRoleLifecycle({roles:R,elements:{box:$('command-feedback'),title:$('command-feedback-title'),message:$('command-feedback-message'),action:$('command-feedback-action'),commandButtons:document.querySelectorAll('[data-command-action]')}}),
+  renderUnavailable:view=>{
+    commandUi.setRole(view.role);
+    commandUi.applyFeedback(view.role,commandUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});
+    commandFeedbackDom.render();
+  }
+});
 function show(target) {
   if(target==='role')model.leave();
   const page=R.route(model.state.activeRole,model.state.profile,target);
@@ -1391,7 +1449,8 @@ function show(target) {
       startupRecoveryApplied=true;
     }
     commandFeedbackDom.attach();
-  }else{commandUi.clear();commandFeedbackDom.detach();}
+    void rolePageRuntime.enter(page,model.state.activeRole);
+  }else{rolePageRuntime.leave();commandUi.clear();commandFeedbackDom.detach();}
   renderCommandFeedback();
   try{history.replaceState(null,'','#'+page);}catch{}
   window.scrollTo({top:0,behavior:'instant'});

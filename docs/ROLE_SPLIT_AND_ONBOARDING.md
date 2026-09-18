@@ -1,5 +1,8 @@
 # Passenger / driver entry, onboarding and role-specific screens
 
+## Latest acceptance update — role-page dependency runtime
+The prototype's real `show()` path now enters and leaves a `createRolePageRuntime` boundary. Role services are opt-in dependencies: a provider must explicitly declare itself configured, return the current role's private authenticated-session binding and create the role lifecycle. Missing or partial providers and missing sessions stop before lifecycle creation or service I/O. The standalone prototype therefore shows a stopped, role-specific banner and locks state-changing controls instead of pretending that authentication, latest-state reads or notifications are connected. Same-role page navigation reuses the active generation; role/account replacement and role-chooser exit invalidate delayed entry completion, and public state does not expose the session binding. This is Node acceptance with injected fakes, not a real browser or backend connection.
+
 ## Latest user request
 Select Passenger or Driver FIRST. Register the information required for that role. Route to the corresponding home using that registered information. Each role must see different information and input controls, not a shared mixed-role menu.
 
