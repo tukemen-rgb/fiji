@@ -209,13 +209,20 @@
     return Object.freeze({role:role==='driver'?'driver':'passenger',outcome:states[outcome]?outcome:'unresolved',...value});
   }
   function createCommandUiController(initialRole='passenger'){
-    let role=initialRole==='driver'?'driver':'passenger',current=commandFeedback(role,'idle');
-    const snapshot=()=>({...current});
-    const setRole=nextRole=>{const normalized=nextRole==='driver'?'driver':'passenger';if(normalized!==role){role=normalized;current=commandFeedback(role,'idle');}return snapshot();};
+    let role=initialRole==='driver'?'driver':'passenger',generation=1,current=commandFeedback(role,'idle');
+    const snapshot=()=>({...current,generation});
+    const setRole=nextRole=>{const normalized=nextRole==='driver'?'driver':'passenger';if(normalized!==role){role=normalized;generation+=1;current=commandFeedback(role,'idle');}return snapshot();};
     const begin=nextRole=>{setRole(nextRole);if(current.disableCommands)return {accepted:false,state:snapshot()};current=commandFeedback(role,'pending');return {accepted:true,state:snapshot()};};
     const finish=outcome=>{current=commandFeedback(role,outcome);return snapshot();};
     const clear=()=>{current=commandFeedback(role,'idle');return snapshot();};
-    return {snapshot,setRole,begin,finish,clear};
+    const applyFeedback=(nextRole,expectedGeneration,outcome,feedback)=>{
+      const normalized=nextRole==='driver'?'driver':nextRole==='passenger'?'passenger':null,keys=feedback&&typeof feedback==='object'&&!Array.isArray(feedback)?Object.keys(feedback).sort():[];
+      const validOutcome=['idle','pending','confirmed','unresolved','reauth'].includes(outcome),validFeedback=keys.join(',')==='action,disableCommands,message,title'&&typeof feedback.title==='string'&&typeof feedback.message==='string'&&typeof feedback.disableCommands==='boolean'&&[null,'refresh','reauth'].includes(feedback.action);
+      if(!normalized||normalized!==role||expectedGeneration!==generation||!validOutcome||!validFeedback)return {accepted:false,state:snapshot()};
+      current=Object.freeze({role,outcome,title:feedback.title.slice(0,160),message:feedback.message.slice(0,320),disableCommands:feedback.disableCommands,action:feedback.action});
+      return {accepted:true,state:snapshot()};
+    };
+    return {snapshot,setRole,begin,finish,clear,applyFeedback};
   }
   function createCommandRestartGuard(storage,options={}){
     const key='taxi-command-guard-v1',now=typeof options.now==='function'?options.now:Date.now,maxAgeMs=Number.isFinite(options.maxAgeMs)?options.maxAgeMs:86400000;
@@ -745,6 +752,49 @@
     };
     return Object.freeze({snapshot,handle,refresh});
   }
+  function createNotificationFeedbackFlow({role,recovery,commandUi,onReauthenticate=()=>({requested:true})}){
+    const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null,initial=commandUi?.snapshot?.();
+    if(!normalized||!recovery||typeof recovery.snapshot!=='function'||typeof recovery.handle!=='function'||typeof recovery.refresh!=='function'||!commandUi||typeof commandUi.snapshot!=='function'||typeof commandUi.applyFeedback!=='function'||typeof onReauthenticate!=='function'||initial?.role!==normalized)throw Error('通知フィードバック接続の設定が不正です。');
+    const generation=initial.generation;let active=true,operation=null,lastReason='idle';
+    const current=()=>active&&commandUi.snapshot().role===normalized&&commandUi.snapshot().generation===generation;
+    const snapshot=()=>Object.freeze({role:normalized,generation,active:current(),busy:Boolean(operation),lastReason,command:commandUi.snapshot(),recovery:recovery.snapshot()});
+    const reject=reason=>{lastReason=reason;return Promise.resolve({processed:false,reason,state:snapshot()});};
+    const sync=()=>{
+      if(!current()){active=false;lastReason='stale_role_generation';return {applied:false,reason:lastReason,state:snapshot()};}
+      const state=recovery.snapshot();
+      if(state.role!==normalized){lastReason='role_mismatch';return {applied:false,reason:lastReason,state:snapshot()};}
+      const outcome=state.busy?'pending':state.guidance==='reauth'?'reauth':state.guidance==='connectivity'||state.guidance==='refresh'?'unresolved':state.guidance==='empty'?'confirmed':'idle';
+      const applied=commandUi.applyFeedback(normalized,generation,outcome,state.feedback);
+      lastReason=applied.accepted?'feedback_applied':'feedback_rejected';
+      return {applied:applied.accepted,reason:lastReason,state:snapshot()};
+    };
+    const run=(kind,execute)=>{
+      if(!current())return reject('stale_role_generation');
+      if(operation)return reject('action_in_progress');
+      let work;try{work=Promise.resolve(execute());}catch{return reject('action_failed');}
+      const handle=Object.freeze({kind,work});operation=handle;sync();
+      return work.then(result=>{
+        if(operation===handle)operation=null;
+        if(!current()){active=false;lastReason='stale_role_generation';return {processed:false,reason:lastReason,result,state:snapshot()};}
+        const applied=sync();lastReason=result?.reason||applied.reason;
+        return {processed:true,reason:lastReason,result,state:snapshot()};
+      },()=>{
+        if(operation===handle)operation=null;
+        if(!current()){active=false;lastReason='stale_role_generation';return {processed:false,reason:lastReason,state:snapshot()};}
+        sync();lastReason='action_failed';return {processed:false,reason:lastReason,state:snapshot()};
+      });
+    };
+    const handle=hint=>run('notification',()=>recovery.handle(hint));
+    const trigger=action=>{
+      if(!current())return reject('stale_role_generation');
+      if(operation)return reject('action_in_progress');
+      const recoveryState=recovery.snapshot(),command=commandUi.snapshot();
+      if(!['refresh','reauth'].includes(action)||action!==recoveryState.action||action!==command.action)return reject('action_not_available');
+      return action==='refresh'?run('refresh',()=>recovery.refresh()):run('reauth',()=>onReauthenticate(Object.freeze({role:normalized,generation})));
+    };
+    const dispose=()=>{active=false;lastReason='disposed';return snapshot();};
+    return Object.freeze({snapshot,sync,handle,trigger,dispose});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -902,7 +952,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>

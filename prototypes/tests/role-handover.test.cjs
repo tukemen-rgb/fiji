@@ -1098,6 +1098,42 @@ test('new hints after a connectivity failure update only the retained maximum', 
   const queued=await notifications.handle({type:'ride.changed',rideId:current.id,revision:12}),state=notifications.snapshot();
   assert.equal(queued.reason,'explicit_refresh_required');assert.equal(calls,3);assert.equal(state.pendingRevision,12);assert.equal(state.guidance,'connectivity');assert.equal(state.commandsLocked,true);
 });
+test('notification recovery feedback is applied to the existing passenger command banner', async () => {
+  const {R}=setup();let calls=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return {status:304};}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
+  const result=await flow.handle({type:'ride.changed',rideId:current.id,revision:9}),view=commandUi.snapshot();
+  assert.equal(result.processed,true);assert.equal(calls,2);assert.equal(view.outcome,'unresolved');assert.equal(view.action,'refresh');assert.equal(view.disableCommands,true);assert.match(view.title,/依頼/);assert.match(view.message,/最新状態を確認する/);
+});
+test('notification feedback allows one explicit refresh and rejects a double tap', async () => {
+  const {R}=setup();let calls=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async hint=>{calls+=1;if(calls<3)return {status:304};return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});});}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
+  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const first=flow.trigger('refresh');await Promise.resolve();
+  const duplicate=await flow.trigger('refresh');assert.equal(duplicate.reason,'action_in_progress');assert.equal(calls,3);assert.equal(commandUi.snapshot().disableCommands,true);
+  release();const completed=await first;assert.equal(completed.processed,true);assert.equal(commandUi.snapshot().disableCommands,false);assert.equal(commandUi.snapshot().action,null);assert.equal(calls,3);
+});
+test('a role switch prevents delayed notification feedback from overwriting the new role', async () => {
+  const {R}=setup();let calls=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async hint=>{calls+=1;if(calls<3)return {status:304};return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});});}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
+  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const pending=flow.trigger('refresh');await Promise.resolve();commandUi.setRole('driver');release();const stale=await pending,view=commandUi.snapshot();
+  assert.equal(stale.reason,'stale_role_generation');assert.equal(view.role,'driver');assert.equal(view.outcome,'idle');assert.equal(view.disableCommands,false);
+});
+test('reauthentication feedback invokes the role action once and blocks duplicate activation', async () => {
+  const {R}=setup();let calls=0,reauthCalls=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
+  const current=currentRideView('driver',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:401}:{status:304};}}),commandUi=R.createCommandUiController('driver'),flow=R.createNotificationFeedbackFlow({role:'driver',recovery,commandUi,onReauthenticate:()=>{reauthCalls+=1;return new Promise(resolve=>{release=resolve;});}});
+  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});await flow.trigger('refresh');assert.equal(commandUi.snapshot().action,'reauth');assert.match(commandUi.snapshot().message,/運行/);
+  const first=flow.trigger('reauth');await Promise.resolve();const duplicate=await flow.trigger('reauth');assert.equal(duplicate.reason,'action_in_progress');assert.equal(reauthCalls,1);release({requested:true});await first;assert.equal(reauthCalls,1);assert.equal(commandUi.snapshot().action,'reauth');
+});
+test('a not-found explicit refresh updates the shared driver banner to an unlocked empty state', async () => {
+  const {R}=setup();let calls=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
+  const current=currentRideView('driver',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:404}:{status:304};}}),commandUi=R.createCommandUiController('driver'),flow=R.createNotificationFeedbackFlow({role:'driver',recovery,commandUi});
+  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const empty=await flow.trigger('refresh'),view=commandUi.snapshot();
+  assert.equal(empty.processed,true);assert.equal(calls,3);assert.equal(view.outcome,'confirmed');assert.equal(view.disableCommands,false);assert.equal(view.action,null);assert.match(view.title,/運行/);assert.match(view.message,/運転手ホーム/);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');
