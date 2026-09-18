@@ -123,3 +123,12 @@ These counts were reported in the earlier handoff. This intake independently rer
 - Browser scenarios: 18 PASS, including profile propagation, role route separation, pending-driver blocks, quote/acceptance round-trip, vehicle mismatch gate, profile edits and 360/390/430px overflow checks.
 - Browser test used Chromium set_content rendering of the standalone HTML. No external requests or JS runtime errors during tested flows. This is NOT an Android-device/file-navigation/live-API/production-authentication test.
 - Existing main/root application was not overwritten or deployed by this documentation update.
+
+## Notification reconnect acceptance update — 2026-09-19 Fiji
+- Initial notification connection failure and a later disconnect lock state-changing commands with passenger-request or driver-operation wording.
+- Recovery exposes one explicit reconnect only. Duplicate, concurrent and repeated reconnects stop before another subscription attempt; no automatic reconnect loop is allowed.
+- A connected replacement transport does not unlock commands until one authorized latest-state verification explicitly succeeds. Reconnect or verification failure remains locked without another automatic attempt.
+- Logout or role exit aborts a pending reconnect, immediately removes a late success and prevents old callbacks or results from changing the replacement role/session.
+- Public state and feedback exclude session references, credentials, endpoints, abort signals, notification bodies and verification responses.
+
+The five executable acceptance cases raise the current total to 285 passing tests (20 verification + 265 role/lifecycle/API/HTTP-contract), with no TODOs. They use injected subscriptions and reads, not real Push/WebSocket, authentication, browser/Android lifecycle or mobile-network recovery.

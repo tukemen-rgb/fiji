@@ -50,5 +50,8 @@ The following is the earlier handoff report, not this intake's rerun. See `docs/
 
 Tests rendered local HTML using Chromium set_content. They are NOT Android-device, published-URL, backend-security or regulator/Google-API integration tests. New document load clears the in-memory demo; no persisted account/login is claimed.
 
+## GDP acceptance update — 2026-09-19
+The prototype now wraps asynchronous notification subscriptions with a role-specific recoverable connection state. Initial connection failure or later disconnect locks passenger-request or driver-operation commands and exposes one explicit reconnect only. Reconnect is single-flight and single-use, never automatic; transport success remains locked until one authorized latest-state verification succeeds. Reconnect or verification failure stops without looping, and logout/role exit aborts pending setup and discards late success. Public state excludes session references, credentials, endpoints, abort signals and notification/verification bodies. All 285 reference tests pass (20 verification + 265 role/lifecycle/API/HTTP-contract), with no TODOs. This is injected prototype acceptance, not production Push/WebSocket, authentication, mobile-network or device validation.
+
 ## Production deliverables expected from Claude
 A PR with implemented role-specific UI, actual authentication, server-side role/ownership checks, reviewer permissions, private document storage, audit schema, issuer workflow, eligibility gates, tests, mobile screenshots and an exact integration/deployment status list. Preserve other work; do not merge/deploy unreviewed code, identity documents or secrets. Keep fixture mode explicit until real services exist.

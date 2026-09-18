@@ -957,6 +957,66 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,attach,receive:hint=>receive(version,hint),detach,idle});
   }
+  function createRecoverableNotificationSubscriptionBridge({role,subscribe,onHint,verifyLatest,render=()=>{}}){
+    if(!['passenger','driver'].includes(role)||typeof subscribe!=='function'||typeof onHint!=='function'||typeof verifyLatest!=='function'||typeof render!=='function')throw Error('通知再接続の設定が不正です。');
+    const subject=role==='passenger'?'依頼':'運行';let attached=false,detached=false,commandsLocked=false,action=null,guidance='idle',reconnects=0,lastEvent='idle',version=0,current=null;const operations=new Set();
+    const feedback=()=>{
+      if(guidance==='connecting')return Object.freeze({title:`${subject}の通知へ接続中`,message:'接続が終わるまで状態を変更しないでください。',disableCommands:true,action:null});
+      if(guidance==='connectivity')return Object.freeze({title:`${subject}の通知に接続できません`,message:'状態変更を止めています。「通知を再接続する」を押してください。',disableCommands:true,action:'reconnect'});
+      if(guidance==='retrying')return Object.freeze({title:`${subject}の通知を再接続中`,message:'接続が終わるまで状態を変更しないでください。',disableCommands:true,action:null});
+      if(guidance==='verifying')return Object.freeze({title:`${subject}の最新状態を確認中`,message:'確認が終わるまで状態を変更しないでください。',disableCommands:true,action:null});
+      if(guidance==='retry_failed')return Object.freeze({title:`${subject}の通知を再接続できません`,message:'自動再接続は停止しました。通信を確認してサポートへ連絡してください。',disableCommands:true,action:null});
+      return Object.freeze({title:'',message:'',disableCommands:false,action:null});
+    };
+    const snapshot=()=>Object.freeze({attached,connected:!!current?.bridge.snapshot().connected,detached,busy:operations.size>0||!!current?.bridge.snapshot().busy,commandsLocked,action,guidance,reconnects,lastEvent,feedback:feedback()});
+    const paint=()=>{try{render(feedback());}catch{lastEvent='render_failed';}};
+    const tracked=work=>{let task;task=Promise.resolve(work).finally(()=>operations.delete(task));operations.add(task);return task;};
+    const active=(token,bridge)=>attached&&!detached&&current?.token===token&&current.bridge===bridge&&version===token;
+    const fail=(kind)=>{
+      commandsLocked=true;action=kind==='initial'?'reconnect':null;guidance=kind==='initial'?'connectivity':'retry_failed';lastEvent=kind==='initial'?'subscription_failed':'reconnect_failed';paint();
+    };
+    const disconnected=token=>{
+      if(!active(token,current?.bridge))return {processed:false,reason:'subscription_stale',state:snapshot()};
+      current.bridge.detach();commandsLocked=true;action=reconnects===0?'reconnect':null;guidance=reconnects===0?'connectivity':'retry_failed';lastEvent='subscription_disconnected';paint();
+      return {processed:true,reason:'subscription_disconnected',state:snapshot()};
+    };
+    const startConnection=kind=>{
+      const token=++version;commandsLocked=true;action=null;guidance=kind==='initial'?'connecting':'retrying';lastEvent=guidance;
+      const bridge=createAsyncNotificationSubscriptionBridge({subscribe:({signal,onHint:deliver})=>subscribe(Object.freeze({signal,onHint:deliver,onDisconnect:()=>disconnected(token)})),onHint});
+      current={token,bridge};bridge.attach();paint();
+      const settled=tracked((async()=>{
+        await bridge.idle();
+        if(!active(token,bridge))return {reconnected:false,reason:'subscription_stale',state:snapshot()};
+        if(!bridge.snapshot().connected){fail(kind);return {reconnected:false,reason:kind==='initial'?'subscription_failed':'reconnect_failed',state:snapshot()};}
+        if(kind==='initial'){
+          commandsLocked=false;action=null;guidance='connected';lastEvent='connected';paint();return {reconnected:false,reason:'connected',state:snapshot()};
+        }
+        guidance='verifying';commandsLocked=true;action=null;lastEvent='verifying';paint();let result;
+        try{result=await verifyLatest();}catch{result=null;}
+        if(!active(token,bridge))return {reconnected:false,reason:'subscription_stale',state:snapshot()};
+        if(result?.verified!==true){fail('reconnect');return {reconnected:false,reason:'verification_failed',state:snapshot()};}
+        commandsLocked=false;action=null;guidance='connected';lastEvent='reconnected';paint();return {reconnected:true,reason:'reconnected',state:snapshot()};
+      })());
+      return {settled,state:snapshot()};
+    };
+    const attach=()=>{
+      if(detached)return {started:false,reason:'bridge_detached',state:snapshot()};
+      if(attached)return {started:false,reason:'already_attached',state:snapshot()};
+      attached=true;startConnection('initial');return {started:true,reason:'connecting',state:snapshot()};
+    };
+    const reconnect=()=>{
+      if(!attached||detached)return Promise.resolve({reconnected:false,reason:'bridge_inactive',state:snapshot()});
+      if(operations.size>0)return Promise.resolve({reconnected:false,reason:'action_in_progress',state:snapshot()});
+      if(guidance!=='connectivity'||action!=='reconnect'||reconnects!==0)return Promise.resolve({reconnected:false,reason:'reconnect_unavailable',state:snapshot()});
+      reconnects=1;current?.bridge.detach();return startConnection('reconnect').settled;
+    };
+    const detach=()=>{
+      if(detached)return snapshot();
+      attached=false;detached=true;version+=1;current?.bridge.detach();commandsLocked=false;action=null;guidance='detached';lastEvent='detached';paint();return snapshot();
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(current)await current.bridge.idle();return snapshot();};
+    return Object.freeze({snapshot,attach,reconnect,detach,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1114,7 +1174,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
