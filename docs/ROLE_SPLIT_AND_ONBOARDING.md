@@ -149,3 +149,11 @@ Four executable cases raise the current total to 289 passing tests (20 verificat
 - Reauthentication is requested once and the old generation stays locked until a new authenticated role-screen generation is entered. A verified 404 unlocks only the current generation into its role-specific empty state.
 
 Four executable cases raise the current total to 293 passing tests (20 verification + 273 role/lifecycle/API/HTTP-contract), with no TODOs. Real DOM routing, authentication, HTTP, Push/WebSocket, browser/Android lifecycle and cross-device synchronization remain unverified.
+
+## Notification subscription feedback button — 2026-09-19 Fiji
+- Connection, reconnect, latest-state, reauthentication and empty guidance from the role-owned notification subscription is projected into the existing shared command banner. `reconnect` is added to the button action allowlist beside `refresh` and `reauth`.
+- The listener activates only when role-screen generation and command-UI generation still match. Reconnect can advance to one explicit latest-state refresh through the same button without duplicate work.
+- Double activation is single-flight. Role/account replacement removes the old listener first, and delayed verification or reauthentication cannot render over the new role.
+- A current-generation 404 renders the role-specific unlocked empty state; an old or unavailable button starts no subscription, read or authentication work.
+
+Five executable cases raise the current total to 298 passing tests (20 verification + 278 role/lifecycle/API/HTTP-contract), with no TODOs. They use a fake DOM-compatible event target; real DOM, authentication, HTTP, Push/WebSocket, browser/Android lifecycle and cross-device synchronization remain unverified.

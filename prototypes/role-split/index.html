@@ -217,7 +217,7 @@
     const clear=()=>{current=commandFeedback(role,'idle');return snapshot();};
     const applyFeedback=(nextRole,expectedGeneration,outcome,feedback)=>{
       const normalized=nextRole==='driver'?'driver':nextRole==='passenger'?'passenger':null,keys=feedback&&typeof feedback==='object'&&!Array.isArray(feedback)?Object.keys(feedback).sort():[];
-      const validOutcome=['idle','pending','confirmed','unresolved','reauth'].includes(outcome),validFeedback=keys.join(',')==='action,disableCommands,message,title'&&typeof feedback.title==='string'&&typeof feedback.message==='string'&&typeof feedback.disableCommands==='boolean'&&[null,'refresh','reauth'].includes(feedback.action);
+      const validOutcome=['idle','pending','confirmed','unresolved','reauth'].includes(outcome),validFeedback=keys.join(',')==='action,disableCommands,message,title'&&typeof feedback.title==='string'&&typeof feedback.message==='string'&&typeof feedback.disableCommands==='boolean'&&[null,'reconnect','refresh','reauth'].includes(feedback.action);
       if(!normalized||normalized!==role||expectedGeneration!==generation||!validOutcome||!validFeedback)return {accepted:false,state:snapshot()};
       current=Object.freeze({role,outcome,title:feedback.title.slice(0,160),message:feedback.message.slice(0,320),disableCommands:feedback.disableCommands,action:feedback.action});
       return {accepted:true,state:snapshot()};
@@ -1079,6 +1079,53 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(current)await current.bridge.idle();return snapshot();};
     return Object.freeze({snapshot,attach,reconnect,refresh,reauthenticate,detach,idle});
   }
+  function createNotificationSubscriptionFeedbackBridge({role,generation,lifecycle,commandUi,eventTarget,subscribe,onHint,verifyLatest,onReauthenticate=async()=>({requested:true}),render}){
+    const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null,initial=commandUi?.snapshot?.();
+    if(!normalized||!Number.isInteger(generation)||generation<1||!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.handleSubscriptionAction!=='function'||!commandUi||typeof commandUi.snapshot!=='function'||typeof commandUi.applyFeedback!=='function'||initial?.role!==normalized||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||typeof subscribe!=='function'||typeof onHint!=='function'||typeof verifyLatest!=='function'||typeof onReauthenticate!=='function'||typeof render!=='function')throw Error('通知購読フィードバック接続の設定が不正です。');
+    const uiGeneration=initial.generation;let attached=false,detached=false,version=0,handledEvents=0,lastEvent='idle';const operations=new Set();let subscription;
+    const current=()=>{const state=lifecycle.snapshot(),ui=commandUi.snapshot();return attached&&!detached&&state.activeRole===normalized&&state.generation===generation&&ui.role===normalized&&ui.generation===uiGeneration;};
+    const outcome=state=>state.busy||['connecting','retrying','verifying','reauthenticating'].includes(state.guidance)?'pending':['reauth','reauth_pending'].includes(state.guidance)?'reauth':['connectivity','verification_connectivity','retry_failed'].includes(state.guidance)?'unresolved':state.guidance==='empty'?'confirmed':'idle';
+    const snapshot=()=>{const state=subscription?.snapshot?.()||{};return Object.freeze({attached,detached,busy:operations.size>0||Boolean(state.busy),handledEvents,lastEvent,action:state.action||null,commandsLocked:Boolean(state.commandsLocked)});};
+    const paint=token=>{
+      if(token!==version||!current())return false;
+      const state=subscription.snapshot(),applied=commandUi.applyFeedback(normalized,uiGeneration,outcome(state),state.feedback);
+      if(!applied.accepted){lastEvent='feedback_rejected';return false;}
+      try{render(commandUi.snapshot());return true;}catch{lastEvent='render_failed';return false;}
+    };
+    subscription=createRecoverableNotificationSubscriptionBridge({role:normalized,subscribe,onHint,verifyLatest,onReauthenticate,render:()=>paint(version)});
+    const reject=reason=>Promise.resolve({processed:false,reason,state:snapshot()});
+    const run=method=>{
+      const token=version;let result;
+      try{result=subscription[method]();}catch{return reject('action_failed');}
+      paint(token);
+      return Promise.resolve(result).then(value=>{if(!current()||token!==version)return {processed:false,reason:'bridge_stale',result:value,state:snapshot()};paint(token);return {processed:true,reason:value?.reason||method,result:value,state:snapshot()};},()=>{if(current()&&token===version)paint(token);return {processed:false,reason:current()&&token===version?'action_failed':'bridge_stale',state:snapshot()};});
+    };
+    const reconnect=()=>run('reconnect'),refresh=()=>run('refresh'),reauthenticate=()=>run('reauthenticate');
+    const activate=()=>{
+      if(!current())return reject(attached&&!detached?'stale_role_generation':'bridge_inactive');
+      if(operations.size>0)return reject('action_in_progress');
+      const action=subscription.snapshot().action;
+      if(!['reconnect','refresh','reauth'].includes(action)||commandUi.snapshot().action!==action)return reject('action_not_available');
+      const token=version;handledEvents+=1;lastEvent=action;let task;
+      task=Promise.resolve(lifecycle.handleSubscriptionAction({role:normalized,generation,action})).then(result=>{
+        if(!current()||token!==version)return {processed:false,reason:'bridge_stale',result,state:snapshot()};
+        lastEvent=result?.reason||action;paint(token);return {processed:result?.handled===true,reason:lastEvent,result,state:snapshot()};
+      },()=>({processed:false,reason:current()&&token===version?'action_failed':'bridge_stale',state:snapshot()})).finally(()=>operations.delete(task));
+      operations.add(task);paint(token);return task;
+    };
+    const onClick=()=>{void activate();};
+    const attach=()=>{
+      if(detached)return {started:false,reason:'bridge_detached',state:snapshot()};
+      if(attached)return {started:false,reason:'already_attached',state:snapshot()};
+      attached=true;version+=1;eventTarget.addEventListener('click',onClick);const started=subscription.attach();lastEvent=started?.reason||'connecting';paint(version);return {started:started?.started===true,reason:lastEvent,state:snapshot()};
+    };
+    const detach=()=>{
+      if(detached)return snapshot();
+      eventTarget.removeEventListener('click',onClick);attached=false;detached=true;version+=1;subscription.detach();lastEvent='detached';return snapshot();
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);await subscription.idle();paint(version);return snapshot();};
+    return Object.freeze({snapshot,attach,activate,reconnect,refresh,reauthenticate,detach,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1236,7 +1283,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1261,7 +1308,7 @@ function renderCommandFeedback(){
   const view=commandUi.snapshot(),box=$('command-feedback');
   box.hidden=view.outcome==='idle';box.className='banner command-feedback'+(['unresolved','reauth','conflict'].includes(view.outcome)?' error':'');
   $('command-feedback-title').textContent=view.title;$('command-feedback-message').textContent=view.message;
-  const action=$('command-feedback-action');action.hidden=!view.action;action.textContent=view.action==='reauth'?'役割選択へ戻る':'最新状態を確認する';
+  const action=$('command-feedback-action');action.hidden=!view.action;action.textContent=view.action==='reauth'?'役割選択へ戻る':view.action==='reconnect'?'通知を再接続する':'最新状態を確認する';
   document.querySelectorAll('[data-command-action]').forEach(button=>button.disabled=view.disableCommands);
 }
 function commandOutcomeForError(error){const message=String(error?.message||'');if(/認証|ログイン|セッション/.test(message))return'reauth';if(/別の画面|最新状態/.test(message))return'conflict';return'rejected';}

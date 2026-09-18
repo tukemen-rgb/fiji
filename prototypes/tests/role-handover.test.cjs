@@ -755,6 +755,23 @@ function roleSubscriptionLifecycleFixture(R,{verifyLatest=async()=>({verified:tr
   });
   return {lifecycle,subscriptions,startupTarget};
 }
+function roleSubscriptionFeedbackLifecycleFixture(R,{subscribe,verifyLatest=async()=>({verified:true}),onReauthenticate=async()=>({requested:true})}={}) {
+  const startupTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},subscriptions=[];let lifecycle;
+  lifecycle=R.createRoleRecoveryLifecycle({
+    createRoleFlow({role,generation}){return recoveryFlow(R,role,async()=>({status:204}),{accountRef:`${role}-${generation}`,viewerRole:role}).flow;},
+    createEventBridge({flow,requestRecovery}){return R.createStartupRecoveryEventBridge({flow,eventTarget:startupTarget,documentState,requestRecovery});},
+    createSubscriptionBridge({role,generation,sessionBinding}){
+      const target=recoveryEventTarget(),commandUi=R.createCommandUiController(role),record={role,generation,sessionBinding,target,commandUi,renders:[],connects:0,unsubscribes:0,disconnect:null};
+      const bridge=R.createNotificationSubscriptionFeedbackBridge({
+        role,generation,lifecycle,commandUi,eventTarget:target,
+        subscribe:async input=>{record.connects+=1;record.disconnect=input.onDisconnect;if(subscribe)return subscribe({...input,role,generation,sessionBinding,record});return()=>{record.unsubscribes+=1;};},
+        onHint:async()=>({processed:true}),verifyLatest:()=>verifyLatest({role,generation,sessionBinding,record}),onReauthenticate:()=>onReauthenticate({role,generation,sessionBinding,record}),render:view=>record.renders.push(view)
+      });
+      record.bridge=bridge;subscriptions.push(record);return bridge;
+    }
+  });
+  return {lifecycle,subscriptions,startupTarget};
+}
 test('role screen entry creates one flow and bridge without duplicate startup reads', async () => {
   const {R}=setup();let reads=0;
   const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}});
@@ -1460,6 +1477,40 @@ test('404 verification clears only the active role generation into its empty sta
   const result=await fixture.lifecycle.handleSubscriptionAction({role:'driver',generation,action:'reconnect'}),state=record.bridge.snapshot();
   assert.equal(result.reason,'ride_not_found');assert.equal(state.guidance,'empty');assert.equal(state.commandsLocked,false);assert.equal(state.action,null);assert.match(state.feedback.title,/運行/);
   assert.equal((await fixture.lifecycle.handleSubscriptionAction({role:'driver',generation,action:'reconnect'})).reason,'action_not_available');
+});
+test('subscription failure renders one reconnect action on the active role button', async () => {
+  const {R}=setup(),fixture=roleSubscriptionFeedbackLifecycleFixture(R,{subscribe:async()=>{throw Error('offline');}});
+  await fixture.lifecycle.enter('passenger');await fixture.lifecycle.idle();const record=fixture.subscriptions[0],view=record.commandUi.snapshot();
+  assert.equal(record.target.listenerCount('click'),1);assert.equal(record.target.addCount('click'),1);assert.equal(view.outcome,'unresolved');assert.equal(view.action,'reconnect');assert.equal(view.disableCommands,true);assert.match(view.title,/依頼/);assert.equal(record.renders.at(-1).action,'reconnect');
+  assert.deepEqual(Object.keys(record.bridge.snapshot()).sort(),['action','attached','busy','commandsLocked','detached','handledEvents','lastEvent']);for(const secret of ['sessionBinding','account','signal','endpoint','token','response'])assert.equal(Object.prototype.hasOwnProperty.call(record.bridge.snapshot(),secret),false);
+  assert.equal((await fixture.lifecycle.enter('passenger')).reason,'already_entered');assert.equal(fixture.subscriptions.length,1);assert.equal(record.connects,1);
+});
+test('shared feedback button reconnects then refreshes once without duplicate work', async () => {
+  const {R}=setup();let connects=0,verifications=0,release;
+  const fixture=roleSubscriptionFeedbackLifecycleFixture(R,{subscribe:async()=>{connects+=1;if(connects===1)throw Error('offline');return()=>{};},verifyLatest:()=>{verifications+=1;if(verifications===1)return {status:503};return new Promise(resolve=>{release=resolve;});}});
+  await fixture.lifecycle.enter('passenger');await fixture.lifecycle.idle();const record=fixture.subscriptions[0];
+  const reconnected=await record.bridge.activate();assert.equal(reconnected.reason,'connectivity_required');assert.equal(record.commandUi.snapshot().action,'refresh');assert.equal(connects,2);assert.equal(verifications,1);
+  const refreshing=record.bridge.activate();await Promise.resolve();const duplicate=await record.bridge.activate();assert.equal(duplicate.reason,'action_in_progress');assert.equal(verifications,2);assert.equal(record.commandUi.snapshot().disableCommands,true);
+  release({verified:true});const refreshed=await refreshing;assert.equal(refreshed.reason,'verification_refreshed');assert.equal(record.commandUi.snapshot().action,null);assert.equal(record.commandUi.snapshot().disableCommands,false);assert.equal(verifications,2);
+});
+test('reauthentication button stays single-flight and becomes stale after a role switch', async () => {
+  const {R}=setup();let release,reauthCalls=0;
+  const fixture=roleSubscriptionFeedbackLifecycleFixture(R,{verifyLatest:async()=>({status:401}),onReauthenticate:()=>{reauthCalls+=1;return new Promise(resolve=>{release=resolve;});}});
+  await fixture.lifecycle.enter('driver');await fixture.lifecycle.idle();const old=fixture.subscriptions[0];old.disconnect();await old.bridge.activate();assert.equal(old.commandUi.snapshot().action,'reauth');
+  const pending=old.bridge.activate();await Promise.resolve();const duplicate=await old.bridge.activate();assert.equal(duplicate.reason,'action_in_progress');assert.equal(reauthCalls,1);
+  await fixture.lifecycle.enter('passenger');await fixture.subscriptions[1].bridge.idle();const fresh=fixture.subscriptions[1],freshRenders=fresh.renders.length;assert.equal(old.target.listenerCount('click'),0);assert.equal(fresh.target.listenerCount('click'),1);
+  release({requested:true});const stale=await pending;assert.equal(stale.reason,'bridge_stale');assert.equal(fresh.renders.length,freshRenders);assert.equal(fresh.commandUi.snapshot().outcome,'idle');assert.equal(reauthCalls,1);
+});
+test('same-role re-entry removes the old subscription button before another click', async () => {
+  const {R}=setup();let connects=0;
+  const fixture=roleSubscriptionFeedbackLifecycleFixture(R,{subscribe:async()=>{connects+=1;throw Error('offline');}});
+  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});await fixture.lifecycle.idle();const old=fixture.subscriptions[0];fixture.lifecycle.leave();await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});await fixture.lifecycle.idle();const fresh=fixture.subscriptions[1];
+  assert.equal(old.target.listenerCount('click'),0);old.target.dispatch('click');assert.equal((await old.bridge.activate()).reason,'bridge_inactive');assert.equal(fresh.target.listenerCount('click'),1);assert.equal(fresh.commandUi.snapshot().action,'reconnect');assert.equal(connects,2);
+});
+test('404 reconnect verification renders the active driver empty state without an action', async () => {
+  const {R}=setup(),fixture=roleSubscriptionFeedbackLifecycleFixture(R,{verifyLatest:async()=>({status:404})});
+  await fixture.lifecycle.enter('driver');await fixture.lifecycle.idle();const record=fixture.subscriptions[0];record.disconnect();const result=await record.bridge.activate(),view=record.commandUi.snapshot();
+  assert.equal(result.reason,'ride_not_found');assert.equal(view.outcome,'confirmed');assert.equal(view.action,null);assert.equal(view.disableCommands,false);assert.match(view.title,/運行/);assert.match(view.message,/運転手ホーム/);assert.equal((await record.bridge.activate()).reason,'action_not_available');
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
