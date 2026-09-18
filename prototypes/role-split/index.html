@@ -619,7 +619,7 @@
       const view=currentRideRecoveryView(normalized,{status:200,body:value});
       return view?.kind==='ride'?view.ride:null;
     };
-    let current=normalizeRide(currentRide),busy=0,lastReason='idle',notificationCycle=null,pendingRevision=null;
+    let current=normalizeRide(currentRide),busy=0,lastReason='idle',notificationCycle=null,pendingRevision=null,needsRefresh=false;
     if(currentRide!==null&&!current)throw Error('通知復旧の現在状態が不正です。');
     const hintFields=['type','rideId','revision'],hintTypes=new Set(['ride.changed','ride.access_changed']);
     const parseHint=value=>{
@@ -627,7 +627,13 @@
       if(keys.join(',')!==[...hintFields].sort().join(',')||!hintTypes.has(value.type)||typeof value.rideId!=='string'||!value.rideId||!Number.isInteger(value.revision)||value.revision<1)return null;
       return Object.freeze({type:value.type,rideId:value.rideId,revision:value.revision});
     };
-    const snapshot=()=>Object.freeze({role:normalized,hasRide:Boolean(current),revision:current?.revision||null,status:current?.status||null,busy:busy>0,pendingRevision,lastReason});
+    const feedback=()=>{
+      const subject=normalized==='driver'?'運行':'依頼';
+      if(busy>0)return Object.freeze({title:subject+'の最新状態を確認中',message:'確認が終わるまで状態を変更しないでください。',disableCommands:true,action:null});
+      if(needsRefresh)return Object.freeze({title:subject+'の最新状態を確認してください',message:'自動確認を停止しました。「最新状態を確認する」を押してください。',disableCommands:true,action:'refresh'});
+      return Object.freeze({title:'',message:'',disableCommands:false,action:null});
+    };
+    const snapshot=()=>{const ui=feedback();return Object.freeze({role:normalized,hasRide:Boolean(current),revision:current?.revision||null,status:current?.status||null,busy:busy>0,pendingRevision,needsRefresh,commandsLocked:ui.disableCommands,action:ui.action,feedback:ui,lastReason});};
     const reject=reason=>{lastReason=reason;return Promise.resolve({processed:false,reason,state:snapshot()});};
     const readHint=async(hint,generation)=>{
       const coordinated=await lifecycle.requestNotificationRecovery({role:normalized,generation,execute:async()=>{
@@ -659,29 +665,56 @@
         pendingRevision=hint.revision;lastReason='notification_coalesced';
         return Promise.resolve({processed:false,reason:'notification_coalesced',queued:true,state:snapshot()});
       }
+      if(needsRefresh){
+        const covered=Math.max(current.revision,pendingRevision||0);
+        if(hint.revision<=covered)return reject('stale_or_duplicate_hint');
+        pendingRevision=hint.revision;lastReason='explicit_refresh_required';
+        return Promise.resolve({processed:false,reason:'explicit_refresh_required',queued:true,state:snapshot()});
+      }
       const generation=active.generation,cycle={generation,targetRevision:hint.revision,followupUsed:false};
       notificationCycle=cycle;busy+=1;lastReason='notification_pending';
       return (async()=>{
         let result=await readHint(hint,generation);
-        if(result.reason==='stale_recovery'||!current){pendingRevision=null;return result;}
-        if(pendingRevision!==null&&pendingRevision<=current.revision)pendingRevision=null;
-        if(pendingRevision!==null&&pendingRevision>current.revision){
+        if(result.reason==='stale_recovery'||!current){pendingRevision=null;needsRefresh=false;return result;}
+        if(result.fetched!==true){pendingRevision=null;needsRefresh=false;return {...result,followup:false,state:snapshot()};}
+        let requiredRevision=Math.max(cycle.targetRevision,pendingRevision||0);
+        if(current.revision>=requiredRevision){pendingRevision=null;needsRefresh=false;return {...result,followup:false,state:snapshot()};}
+        pendingRevision=requiredRevision;
+        if(!cycle.followupUsed){
           const revision=pendingRevision;pendingRevision=null;cycle.targetRevision=revision;cycle.followupUsed=true;
           result=await readHint(Object.freeze({type:'ride.changed',rideId:current.id,revision}),generation);
-          if(result.reason==='stale_recovery'||!current){pendingRevision=null;return {...result,followup:true};}
-          if(pendingRevision!==null&&pendingRevision<=current.revision)pendingRevision=null;
-          if(pendingRevision!==null&&pendingRevision>current.revision){
-            lastReason='newer_hint_pending';
-            return {...result,reason:'newer_hint_pending',followup:true,pendingRevision,state:snapshot()};
-          }
-          return {...result,followup:true,state:snapshot()};
+          if(result.reason==='stale_recovery'||!current){pendingRevision=null;needsRefresh=false;return {...result,followup:true};}
+          if(result.fetched!==true){pendingRevision=null;needsRefresh=false;return {...result,followup:true,state:snapshot()};}
+          requiredRevision=Math.max(cycle.targetRevision,pendingRevision||0);
+          if(current.revision>=requiredRevision){pendingRevision=null;needsRefresh=false;return {...result,followup:true,state:snapshot()};}
+          pendingRevision=requiredRevision;
         }
-        return {...result,followup:false,state:snapshot()};
+        needsRefresh=true;lastReason='explicit_refresh_required';
+        return {...result,processed:false,reason:'explicit_refresh_required',followup:cycle.followupUsed,pendingRevision,state:snapshot()};
       })().catch(()=>{lastReason='recovery_failed';return {processed:false,reason:'recovery_failed',state:snapshot()};}).finally(()=>{
         if(notificationCycle===cycle)notificationCycle=null;busy=Math.max(0,busy-1);
       });
     };
-    return Object.freeze({snapshot,handle});
+    const refresh=()=>{
+      const active=lifecycle.snapshot();
+      if(active.activeRole!==normalized){pendingRevision=null;needsRefresh=false;return reject('inactive_role');}
+      if(!current){pendingRevision=null;needsRefresh=false;return reject('missing_baseline');}
+      if(notificationCycle)return reject('recovery_in_progress');
+      if(!needsRefresh||pendingRevision===null)return reject('refresh_not_required');
+      const generation=active.generation,revision=pendingRevision,cycle={generation,targetRevision:revision,followupUsed:true,manual:true};
+      notificationCycle=cycle;busy+=1;lastReason='manual_refresh_pending';
+      return (async()=>{
+        const result=await readHint(Object.freeze({type:'ride.changed',rideId:current.id,revision}),generation);
+        if(result.reason==='stale_recovery'||!current){pendingRevision=null;needsRefresh=false;return {...result,manual:true};}
+        const requiredRevision=Math.max(revision,pendingRevision||0);
+        if(current.revision>=requiredRevision){pendingRevision=null;needsRefresh=false;lastReason='notification_recovered';return {...result,processed:true,reason:'notification_recovered',manual:true,state:snapshot()};}
+        pendingRevision=requiredRevision;needsRefresh=true;lastReason='explicit_refresh_required';
+        return {...result,processed:false,reason:'explicit_refresh_required',manual:true,pendingRevision,state:snapshot()};
+      })().catch(()=>{lastReason='recovery_failed';return {processed:false,reason:'recovery_failed',manual:true,state:snapshot()};}).finally(()=>{
+        if(notificationCycle===cycle)notificationCycle=null;busy=Math.max(0,busy-1);
+      });
+    };
+    return Object.freeze({snapshot,handle,refresh});
   }
   function create(){
     let seq=10;
