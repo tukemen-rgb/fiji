@@ -482,8 +482,8 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,start,detach,idle});
   }
-  function createRoleRecoveryLifecycle({createRoleFlow,createEventBridge,createFeedbackBridge=null}){
-    if(typeof createRoleFlow!=='function'||typeof createEventBridge!=='function'||createFeedbackBridge!==null&&typeof createFeedbackBridge!=='function')throw Error('役割別復旧ライフサイクルの設定が不正です。');
+  function createRoleRecoveryLifecycle({createRoleFlow,createEventBridge,createFeedbackBridge=null,createNotificationBridge=null}){
+    if(typeof createRoleFlow!=='function'||typeof createEventBridge!=='function'||createFeedbackBridge!==null&&typeof createFeedbackBridge!=='function'||createNotificationBridge!==null&&typeof createNotificationBridge!=='function')throw Error('役割別復旧ライフサイクルの設定が不正です。');
     let active=null,generation=0,lastAction='idle',recoveryAction=null;
     const operations=new Set();
     const snapshot=()=>Object.freeze({activeRole:active?.role||null,generation,entered:Boolean(active),busy:operations.size>0,lastAction});
@@ -494,7 +494,7 @@
     };
     const leave=()=>{
       if(!active)return {left:false,reason:'not_entered',state:snapshot()};
-      const previous=active;active=null;if(recoveryAction?.entry===previous)recoveryAction=null;lastAction='left';previous.feedbackBridge?.detach();previous.bridge.detach();
+      const previous=active;active=null;if(recoveryAction?.entry===previous)recoveryAction=null;lastAction='left';previous.notificationBridge?.detach();previous.feedbackBridge?.detach();previous.bridge.detach();
       return {left:true,reason:'left',role:previous.role,state:snapshot()};
     };
     const enter=role=>{
@@ -503,7 +503,7 @@
       if(active?.role===normalized)return Promise.resolve({entered:false,reason:'already_entered',state:snapshot()});
       if(active)leave();
       generation+=1;const entryGeneration=generation;
-      let flow,bridge,feedbackBridge;
+      let flow,bridge,feedbackBridge,notificationBridge;
       try{
         flow=createRoleFlow({role:normalized,generation:entryGeneration});
         if(!flow||typeof flow.snapshot!=='function'||typeof flow.recoverOnStartup!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function')throw Error('flow');
@@ -517,14 +517,21 @@
           const feedbackStarted=feedbackBridge.attach();
           if(feedbackStarted?.started!==true)throw Error('feedback_bridge_start');
         }
+        if(createNotificationBridge){
+          notificationBridge=createNotificationBridge({role:normalized,generation:entryGeneration,onHint:hint=>handleNotification({role:normalized,generation:entryGeneration,hint})});
+          if(!notificationBridge||typeof notificationBridge.attach!=='function'||typeof notificationBridge.detach!=='function'||typeof notificationBridge.idle!=='function')throw Error('notification_bridge');
+          const notificationStarted=notificationBridge.attach();
+          if(notificationStarted?.started!==true)throw Error('notification_bridge_start');
+        }
       }catch{
+        try{notificationBridge?.detach();}catch{}
         try{feedbackBridge?.detach();}catch{}
         try{bridge?.detach();}catch{}
         try{flow?.dispose();}catch{}
         lastAction='entry_rejected';
         return Promise.resolve({entered:false,reason:'entry_rejected',state:snapshot()});
       }
-      const entry=Object.freeze({role:normalized,generation:entryGeneration,flow,bridge,feedbackBridge});active=entry;lastAction='entered';
+      const entry=Object.freeze({role:normalized,generation:entryGeneration,flow,bridge,feedbackBridge,notificationBridge});active=entry;lastAction='entered';
       return track((async()=>{
         const startup=await flow.recoverOnStartup();
         if(active!==entry)return {entered:false,reason:'stale_entry',startup,state:snapshot()};
@@ -582,6 +589,7 @@
     };
     const idle=async()=>{
       while(operations.size>0)await Promise.all([...operations]);
+      if(active?.notificationBridge)await active.notificationBridge.idle();
       if(active?.feedbackBridge)await active.feedbackBridge.idle();
       if(active)await active.bridge.idle();
       return snapshot();
@@ -865,6 +873,36 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,attach,activate,handleNotification,detach,idle});
   }
+  function createNotificationHintEventBridge({eventTarget,onHint,eventName='notification'}){
+    if(!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||typeof onHint!=='function'||typeof eventName!=='string'||!eventName)throw Error('通知ヒントイベント接続の設定が不正です。');
+    let attached=false,detached=false,handledEvents=0,lastEvent='idle',version=0;const operations=new Set();
+    const snapshot=()=>Object.freeze({attached,detached,busy:operations.size>0,handledEvents,lastEvent});
+    const reject=reason=>Promise.resolve({processed:false,reason,state:snapshot()});
+    const receive=hint=>{
+      if(!attached||detached)return reject('bridge_inactive');
+      const token=version;handledEvents+=1;lastEvent='notification';let task;
+      task=Promise.resolve(onHint(hint)).then(result=>{
+        if(!attached||detached||token!==version)return {processed:false,reason:'bridge_stale',result,state:snapshot()};
+        lastEvent=result?.reason||'notification';return {...result,state:snapshot()};
+      },()=>{
+        if(attached&&!detached&&token===version)lastEvent='notification_failed';
+        return {processed:false,reason:attached&&!detached&&token===version?'notification_failed':'bridge_stale',state:snapshot()};
+      }).finally(()=>operations.delete(task));
+      operations.add(task);return task;
+    };
+    const listener=event=>{void receive(event?.detail);};
+    const attach=()=>{
+      if(detached)return {started:false,reason:'bridge_detached',state:snapshot()};
+      if(attached)return {started:false,reason:'already_attached',state:snapshot()};
+      attached=true;version+=1;eventTarget.addEventListener(eventName,listener);lastEvent='attached';return {started:true,reason:'attached',state:snapshot()};
+    };
+    const detach=()=>{
+      if(attached)eventTarget.removeEventListener(eventName,listener);
+      attached=false;detached=true;version+=1;lastEvent='detached';return snapshot();
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
+    return Object.freeze({snapshot,attach,receive,detach,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1022,7 +1060,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>

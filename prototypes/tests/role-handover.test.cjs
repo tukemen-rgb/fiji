@@ -651,7 +651,7 @@ function recoveryEventTarget() {
   return {
     addEventListener(type,handler){if(!listeners.has(type))listeners.set(type,new Set());listeners.get(type).add(handler);adds.set(type,(adds.get(type)||0)+1);},
     removeEventListener(type,handler){listeners.get(type)?.delete(handler);},
-    dispatch(type){for(const handler of [...(listeners.get(type)||[])])handler({type});},
+    dispatch(type,event={}){for(const handler of [...(listeners.get(type)||[])])handler({type,...event});},
     listenerCount(type){return listeners.get(type)?.size||0;},
     addCount(type){return adds.get(type)||0;}
   };
@@ -718,7 +718,7 @@ function roleLifecycleFixture(R,{target=recoveryEventTarget(),documentState={vis
   return {lifecycle,target,documentState,bundles,bridges};
 }
 function roleFeedbackLifecycleFixture(R,{notificationRead=async()=>({status:304}),onReauthenticate=()=>({requested:true})}={}) {
-  const startupTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},feedbacks=[],events=[];let lifecycle;
+  const startupTarget=recoveryEventTarget(),notificationTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},feedbacks=[],notificationBridges=[],events=[];let lifecycle;
   lifecycle=R.createRoleRecoveryLifecycle({
     createRoleFlow({role,generation}){return recoveryFlow(R,role,async()=>({status:204}),{accountRef:`${role}-${generation}`,viewerRole:role}).flow;},
     createEventBridge({flow,requestRecovery}){return R.createStartupRecoveryEventBridge({flow,eventTarget:startupTarget,documentState,requestRecovery});},
@@ -727,9 +727,13 @@ function roleFeedbackLifecycleFixture(R,{notificationRead=async()=>({status:304}
       const inner=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});
       const bridge={snapshot:()=>inner.snapshot(),attach(){events.push(`attach:${role}:${generation}`);return inner.attach();},activate:()=>inner.activate(),handleNotification:hint=>inner.handleNotification(hint),detach(){events.push(`detach:${role}:${generation}`);return inner.detach();},idle:()=>inner.idle()};
       feedbacks.push({role,generation,current,recovery,commandUi,flow,target,renders,bridge,inner});return bridge;
+    },
+    createNotificationBridge({role,generation,onHint}){
+      const inner=R.createNotificationHintEventBridge({eventTarget:notificationTarget,onHint});
+      notificationBridges.push({role,generation,inner});return inner;
     }
   });
-  return {lifecycle,feedbacks,events,startupTarget};
+  return {lifecycle,feedbacks,notificationBridges,events,startupTarget,notificationTarget};
 }
 test('role screen entry creates one flow and bridge without duplicate startup reads', async () => {
   const {R}=setup();let reads=0;
@@ -1241,6 +1245,35 @@ test('a delayed notification hint from a departed role cannot render into the ne
   await fixture.lifecycle.enter('passenger');const old=fixture.feedbacks[0],pending=fixture.lifecycle.handleNotification({role:'passenger',generation:old.generation,hint:{type:'ride.changed',rideId:old.current.id,revision:9}});await Promise.resolve();await Promise.resolve();const oldRenderCount=old.renders.length;
   await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[1];release();const result=await pending;await old.inner.idle();
   assert.equal(result.reason,'stale_notification');assert.equal(old.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().role,'driver');assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(current.inner.snapshot().handledEvents,0);
+});
+test('role entry binds one notification listener without caller role or generation', async () => {
+  const {R}=setup();let seen;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async input=>{seen=input;return {status:304};}});
+  await fixture.lifecycle.enter('passenger');assert.equal((await fixture.lifecycle.enter('passenger')).reason,'already_entered');const current=fixture.feedbacks[0].current;
+  fixture.notificationTarget.dispatch('notification',{role:'driver',generation:999,detail:{type:'ride.changed',rideId:current.id,revision:9}});await fixture.notificationBridges[0].inner.idle();
+  assert.equal(fixture.notificationTarget.listenerCount('notification'),1);assert.equal(fixture.notificationTarget.addCount('notification'),1);assert.equal(seen.role,'passenger');assert.equal(seen.generation,1);assert.equal(seen.hint.revision,9);
+});
+test('role exit removes the bound notification listener before future events', async () => {
+  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
+  await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[0].current;fixture.lifecycle.leave();fixture.notificationTarget.dispatch('notification',{detail:{type:'ride.changed',rideId:current.id,revision:9}});await fixture.notificationBridges[0].inner.idle();
+  assert.equal(fixture.notificationTarget.listenerCount('notification'),0);assert.equal(reads,0);assert.equal(fixture.notificationBridges[0].inner.snapshot().detached,true);
+});
+test('role switch replaces the bound notification listener with the current generation', async () => {
+  const {R}=setup(),seen=[];const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async input=>{seen.push(input);return {status:304};}});
+  await fixture.lifecycle.enter('passenger');const old=fixture.notificationBridges[0];await fixture.lifecycle.enter('driver');const fresh=fixture.notificationBridges[1],current=fixture.feedbacks[1].current;
+  fixture.notificationTarget.dispatch('notification',{detail:{type:'ride.changed',rideId:current.id,revision:9}});await fresh.inner.idle();
+  assert.equal(fixture.notificationTarget.listenerCount('notification'),1);assert.equal(fixture.notificationTarget.addCount('notification'),2);assert.equal(old.inner.snapshot().handledEvents,0);assert.equal(fresh.inner.snapshot().handledEvents,1);assert.deepEqual(seen.map(value=>[value.role,value.generation]),[['driver',2],['driver',2]]);
+});
+test('same-role re-entry does not reuse an old notification listener', async () => {
+  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
+  await fixture.lifecycle.enter('passenger');const old=fixture.notificationBridges[0];fixture.lifecycle.leave();await fixture.lifecycle.enter('passenger');const fresh=fixture.notificationBridges[1],current=fixture.feedbacks[1].current;
+  fixture.notificationTarget.dispatch('notification',{detail:{type:'ride.changed',rideId:current.id,revision:9}});await fresh.inner.idle();
+  assert.notEqual(old.inner,fresh.inner);assert.equal(old.inner.snapshot().detached,true);assert.equal(old.inner.snapshot().handledEvents,0);assert.equal(fresh.inner.snapshot().handledEvents,1);assert.equal(reads,2);
+});
+test('a delayed notification event cannot update after its listener generation is replaced', async () => {
+  const {R}=setup();let release;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:({role,hint})=>role==='passenger'?new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});}):Promise.resolve({status:304})});
+  await fixture.lifecycle.enter('passenger');const oldNotification=fixture.notificationBridges[0],oldFeedback=fixture.feedbacks[0],hint={type:'ride.changed',rideId:oldFeedback.current.id,revision:9},pending=oldNotification.inner.receive(hint);await Promise.resolve();await Promise.resolve();const oldRenderCount=oldFeedback.renders.length;
+  await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[1];release();const result=await pending;await oldNotification.inner.idle();await oldFeedback.inner.idle();
+  assert.equal(result.reason,'bridge_stale');assert.equal(oldFeedback.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().role,'driver');assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(fixture.notificationTarget.listenerCount('notification'),1);
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
