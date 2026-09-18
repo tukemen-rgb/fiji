@@ -534,12 +534,12 @@ test('cross-role or unexpected recovery views fail closed', () => {
   assert.equal(blocked.applied,true);assert.equal(blocked.reason,'invalid_view');
   assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().outcome,'conflict');assert.equal(commandUi.snapshot().disableCommands,true);
 });
-function recoveryFlow(R,role,readCurrentRide,principal={accountRef:`demo-${role}-account`,viewerRole:role}) {
+function recoveryFlow(R,role,readCurrentRide,principal={accountRef:`demo-${role}-account`,viewerRole:role},options={}) {
   const storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});guard.mark(role,'pending');
   const controller=R.createStartupRecoveryController({guard,role,principal,readCurrentRide});
   const pages=[],commandUi=R.createCommandUiController(role);commandUi.finish('unresolved');
   const uiAdapter=R.createStartupRecoveryUiAdapter({role,sessionGeneration:controller.snapshot().sessionGeneration,navigate:page=>pages.push(page),commandUi});
-  const flow=R.createStartupRecoveryFlow({role,controller,uiAdapter});
+  const flow=R.createStartupRecoveryFlow({role,controller,uiAdapter,...options});
   return {storage,guard,controller,pages,commandUi,uiAdapter,flow};
 }
 test('startup screen flow applies passenger recovery to navigation and lock once', async () => {
@@ -592,6 +592,59 @@ test('role mismatch and invalid recovery actions send no discovery request', asy
   assert.equal(wrong.processed,false);assert.equal(wrong.reason,'role_mismatch');
   const invalid=await flow.resume('automatic');
   assert.equal(invalid.processed,false);assert.equal(invalid.reason,'invalid_resume_reason');assert.equal(reads,0);assert.deepEqual(pages,[]);
+});
+test('a hidden startup screen sends no read until it becomes visible', async () => {
+  const {R}=setup();let reads=0;
+  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;return {status:204};},undefined,{initiallyVisible:false});
+  const hidden=await flow.recoverOnStartup();
+  assert.equal(hidden.reason,'screen_hidden');assert.equal(reads,0);assert.deepEqual(pages,[]);
+  const visible=await flow.setVisible(true);
+  assert.equal(visible.processed,true);assert.equal(visible.reason,'home_restored');assert.equal(reads,1);assert.deepEqual(pages,['home']);
+});
+test('a result completed while hidden is deferred and applied once on return', async () => {
+  const {R}=setup();let resolve;
+  const {flow,pages,commandUi}=recoveryFlow(R,'driver',()=>new Promise(done=>{resolve=done;}));
+  const pending=flow.recoverOnStartup();await flow.setVisible(false);
+  resolve({status:200,body:currentRideView('driver')});
+  const deferred=await pending;
+  assert.equal(deferred.reason,'hidden_result_deferred');assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().disableCommands,true);
+  const restored=await flow.setVisible(true);
+  assert.equal(restored.processed,true);assert.deepEqual(pages,['driver-trips']);assert.equal(commandUi.snapshot().disableCommands,false);
+  assert.equal((await flow.setVisible(true)).reason,'visibility_unchanged');assert.deepEqual(pages,['driver-trips']);
+});
+test('a hidden connectivity action does not consume the one allowed reread', async () => {
+  const {R}=setup();let reads=0;
+  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;if(reads===1)throw Error('offline');return {status:204};});
+  await flow.recoverOnStartup();await flow.setVisible(false);
+  assert.equal((await flow.resume('connectivity')).reason,'screen_hidden');assert.equal(reads,1);
+  assert.equal((await flow.setVisible(true)).reason,'visible_noop');assert.equal(reads,1);
+  const restored=await flow.resume('connectivity');
+  assert.equal(restored.processed,true);assert.equal(reads,2);assert.deepEqual(pages,['home']);
+});
+test('rapid hide and show during one read does not start another read', async () => {
+  const {R}=setup();let resolve,reads=0;
+  const {flow,pages}=recoveryFlow(R,'driver',()=>{reads+=1;return new Promise(done=>{resolve=done;});});
+  const pending=flow.recoverOnStartup();await flow.setVisible(false);await flow.setVisible(true);
+  assert.equal(reads,1);assert.equal(flow.snapshot().controller.busy,true);
+  resolve({status:204});const restored=await pending;
+  assert.equal(restored.processed,true);assert.equal(reads,1);assert.deepEqual(pages,['driver-home']);
+});
+test('a session initialized while hidden performs one discovery when shown', async () => {
+  const {R}=setup();let reads=0;
+  const {flow,controller,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;return {status:204};},{accountRef:'passenger-a',viewerRole:'passenger'},{initiallyVisible:false});
+  controller.replacePrincipal(null);
+  const hidden=await flow.beginSession({accountRef:'passenger-b',viewerRole:'passenger'});
+  assert.equal(hidden.reason,'screen_hidden');assert.equal(reads,0);
+  const visible=await flow.setVisible(true);
+  assert.equal(visible.processed,true);assert.equal(reads,1);assert.deepEqual(pages,['home']);
+});
+test('disposing a hidden flow discards its deferred result permanently', async () => {
+  const {R}=setup();let resolve;
+  const {flow,pages}=recoveryFlow(R,'passenger',()=>new Promise(done=>{resolve=done;}));
+  const pending=flow.recoverOnStartup();await flow.setVisible(false);resolve({status:204});
+  assert.equal((await pending).reason,'hidden_result_deferred');assert.equal(flow.snapshot().deferredResult,true);
+  flow.dispose();assert.equal(flow.snapshot().deferredResult,false);
+  assert.equal((await flow.setVisible(true)).reason,'flow_disposed');assert.deepEqual(pages,[]);
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);

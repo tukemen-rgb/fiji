@@ -367,20 +367,25 @@
     };
     return Object.freeze({snapshot,beginSession,apply});
   }
-  function createStartupRecoveryFlow({role,controller,uiAdapter}){
+  function createStartupRecoveryFlow({role,controller,uiAdapter,initiallyVisible=true}){
     const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
-    if(!normalized||!controller||typeof controller.snapshot!=='function'||typeof controller.reconcile!=='function'||typeof controller.beginSessionRecovery!=='function'||typeof controller.replacePrincipal!=='function'||!uiAdapter||typeof uiAdapter.snapshot!=='function'||typeof uiAdapter.apply!=='function'||typeof uiAdapter.beginSession!=='function')throw Error('起動時復旧フローの設定が不正です。');
+    if(!normalized||typeof initiallyVisible!=='boolean'||!controller||typeof controller.snapshot!=='function'||typeof controller.reconcile!=='function'||typeof controller.beginSessionRecovery!=='function'||typeof controller.replacePrincipal!=='function'||!uiAdapter||typeof uiAdapter.snapshot!=='function'||typeof uiAdapter.apply!=='function'||typeof uiAdapter.beginSession!=='function')throw Error('起動時復旧フローの設定が不正です。');
     const initialController=controller.snapshot(),initialUi=uiAdapter.snapshot();
     if(initialController.role!==normalized||initialUi.role!==normalized||initialController.sessionGeneration!==initialUi.sessionGeneration)throw Error('起動時復旧フローの役割または世代が一致しません。');
-    let disposed=false,epoch=1,lastAction='idle';
-    const snapshot=()=>Object.freeze({role:normalized,disposed,epoch,lastAction,controller:controller.snapshot(),ui:uiAdapter.snapshot()});
-    const perform=async(reason,runEpoch=epoch)=>{
-      if(disposed)return {processed:false,reason:'flow_disposed',state:snapshot()};
-      lastAction=reason;
-      const result=await controller.reconcile(reason);
+    let disposed=false,epoch=1,lastAction='idle',visible=initiallyVisible,deferred=null;
+    const snapshot=()=>Object.freeze({role:normalized,disposed,visible,deferredResult:Boolean(deferred),epoch,lastAction,controller:controller.snapshot(),ui:uiAdapter.snapshot()});
+    const applyResult=(result,runEpoch)=>{
       if(disposed||runEpoch!==epoch)return {processed:false,reason:'flow_stale',result,state:snapshot()};
+      if(!visible){deferred=Object.freeze({result,epoch:runEpoch});lastAction='deferred';return {processed:false,reason:'hidden_result_deferred',result,state:snapshot()};}
       const application=uiAdapter.apply(result);
       return {processed:application.applied,reason:application.reason,result,application,state:snapshot()};
+    };
+    const perform=async(reason,runEpoch=epoch)=>{
+      if(disposed)return {processed:false,reason:'flow_disposed',state:snapshot()};
+      if(!visible)return {processed:false,reason:'screen_hidden',state:snapshot()};
+      lastAction=reason;
+      const result=await controller.reconcile(reason);
+      return applyResult(result,runEpoch);
     };
     const recoverOnStartup=()=>perform('startup');
     const resume=reason=>{
@@ -396,12 +401,23 @@
       if(!uiStart.started){controller.replacePrincipal(null);disposed=true;epoch+=1;lastAction='disposed';return {processed:false,reason:'ui_session_rejected',initialized,uiStart,state:snapshot()};}
       return perform('startup',epoch);
     };
+    const setVisible=async nextVisible=>{
+      if(typeof nextVisible!=='boolean')return {processed:false,reason:'invalid_visibility',state:snapshot()};
+      if(disposed)return {processed:false,reason:'flow_disposed',state:snapshot()};
+      if(nextVisible===visible)return {processed:false,reason:'visibility_unchanged',state:snapshot()};
+      visible=nextVisible;lastAction=visible?'visible':'hidden';
+      if(!visible)return {processed:false,reason:'screen_hidden',state:snapshot()};
+      if(deferred){const pending=deferred;deferred=null;return applyResult(pending.result,pending.epoch);}
+      const state=controller.snapshot();
+      if(state.markerRetained&&state.attempts===0&&state.sessionRecoveryInitialized)return perform('startup',epoch);
+      return {processed:false,reason:'visible_noop',state:snapshot()};
+    };
     const dispose=()=>{
       if(disposed)return {disposed:false,reason:'already_disposed',state:snapshot()};
-      disposed=true;epoch+=1;lastAction='disposed';controller.replacePrincipal(null);
+      disposed=true;deferred=null;epoch+=1;lastAction='disposed';controller.replacePrincipal(null);
       return {disposed:true,reason:'disposed',state:snapshot()};
     };
-    return Object.freeze({snapshot,recoverOnStartup,resume,beginSession,dispose});
+    return Object.freeze({snapshot,recoverOnStartup,resume,beginSession,setVisible,dispose});
   }
   function create(){
     let seq=10;
