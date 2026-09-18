@@ -419,6 +419,62 @@
     };
     return Object.freeze({snapshot,recoverOnStartup,resume,beginSession,setVisible,dispose});
   }
+  function createStartupRecoveryEventBridge({flow,eventTarget,documentState}){
+    if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');
+    let attached=false,detached=false,lastEvent='idle',handledEvents=0,onlinePending=null;
+    const operations=new Set();
+    const isVisible=()=>documentState.visibilityState!=='hidden';
+    const snapshot=()=>Object.freeze({attached,detached,busy:operations.size>0,lastEvent,handledEvents});
+    const track=(name,work)=>{
+      handledEvents+=1;lastEvent=name;
+      let task;
+      task=Promise.resolve(work).catch(()=>({processed:false,reason:'event_failed'})).finally(()=>operations.delete(task));
+      operations.add(task);return task;
+    };
+    const updateVisibility=name=>{
+      if(!attached||detached)return;
+      track(name,flow.setVisible(isVisible()));
+    };
+    const onVisibilityChange=()=>updateVisibility('visibilitychange');
+    const onPageShow=()=>updateVisibility('pageshow');
+    const onOnline=()=>{
+      if(!attached||detached||!isVisible()||onlinePending)return;
+      const before=flow.snapshot();
+      if(before.disposed||before.controller?.outcome!=='unresolved'||before.controller?.canRetry!==true)return;
+      const work=(async()=>{
+        if(detached||!isVisible())return {processed:false,reason:'screen_hidden'};
+        const visibility=await flow.setVisible(true);
+        if(detached)return {processed:false,reason:'bridge_detached'};
+        if(visibility.processed)return visibility;
+        const current=flow.snapshot();
+        if(!current.visible||current.disposed||current.controller?.outcome!=='unresolved'||current.controller?.canRetry!==true)return {processed:false,reason:'retry_not_allowed',state:current};
+        return flow.resume('connectivity');
+      })();
+      onlinePending=track('online',work);
+      onlinePending.finally(()=>{onlinePending=null;});
+    };
+    const start=()=>{
+      if(detached)return {started:false,reason:'bridge_detached',state:snapshot()};
+      if(attached)return {started:false,reason:'already_attached',state:snapshot()};
+      eventTarget.addEventListener('visibilitychange',onVisibilityChange);
+      eventTarget.addEventListener('pageshow',onPageShow);
+      eventTarget.addEventListener('online',onOnline);
+      attached=true;updateVisibility('attach');
+      return {started:true,reason:'attached',state:snapshot()};
+    };
+    const detach=()=>{
+      if(detached)return {detached:false,reason:'already_detached',state:snapshot()};
+      if(attached){
+        eventTarget.removeEventListener('visibilitychange',onVisibilityChange);
+        eventTarget.removeEventListener('pageshow',onPageShow);
+        eventTarget.removeEventListener('online',onOnline);
+      }
+      attached=false;detached=true;lastEvent='detached';flow.dispose();
+      return {detached:true,reason:'detached',state:snapshot()};
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
+    return Object.freeze({snapshot,start,detach,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -576,7 +632,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>

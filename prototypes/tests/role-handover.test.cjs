@@ -646,6 +646,64 @@ test('disposing a hidden flow discards its deferred result permanently', async (
   flow.dispose();assert.equal(flow.snapshot().deferredResult,false);
   assert.equal((await flow.setVisible(true)).reason,'flow_disposed');assert.deepEqual(pages,[]);
 });
+function recoveryEventTarget() {
+  const listeners=new Map(),adds=new Map();
+  return {
+    addEventListener(type,handler){if(!listeners.has(type))listeners.set(type,new Set());listeners.get(type).add(handler);adds.set(type,(adds.get(type)||0)+1);},
+    removeEventListener(type,handler){listeners.get(type)?.delete(handler);},
+    dispatch(type){for(const handler of [...(listeners.get(type)||[])])handler({type});},
+    listenerCount(type){return listeners.get(type)?.size||0;},
+    addCount(type){return adds.get(type)||0;}
+  };
+}
+test('startup recovery event bridge attaches each lifecycle listener once', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
+  const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));
+  const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});
+  assert.equal(bridge.start().started,true);assert.equal(bridge.start().reason,'already_attached');await bridge.idle();
+  for(const type of ['visibilitychange','pageshow','online']){assert.equal(target.listenerCount(type),1);assert.equal(target.addCount(type),1);}
+  assert.deepEqual(Object.keys(bridge.snapshot()).sort(),['attached','busy','detached','handledEvents','lastEvent']);
+});
+test('visibilitychange and pageshow restore a hidden startup screen with one read', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'hidden'};let reads=0;
+  const {flow,pages}=recoveryFlow(R,'driver',async()=>{reads+=1;return {status:204};},undefined,{initiallyVisible:false});
+  const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
+  target.dispatch('pageshow');await bridge.idle();assert.equal(reads,0);
+  documentState.visibilityState='visible';target.dispatch('visibilitychange');target.dispatch('pageshow');await bridge.idle();
+  assert.equal(reads,1);assert.deepEqual(pages,['driver-home']);assert.equal(flow.snapshot().visible,true);
+});
+test('duplicate online events coalesce into the single permitted connectivity reread', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};let reads=0,release;
+  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});});
+  await flow.recoverOnStartup();const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
+  target.dispatch('online');target.dispatch('online');await Promise.resolve();await Promise.resolve();
+  assert.equal(reads,2);target.dispatch('online');assert.equal(reads,2);
+  release({status:204});await bridge.idle();assert.equal(reads,2);assert.deepEqual(pages,['home']);
+});
+test('online does not substitute for the explicit reauthentication recovery action', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};let reads=0;
+  const {flow,pages}=recoveryFlow(R,'driver',async()=>{reads+=1;return {status:401};});
+  await flow.recoverOnStartup();const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
+  target.dispatch('online');await bridge.idle();assert.equal(reads,1);assert.deepEqual(pages,[]);assert.equal(flow.snapshot().controller.outcome,'reauth');
+});
+test('hiding during an online reread defers its result until pageshow without another read', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};let reads=0,release;
+  const {flow,pages}=recoveryFlow(R,'driver',async()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});});
+  await flow.recoverOnStartup();const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
+  target.dispatch('online');await Promise.resolve();await Promise.resolve();assert.equal(reads,2);
+  documentState.visibilityState='hidden';target.dispatch('visibilitychange');assert.equal(flow.snapshot().visible,false);
+  release({status:200,body:currentRideView('driver')});await bridge.idle();assert.deepEqual(pages,[]);assert.equal(flow.snapshot().deferredResult,true);
+  documentState.visibilityState='visible';target.dispatch('pageshow');await bridge.idle();assert.equal(reads,2);assert.deepEqual(pages,['driver-trips']);
+});
+test('detaching the event bridge removes listeners and prevents late or future navigation', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};let reads=0,release;
+  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});});
+  await flow.recoverOnStartup();const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
+  target.dispatch('online');await Promise.resolve();await Promise.resolve();assert.equal(reads,2);
+  assert.equal(bridge.detach().detached,true);for(const type of ['visibilitychange','pageshow','online'])assert.equal(target.listenerCount(type),0);
+  release({status:204});await bridge.idle();target.dispatch('online');target.dispatch('pageshow');await bridge.idle();
+  assert.equal(reads,2);assert.deepEqual(pages,[]);assert.equal(flow.snapshot().disposed,true);assert.equal(bridge.start().reason,'bridge_detached');
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');
