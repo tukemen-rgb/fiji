@@ -482,8 +482,8 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,start,detach,idle});
   }
-  function createRoleRecoveryLifecycle({createRoleFlow,createEventBridge}){
-    if(typeof createRoleFlow!=='function'||typeof createEventBridge!=='function')throw Error('役割別復旧ライフサイクルの設定が不正です。');
+  function createRoleRecoveryLifecycle({createRoleFlow,createEventBridge,createFeedbackBridge=null}){
+    if(typeof createRoleFlow!=='function'||typeof createEventBridge!=='function'||createFeedbackBridge!==null&&typeof createFeedbackBridge!=='function')throw Error('役割別復旧ライフサイクルの設定が不正です。');
     let active=null,generation=0,lastAction='idle',recoveryAction=null;
     const operations=new Set();
     const snapshot=()=>Object.freeze({activeRole:active?.role||null,generation,entered:Boolean(active),busy:operations.size>0,lastAction});
@@ -494,7 +494,7 @@
     };
     const leave=()=>{
       if(!active)return {left:false,reason:'not_entered',state:snapshot()};
-      const previous=active;active=null;if(recoveryAction?.entry===previous)recoveryAction=null;lastAction='left';previous.bridge.detach();
+      const previous=active;active=null;if(recoveryAction?.entry===previous)recoveryAction=null;lastAction='left';previous.feedbackBridge?.detach();previous.bridge.detach();
       return {left:true,reason:'left',role:previous.role,state:snapshot()};
     };
     const enter=role=>{
@@ -503,7 +503,7 @@
       if(active?.role===normalized)return Promise.resolve({entered:false,reason:'already_entered',state:snapshot()});
       if(active)leave();
       generation+=1;const entryGeneration=generation;
-      let flow,bridge;
+      let flow,bridge,feedbackBridge;
       try{
         flow=createRoleFlow({role:normalized,generation:entryGeneration});
         if(!flow||typeof flow.snapshot!=='function'||typeof flow.recoverOnStartup!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function')throw Error('flow');
@@ -511,13 +511,20 @@
         if(!bridge||typeof bridge.start!=='function'||typeof bridge.detach!=='function'||typeof bridge.idle!=='function')throw Error('bridge');
         const started=bridge.start();
         if(started?.started!==true)throw Error('bridge_start');
+        if(createFeedbackBridge){
+          feedbackBridge=createFeedbackBridge({role:normalized,generation:entryGeneration,flow});
+          if(!feedbackBridge||typeof feedbackBridge.attach!=='function'||typeof feedbackBridge.detach!=='function'||typeof feedbackBridge.idle!=='function')throw Error('feedback_bridge');
+          const feedbackStarted=feedbackBridge.attach();
+          if(feedbackStarted?.started!==true)throw Error('feedback_bridge_start');
+        }
       }catch{
+        try{feedbackBridge?.detach();}catch{}
         try{bridge?.detach();}catch{}
         try{flow?.dispose();}catch{}
         lastAction='entry_rejected';
         return Promise.resolve({entered:false,reason:'entry_rejected',state:snapshot()});
       }
-      const entry=Object.freeze({role:normalized,generation:entryGeneration,flow,bridge});active=entry;lastAction='entered';
+      const entry=Object.freeze({role:normalized,generation:entryGeneration,flow,bridge,feedbackBridge});active=entry;lastAction='entered';
       return track((async()=>{
         const startup=await flow.recoverOnStartup();
         if(active!==entry)return {entered:false,reason:'stale_entry',startup,state:snapshot()};
@@ -562,6 +569,7 @@
     };
     const idle=async()=>{
       while(operations.size>0)await Promise.all([...operations]);
+      if(active?.feedbackBridge)await active.feedbackBridge.idle();
       if(active)await active.bridge.idle();
       return snapshot();
     };

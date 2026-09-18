@@ -717,6 +717,20 @@ function roleLifecycleFixture(R,{target=recoveryEventTarget(),documentState={vis
   });
   return {lifecycle,target,documentState,bundles,bridges};
 }
+function roleFeedbackLifecycleFixture(R,{notificationRead=async()=>({status:304}),onReauthenticate=()=>({requested:true})}={}) {
+  const startupTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},feedbacks=[],events=[];let lifecycle;
+  lifecycle=R.createRoleRecoveryLifecycle({
+    createRoleFlow({role,generation}){return recoveryFlow(R,role,async()=>({status:204}),{accountRef:`${role}-${generation}`,viewerRole:role}).flow;},
+    createEventBridge({flow,requestRecovery}){return R.createStartupRecoveryEventBridge({flow,eventTarget:startupTarget,documentState,requestRecovery});},
+    createFeedbackBridge({role,generation}){
+      const current=currentRideView(role,{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle,role,currentRide:current,recover:hint=>notificationRead({role,generation,hint})}),commandUi=R.createCommandUiController(role),flow=R.createNotificationFeedbackFlow({role,recovery,commandUi,onReauthenticate:context=>onReauthenticate({...context,generation})}),target=recoveryEventTarget(),renders=[];
+      const inner=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});
+      const bridge={snapshot:()=>inner.snapshot(),attach(){events.push(`attach:${role}:${generation}`);return inner.attach();},activate:()=>inner.activate(),detach(){events.push(`detach:${role}:${generation}`);return inner.detach();},idle:()=>inner.idle()};
+      feedbacks.push({role,generation,current,recovery,commandUi,flow,target,renders,bridge,inner});return bridge;
+    }
+  });
+  return {lifecycle,feedbacks,events,startupTarget};
+}
 test('role screen entry creates one flow and bridge without duplicate startup reads', async () => {
   const {R}=setup();let reads=0;
   const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}});
@@ -1169,6 +1183,35 @@ test('the reauthentication button event is single-flight and remains locked unti
   const current=currentRideView('driver',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:403}:{status:304};}}),commandUi=R.createCommandUiController('driver'),flow=R.createNotificationFeedbackFlow({role:'driver',recovery,commandUi,onReauthenticate:()=>{reauthCalls+=1;return new Promise(resolve=>{release=resolve;});}});
   await flow.handle({type:'ride.changed',rideId:current.id,revision:9});await flow.trigger('refresh');const bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:()=>{}});bridge.attach();const first=bridge.activate();await Promise.resolve();const duplicate=await bridge.activate();
   assert.equal(duplicate.reason,'action_in_progress');assert.equal(reauthCalls,1);release({requested:true});await first;assert.equal(reauthCalls,1);assert.equal(commandUi.snapshot().action,'reauth');assert.equal(commandUi.snapshot().disableCommands,true);
+});
+test('role entry owns one notification feedback bridge without duplicate attachment', async () => {
+  const {R}=setup(),fixture=roleFeedbackLifecycleFixture(R);
+  assert.equal((await fixture.lifecycle.enter('passenger')).entered,true);assert.equal((await fixture.lifecycle.enter('passenger')).reason,'already_entered');
+  assert.equal(fixture.feedbacks.length,1);assert.deepEqual(fixture.events,['attach:passenger:1']);assert.equal(fixture.feedbacks[0].target.listenerCount('click'),1);assert.equal(fixture.feedbacks[0].target.addCount('click'),1);
+});
+test('leaving a role detaches its notification button before later clicks can act', async () => {
+  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
+  await fixture.lifecycle.enter('passenger');const first=fixture.feedbacks[0];await first.flow.handle({type:'ride.changed',rideId:first.current.id,revision:9});assert.equal(first.commandUi.snapshot().action,'refresh');const before=reads;
+  fixture.lifecycle.leave();assert.equal(first.target.listenerCount('click'),0);first.target.dispatch('click');await first.bridge.idle();
+  assert.equal(reads,before);assert.equal(first.inner.snapshot().detached,true);assert.equal((await first.inner.activate()).reason,'bridge_inactive');
+});
+test('role switching detaches the old notification bridge before attaching the new one', async () => {
+  const {R}=setup(),fixture=roleFeedbackLifecycleFixture(R);
+  await fixture.lifecycle.enter('passenger');await fixture.lifecycle.enter('driver');
+  assert.deepEqual(fixture.events,['attach:passenger:1','detach:passenger:1','attach:driver:2']);assert.equal(fixture.feedbacks[0].target.listenerCount('click'),0);assert.equal(fixture.feedbacks[1].target.listenerCount('click'),1);assert.equal(fixture.lifecycle.snapshot().activeRole,'driver');
+});
+test('re-entering the same role creates a fresh notification button generation', async () => {
+  const {R}=setup(),fixture=roleFeedbackLifecycleFixture(R);
+  await fixture.lifecycle.enter('driver');const first=fixture.feedbacks[0];fixture.lifecycle.leave();await fixture.lifecycle.enter('driver');const second=fixture.feedbacks[1];
+  assert.notEqual(first.inner,second.inner);assert.equal(first.generation+1,second.generation);assert.equal(first.target.listenerCount('click'),0);assert.equal(second.target.listenerCount('click'),1);assert.equal((await first.inner.activate()).reason,'bridge_inactive');
+});
+test('a delayed old notification action cannot render into a switched role generation', async () => {
+  const {R}=setup();let oldCalls=0,release;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:({role,hint})=>{
+    if(role!=='passenger')return Promise.resolve({status:304});oldCalls+=1;if(oldCalls<3)return Promise.resolve({status:304});return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});});
+  }});
+  await fixture.lifecycle.enter('passenger');const old=fixture.feedbacks[0];await old.flow.handle({type:'ride.changed',rideId:old.current.id,revision:9});const pending=old.inner.activate();await Promise.resolve();const oldRenderCount=old.renders.length;
+  await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[1];release();const result=await pending;await old.inner.idle();
+  assert.equal(result.reason,'bridge_stale');assert.equal(old.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().role,'driver');assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(current.target.listenerCount('click'),1);
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
