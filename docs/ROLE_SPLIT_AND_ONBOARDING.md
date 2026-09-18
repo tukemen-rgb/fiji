@@ -165,3 +165,11 @@ Five executable cases raise the current total to 298 passing tests (20 verificat
 - The standalone prototype uses this adapter for its existing feedback elements. Its current local action fallback remains demo navigation/state clearing; the recoverable subscription services are injected only in acceptance tests and are not a real Push/WebSocket or authenticated API connection.
 
 Five executable cases raise the current total to 303 passing tests (20 verification + 283 role/lifecycle/API/HTTP-contract), with no TODOs. DOM-shaped fakes verify properties and listener lifecycle; real browser clicks, screen readers, Android, authentication and cross-device notification delivery remain unverified.
+
+## Role-owned notification DOM integration — 2026-09-19 Fiji
+- One composite bridge now joins the current role-screen lifecycle, recoverable notification subscription, shared feedback state and prototype DOM. The subscription feedback layer can omit its own event listener so only the DOM adapter owns the real action-button click.
+- Initial failure reaches the role-specific banner and reconnect button. That button can advance through reconnect and one authorized latest-state verification only in the active role/session/DOM generation; duplicate activation stops before connection or read work.
+- Role exit removes the DOM listener and hides the banner before detaching the subscription. A role switch discards delayed old verification without repainting the new role, and same-role account replacement creates a fresh subscription and DOM generation.
+- The composite public state contains only lifecycle/UI status. It does not expose session bindings, credentials, notification payloads or verification responses.
+
+Five executable cases raise the current total to 308 passing tests (20 verification + 288 role/lifecycle/API/HTTP-contract), with no TODOs. DOM elements and notification/auth services are injected fakes; real browser events, authenticated HTTP, Push/WebSocket, Android and cross-device delivery remain unverified.

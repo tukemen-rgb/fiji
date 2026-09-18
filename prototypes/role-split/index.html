@@ -1081,7 +1081,8 @@
   }
   function createNotificationSubscriptionFeedbackBridge({role,generation,lifecycle,commandUi,eventTarget,subscribe,onHint,verifyLatest,onReauthenticate=async()=>({requested:true}),render}){
     const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null,initial=commandUi?.snapshot?.();
-    if(!normalized||!Number.isInteger(generation)||generation<1||!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.handleSubscriptionAction!=='function'||!commandUi||typeof commandUi.snapshot!=='function'||typeof commandUi.applyFeedback!=='function'||initial?.role!==normalized||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||typeof subscribe!=='function'||typeof onHint!=='function'||typeof verifyLatest!=='function'||typeof onReauthenticate!=='function'||typeof render!=='function')throw Error('通知購読フィードバック接続の設定が不正です。');
+    const listens=eventTarget!==null&&eventTarget!==undefined;
+    if(!normalized||!Number.isInteger(generation)||generation<1||!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.handleSubscriptionAction!=='function'||!commandUi||typeof commandUi.snapshot!=='function'||typeof commandUi.applyFeedback!=='function'||initial?.role!==normalized||(listens&&(typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'))||typeof subscribe!=='function'||typeof onHint!=='function'||typeof verifyLatest!=='function'||typeof onReauthenticate!=='function'||typeof render!=='function')throw Error('通知購読フィードバック接続の設定が不正です。');
     const uiGeneration=initial.generation;let attached=false,detached=false,version=0,handledEvents=0,lastEvent='idle';const operations=new Set();let subscription;
     const current=()=>{const state=lifecycle.snapshot(),ui=commandUi.snapshot();return attached&&!detached&&state.activeRole===normalized&&state.generation===generation&&ui.role===normalized&&ui.generation===uiGeneration;};
     const outcome=state=>state.busy||['connecting','retrying','verifying','reauthenticating'].includes(state.guidance)?'pending':['reauth','reauth_pending'].includes(state.guidance)?'reauth':['connectivity','verification_connectivity','retry_failed'].includes(state.guidance)?'unresolved':state.guidance==='empty'?'confirmed':'idle';
@@ -1117,11 +1118,11 @@
     const attach=()=>{
       if(detached)return {started:false,reason:'bridge_detached',state:snapshot()};
       if(attached)return {started:false,reason:'already_attached',state:snapshot()};
-      attached=true;version+=1;eventTarget.addEventListener('click',onClick);const started=subscription.attach();lastEvent=started?.reason||'connecting';paint(version);return {started:started?.started===true,reason:lastEvent,state:snapshot()};
+      attached=true;version+=1;if(listens)eventTarget.addEventListener('click',onClick);const started=subscription.attach();lastEvent=started?.reason||'connecting';paint(version);return {started:started?.started===true,reason:lastEvent,state:snapshot()};
     };
     const detach=()=>{
       if(detached)return snapshot();
-      eventTarget.removeEventListener('click',onClick);attached=false;detached=true;version+=1;subscription.detach();lastEvent='detached';return snapshot();
+      if(listens)eventTarget.removeEventListener('click',onClick);attached=false;detached=true;version+=1;subscription.detach();lastEvent='detached';return snapshot();
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);await subscription.idle();paint(version);return snapshot();};
     return Object.freeze({snapshot,attach,activate,reconnect,refresh,reauthenticate,detach,idle});
@@ -1157,6 +1158,21 @@
     const attach=()=>{if(attached)return {started:false,reason:'already_attached',state:snapshot()};attached=true;generation+=1;lastEvent='attached';action.addEventListener('click',onClick);paint();return {started:true,reason:'attached',state:snapshot()};};
     const detach=()=>{if(attached)action.removeEventListener('click',onClick);attached=false;busy=false;generation+=1;lastEvent='detached';box.hidden=true;action.hidden=true;action.disabled=true;attr(box,'aria-busy','false');attr(action,'aria-disabled','true');return snapshot();};
     return Object.freeze({snapshot,attach,render:paint,activate:run,detach});
+  }
+  function createNotificationSubscriptionDomBridge({role,generation,lifecycle,elements,subscribe,onHint,verifyLatest,onReauthenticate=async()=>({requested:true}),render=()=>{}}){
+    const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
+    if(!normalized||!Number.isInteger(generation)||generation<1||!lifecycle||typeof lifecycle.snapshot!=='function'||typeof subscribe!=='function'||typeof onHint!=='function'||typeof verifyLatest!=='function'||typeof onReauthenticate!=='function'||typeof render!=='function')throw Error('通知購読DOM統合の設定が不正です。');
+    const commandUi=createCommandUiController(normalized);let attached=false,detached=false,lastEvent='idle';let feedback;
+    const dom=createCommandFeedbackDomBridge({commandUi,elements,activate:()=>feedback.activate()});
+    const snapshot=()=>{const state=feedback?.snapshot?.()||{},view=commandUi.snapshot(),domState=dom.snapshot();return Object.freeze({attached,detached,busy:Boolean(state.busy||domState.busy),action:view.action||null,commandsLocked:Boolean(view.disableCommands),domGeneration:domState.generation,lastEvent});};
+    const paint=view=>{if(!attached||detached)return false;dom.render(view);try{render(view);return true;}catch{lastEvent='render_failed';return false;}};
+    feedback=createNotificationSubscriptionFeedbackBridge({role:normalized,generation,lifecycle,commandUi,eventTarget:null,subscribe,onHint,verifyLatest,onReauthenticate,render:paint});
+    const attach=()=>{if(detached)return {started:false,reason:'bridge_detached',state:snapshot()};if(attached)return {started:false,reason:'already_attached',state:snapshot()};attached=true;dom.attach();const started=feedback.attach();lastEvent=started.reason;return {started:started.started,reason:lastEvent,state:snapshot()};};
+    const activate=()=>{if(!attached||detached)return Promise.resolve({processed:false,reason:'bridge_inactive',state:snapshot()});lastEvent=commandUi.snapshot().action||'action';return dom.activate();};
+    const reconnect=()=>feedback.reconnect(),refresh=()=>feedback.refresh(),reauthenticate=()=>feedback.reauthenticate();
+    const detach=()=>{if(detached)return snapshot();dom.detach();attached=false;detached=true;feedback.detach();lastEvent='detached';return snapshot();};
+    const idle=async()=>{await Promise.resolve();await feedback.idle();await Promise.resolve();if(attached&&!detached)dom.render();return snapshot();};
+    return Object.freeze({snapshot,attach,activate,reconnect,refresh,reauthenticate,detach,idle});
   }
   function create(){
     let seq=10;
@@ -1315,7 +1331,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
