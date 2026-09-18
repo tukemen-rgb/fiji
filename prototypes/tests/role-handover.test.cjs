@@ -912,6 +912,60 @@ test('switching roles during online recovery allows one independent action in th
   assert.equal(fresh.recovered,true);assert.deepEqual(reads,{passenger:2,driver:2});assert.deepEqual(fixture.bundles[1].pages,['driver-home']);
   releasePassenger({status:204});await fixture.bridges[0].bridge.idle();assert.deepEqual(fixture.bundles[0].pages,[]);assert.equal(boundary.snapshot().page,'driver-home');
 });
+test('a minimal notification hint applies only an authorized role-scoped recovery', async () => {
+  const {R}=setup();let calls=0,received;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned',nextAction:'track_driver'});
+  const notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async hint=>{calls+=1;received=hint;return {status:200,body:currentRideView('passenger',{revision:9,status:'on_trip',nextAction:'show_on_trip'})};}});
+  const result=await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});
+  assert.equal(result.processed,true);assert.equal(result.reason,'notification_recovered');assert.equal(calls,1);assert.equal(received.type,'ride.changed');assert.equal(received.rideId,current.id);assert.equal(received.revision,9);
+  const snapshot=notifications.snapshot();
+  assert.equal(snapshot.role,'passenger');assert.equal(snapshot.hasRide,true);assert.equal(snapshot.revision,9);assert.equal(snapshot.status,'on_trip');assert.equal(snapshot.busy,false);assert.equal(snapshot.lastReason,'notification_recovered');
+});
+test('private, foreign and stale notification hints stop before authorized recovery', async () => {
+  const {R}=setup();let calls=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
+  const current=currentRideView('driver',{revision:8,status:'assigned',nextAction:'start_pickup'});
+  const notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return {status:500};}});
+  assert.equal((await notifications.handle({type:'ride.changed',rideId:current.id,revision:9,plate:'DEMO 001'})).reason,'invalid_hint');
+  assert.equal((await notifications.handle({type:'ride.changed',rideId:'foreign',revision:9})).reason,'foreign_hint');
+  assert.equal((await notifications.handle({type:'ride.changed',rideId:current.id,revision:8})).reason,'stale_or_duplicate_hint');
+  assert.equal(calls,0);assert.equal(notifications.snapshot().revision,8);
+});
+test('notification-first recovery rejects a simultaneous manual refresh without another read', async () => {
+  const {R}=setup();let notificationCalls=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'});
+  const notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:()=>{notificationCalls+=1;return new Promise(resolve=>{release=resolve;});}});
+  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();
+  const manual=await boundary.recover('refresh');assert.equal(manual.reason,'recovery_in_progress');assert.equal(notificationCalls,1);
+  release({status:200,body:currentRideView('passenger',{revision:9,status:'on_trip'})});assert.equal((await pending).processed,true);assert.equal(notificationCalls,1);
+});
+test('manual-first recovery rejects a notification without calling its reader', async () => {
+  const {R}=setup();let reads=0,releaseManual,notificationCalls=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{releaseManual=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{notificationCalls+=1;return {status:500};}});
+  const manual=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();
+  const notification=await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});assert.equal(notification.reason,'recovery_in_progress');assert.equal(notificationCalls,0);assert.equal(reads,2);
+  releaseManual({status:204});assert.equal((await manual).recovered,true);
+});
+test('notification-first recovery coalesces a simultaneous online event', async () => {
+  const {R}=setup();let startupReads=0,notificationCalls=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{startupReads+=1;throw Error('offline');}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:()=>{notificationCalls+=1;return new Promise(resolve=>{release=resolve;});}});
+  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();fixture.target.dispatch('online');await fixture.bridges[0].bridge.idle();
+  assert.equal(startupReads,1);assert.equal(notificationCalls,1);
+  release({status:200,body:currentRideView('passenger',{revision:9,status:'on_trip'})});assert.equal((await pending).processed,true);assert.equal(startupReads,1);
+});
+test('a notification result arriving after a role switch cannot update the old role state', async () => {
+  const {R}=setup();let release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
+  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:()=>new Promise(resolve=>{release=resolve;})});
+  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();await boundary.navigate('driver-home','driver');
+  release({status:200,body:currentRideView('passenger',{revision:9,status:'on_trip'})});const stale=await pending;
+  assert.equal(stale.processed,false);assert.equal(stale.reason,'stale_recovery');assert.equal(notifications.snapshot().revision,8);assert.equal(boundary.snapshot().activeRole,'driver');assert.equal(boundary.snapshot().page,'driver-home');
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');

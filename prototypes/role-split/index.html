@@ -535,12 +535,30 @@
       });
       handle=Object.freeze({entry,task});recoveryAction=handle;operations.add(task);return task;
     };
+    const requestNotificationRecovery=({role,generation:expectedGeneration,execute}={})=>{
+      if(typeof execute!=='function')return Promise.resolve({recovered:false,reason:'invalid_notification_recovery',state:snapshot()});
+      const entry=active;
+      if(!entry)return Promise.resolve({recovered:false,reason:'not_entered',state:snapshot()});
+      if(role!==entry.role||expectedGeneration!==entry.generation)return Promise.resolve({recovered:false,reason:'stale_role_generation',state:snapshot()});
+      if(recoveryAction?.entry===entry)return Promise.resolve({recovered:false,reason:'recovery_in_progress',state:snapshot()});
+      lastAction='notification';
+      let handle;
+      const task=(async()=>{
+        const notification=await execute();
+        if(active!==entry)return {recovered:false,reason:'stale_recovery',state:snapshot()};
+        const recovered=notification?.fetched===true;lastAction=notification?.reason||'notification_failed';
+        return {recovered,reason:lastAction,notification,state:snapshot()};
+      })().catch(()=>({recovered:false,reason:'recovery_failed',state:snapshot()})).finally(()=>{
+        operations.delete(task);if(recoveryAction===handle)recoveryAction=null;
+      });
+      handle=Object.freeze({entry,task});recoveryAction=handle;operations.add(task);return task;
+    };
     const idle=async()=>{
       while(operations.size>0)await Promise.all([...operations]);
       if(active)await active.bridge.idle();
       return snapshot();
     };
-    return Object.freeze({snapshot,enter,leave,requestRecovery,idle});
+    return Object.freeze({snapshot,enter,leave,requestRecovery,requestNotificationRecovery,idle});
   }
   function createRoleRoutingBoundary({lifecycle}){
     if(!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.enter!=='function'||typeof lifecycle.leave!=='function'||typeof lifecycle.requestRecovery!=='function'||typeof lifecycle.idle!=='function')throw Error('役割別ルーティング境界の設定が不正です。');
@@ -592,6 +610,51 @@
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);await lifecycle.idle();return snapshot();};
     return Object.freeze({snapshot,navigate,recover,idle});
+  }
+  function createRoleNotificationRecovery({lifecycle,role,currentRide=null,recover}){
+    const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
+    if(!normalized||!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.requestNotificationRecovery!=='function'||typeof recover!=='function')throw Error('通知復旧の設定が不正です。');
+    const normalizeRide=value=>{
+      if(value===null)return null;
+      const view=currentRideRecoveryView(normalized,{status:200,body:value});
+      return view?.kind==='ride'?view.ride:null;
+    };
+    let current=normalizeRide(currentRide),busy=0,lastReason='idle';
+    if(currentRide!==null&&!current)throw Error('通知復旧の現在状態が不正です。');
+    const hintFields=['type','rideId','revision'],hintTypes=new Set(['ride.changed','ride.access_changed']);
+    const parseHint=value=>{
+      const keys=value&&typeof value==='object'&&!Array.isArray(value)?Object.keys(value).sort():[];
+      if(keys.join(',')!==[...hintFields].sort().join(',')||!hintTypes.has(value.type)||typeof value.rideId!=='string'||!value.rideId||!Number.isInteger(value.revision)||value.revision<1)return null;
+      return Object.freeze({type:value.type,rideId:value.rideId,revision:value.revision});
+    };
+    const snapshot=()=>Object.freeze({role:normalized,hasRide:Boolean(current),revision:current?.revision||null,status:current?.status||null,busy:busy>0,lastReason});
+    const reject=reason=>{lastReason=reason;return Promise.resolve({processed:false,reason,state:snapshot()});};
+    const handle=rawHint=>{
+      const hint=parseHint(rawHint);if(!hint)return reject('invalid_hint');
+      const active=lifecycle.snapshot();
+      if(active.activeRole!==normalized)return reject('inactive_role');
+      if(!current)return reject('missing_baseline');
+      if(hint.rideId!==current.id)return reject('foreign_hint');
+      if(hint.revision<=current.revision)return reject('stale_or_duplicate_hint');
+      const generation=active.generation;busy+=1;lastReason='notification_pending';
+      return lifecycle.requestNotificationRecovery({role:normalized,generation,execute:async()=>{
+        const response=await recover(hint),status=Number(response?.status);
+        if([401,403,404].includes(status))return Object.freeze({fetched:true,applied:false,clear:true,reason:'access_lost'});
+        if(status===304)return Object.freeze({fetched:true,applied:false,reason:'hint_not_yet_visible'});
+        const view=currentRideRecoveryView(normalized,response);
+        if(view?.kind!=='ride'||view.ride.id!==current.id)return Object.freeze({fetched:true,applied:false,reason:'invalid_recovery'});
+        if(view.ride.revision<hint.revision||view.ride.revision<=current.revision)return Object.freeze({fetched:true,applied:false,reason:'hint_not_yet_visible'});
+        return Object.freeze({fetched:true,applied:true,nextRide:view.ride,reason:'notification_recovered'});
+      }}).then(coordinated=>{
+        const latest=lifecycle.snapshot(),notification=coordinated.notification;
+        if(coordinated.reason==='stale_recovery'||latest.activeRole!==normalized||latest.generation!==generation){lastReason='stale_recovery';return {processed:false,reason:'stale_recovery',state:snapshot()};}
+        if(notification?.clear)current=null;
+        else if(notification?.applied&&notification.nextRide)current=notification.nextRide;
+        lastReason=coordinated.reason;
+        return {processed:notification?.applied===true,reason:coordinated.reason,fetched:notification?.fetched===true,state:snapshot()};
+      }).catch(()=>{lastReason='recovery_failed';return {processed:false,reason:'recovery_failed',state:snapshot()};}).finally(()=>{busy=Math.max(0,busy-1);});
+    };
+    return Object.freeze({snapshot,handle});
   }
   function create(){
     let seq=10;
@@ -750,7 +813,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
