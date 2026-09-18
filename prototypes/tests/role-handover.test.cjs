@@ -704,6 +704,71 @@ test('detaching the event bridge removes listeners and prevents late or future n
   release({status:204});await bridge.idle();target.dispatch('online');target.dispatch('pageshow');await bridge.idle();
   assert.equal(reads,2);assert.deepEqual(pages,[]);assert.equal(flow.snapshot().disposed,true);assert.equal(bridge.start().reason,'bridge_detached');
 });
+function roleLifecycleFixture(R,{target=recoveryEventTarget(),documentState={visibilityState:'visible'},readCurrentRide}={}) {
+  const bundles=[],bridges=[];
+  const lifecycle=R.createRoleRecoveryLifecycle({
+    createRoleFlow({role,generation}){
+      const bundle=recoveryFlow(R,role,request=>readCurrentRide({role,generation,request}),{accountRef:`${role}-${generation}`,viewerRole:role},{initiallyVisible:documentState.visibilityState!=='hidden'});
+      bundles.push({...bundle,role,generation});return bundle.flow;
+    },
+    createEventBridge({flow,role,generation}){
+      const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridges.push({bridge,role,generation});return bridge;
+    }
+  });
+  return {lifecycle,target,documentState,bundles,bridges};
+}
+test('role screen entry creates one flow and bridge without duplicate startup reads', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}});
+  const entered=await fixture.lifecycle.enter('passenger');assert.equal(entered.entered,true);assert.equal(reads,1);
+  const duplicate=await fixture.lifecycle.enter('passenger');assert.equal(duplicate.reason,'already_entered');assert.equal(reads,1);
+  assert.equal(fixture.bundles.length,1);assert.equal(fixture.bridges.length,1);
+  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),1);
+});
+test('switching role screens disposes the old entry before accepting the new role', async () => {
+  const {R}=setup();let releasePassenger;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:({role})=>role==='passenger'?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({status:204})});
+  const passenger=fixture.lifecycle.enter('passenger');await Promise.resolve();await Promise.resolve();
+  const driver=await fixture.lifecycle.enter('driver');assert.equal(driver.entered,true);
+  releasePassenger({status:200,body:currentRideView('passenger')});const old=await passenger;
+  assert.equal(old.reason,'stale_entry');assert.equal(fixture.bundles[0].flow.snapshot().disposed,true);assert.deepEqual(fixture.bundles[0].pages,[]);
+  assert.deepEqual(fixture.bundles[1].pages,['driver-home']);assert.equal(fixture.lifecycle.snapshot().activeRole,'driver');
+  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),1);
+});
+test('leaving a role screen removes every listener and ignores later events', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}});
+  await fixture.lifecycle.enter('driver');const left=fixture.lifecycle.leave();assert.equal(left.left,true);assert.equal(left.role,'driver');
+  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),0);
+  fixture.target.dispatch('online');fixture.target.dispatch('pageshow');await fixture.lifecycle.idle();assert.equal(reads,1);
+  assert.deepEqual(Object.keys(fixture.lifecycle.snapshot()).sort(),['activeRole','busy','entered','generation','lastAction']);
+});
+test('re-entering the same role after leaving creates a fresh isolated generation', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}});
+  await fixture.lifecycle.enter('passenger');const first=fixture.bundles[0];fixture.lifecycle.leave();
+  const secondEntry=await fixture.lifecycle.enter('passenger');const second=fixture.bundles[1];
+  assert.equal(secondEntry.entered,true);assert.equal(reads,2);assert.notEqual(first.flow,second.flow);assert.equal(first.flow.snapshot().disposed,true);
+  assert.equal(first.generation+1,second.generation);assert.equal(fixture.target.listenerCount('online'),1);
+});
+test('entering a hidden role screen waits for pageshow before its first discovery', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{documentState:{visibilityState:'hidden'},readCurrentRide:async()=>{reads+=1;return {status:204};}});
+  const entered=await fixture.lifecycle.enter('driver');assert.equal(entered.startup.reason,'screen_hidden');assert.equal(reads,0);
+  fixture.documentState.visibilityState='visible';fixture.target.dispatch('pageshow');await fixture.lifecycle.idle();
+  assert.equal(reads,1);assert.deepEqual(fixture.bundles[0].pages,['driver-home']);
+});
+test('a delayed online result from a departed entry cannot affect a re-entered role', async () => {
+  const {R}=setup();let phase=0,releaseOld;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:({generation})=>{
+    if(generation===1){phase+=1;if(phase===1)throw Error('offline');return new Promise(resolve=>{releaseOld=resolve;});}
+    return Promise.resolve({status:204});
+  }});
+  await fixture.lifecycle.enter('passenger');fixture.target.dispatch('online');await Promise.resolve();await Promise.resolve();
+  fixture.lifecycle.leave();const reentered=await fixture.lifecycle.enter('passenger');assert.equal(reentered.entered,true);
+  releaseOld({status:200,body:currentRideView('passenger')});await fixture.bridges[0].bridge.idle();
+  assert.deepEqual(fixture.bundles[0].pages,[]);assert.deepEqual(fixture.bundles[1].pages,['home']);assert.equal(fixture.lifecycle.snapshot().generation,2);
+});
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
   m.leave(); m.chooseRole('passenger');

@@ -475,6 +475,55 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,start,detach,idle});
   }
+  function createRoleRecoveryLifecycle({createRoleFlow,createEventBridge}){
+    if(typeof createRoleFlow!=='function'||typeof createEventBridge!=='function')throw Error('役割別復旧ライフサイクルの設定が不正です。');
+    let active=null,generation=0,lastAction='idle';
+    const operations=new Set();
+    const snapshot=()=>Object.freeze({activeRole:active?.role||null,generation,entered:Boolean(active),busy:operations.size>0,lastAction});
+    const track=work=>{
+      let task;
+      task=Promise.resolve(work).catch(()=>({entered:false,reason:'startup_failed'})).finally(()=>operations.delete(task));
+      operations.add(task);return task;
+    };
+    const leave=()=>{
+      if(!active)return {left:false,reason:'not_entered',state:snapshot()};
+      const previous=active;active=null;lastAction='left';previous.bridge.detach();
+      return {left:true,reason:'left',role:previous.role,state:snapshot()};
+    };
+    const enter=role=>{
+      const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null;
+      if(!normalized)return Promise.resolve({entered:false,reason:'invalid_role',state:snapshot()});
+      if(active?.role===normalized)return Promise.resolve({entered:false,reason:'already_entered',state:snapshot()});
+      if(active)leave();
+      generation+=1;const entryGeneration=generation;
+      let flow,bridge;
+      try{
+        flow=createRoleFlow({role:normalized,generation:entryGeneration});
+        if(!flow||typeof flow.snapshot!=='function'||typeof flow.recoverOnStartup!=='function'||typeof flow.dispose!=='function')throw Error('flow');
+        bridge=createEventBridge({role:normalized,generation:entryGeneration,flow});
+        if(!bridge||typeof bridge.start!=='function'||typeof bridge.detach!=='function'||typeof bridge.idle!=='function')throw Error('bridge');
+        const started=bridge.start();
+        if(started?.started!==true)throw Error('bridge_start');
+      }catch{
+        try{bridge?.detach();}catch{}
+        try{flow?.dispose();}catch{}
+        lastAction='entry_rejected';
+        return Promise.resolve({entered:false,reason:'entry_rejected',state:snapshot()});
+      }
+      const entry=Object.freeze({role:normalized,generation:entryGeneration,flow,bridge});active=entry;lastAction='entered';
+      return track((async()=>{
+        const startup=await flow.recoverOnStartup();
+        if(active!==entry)return {entered:false,reason:'stale_entry',startup,state:snapshot()};
+        return {entered:true,reason:'entered',startup,state:snapshot()};
+      })());
+    };
+    const idle=async()=>{
+      while(operations.size>0)await Promise.all([...operations]);
+      if(active)await active.bridge.idle();
+      return snapshot();
+    };
+    return Object.freeze({snapshot,enter,leave,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -632,7 +681,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
