@@ -157,3 +157,11 @@ Four executable cases raise the current total to 293 passing tests (20 verificat
 - A current-generation 404 renders the role-specific unlocked empty state; an old or unavailable button starts no subscription, read or authentication work.
 
 Five executable cases raise the current total to 298 passing tests (20 verification + 278 role/lifecycle/API/HTTP-contract), with no TODOs. They use a fake DOM-compatible event target; real DOM, authentication, HTTP, Push/WebSocket, browser/Android lifecycle and cross-device synchronization remain unverified.
+
+## Prototype DOM feedback adapter — 2026-09-19 Fiji
+- The shared command banner, title, message, action button and role command buttons are updated by one DOM adapter. Only `reconnect`, `refresh` and `reauth` are accepted as visible actions.
+- Pending activation disables the feedback button and exposes `aria-busy`; every role command mirrors its visual disabled state through `aria-disabled`.
+- Role-page exit removes the click listener and hides the banner. Same-role re-entry attaches one fresh listener generation, while delayed completion from the departed generation is discarded without repainting.
+- The standalone prototype uses this adapter for its existing feedback elements. Its current local action fallback remains demo navigation/state clearing; the recoverable subscription services are injected only in acceptance tests and are not a real Push/WebSocket or authenticated API connection.
+
+Five executable cases raise the current total to 303 passing tests (20 verification + 283 role/lifecycle/API/HTTP-contract), with no TODOs. DOM-shaped fakes verify properties and listener lifecycle; real browser clicks, screen readers, Android, authentication and cross-device notification delivery remain unverified.

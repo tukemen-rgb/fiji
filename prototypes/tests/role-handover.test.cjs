@@ -656,6 +656,10 @@ function recoveryEventTarget() {
     addCount(type){return adds.get(type)||0;}
   };
 }
+function feedbackDomElements() {
+  const target=recoveryEventTarget(),element=()=>({hidden:false,disabled:false,textContent:'',className:'',attributes:{},setAttribute(name,value){this.attributes[name]=String(value);}}),action=Object.assign(element(),target);
+  return {box:element(),title:element(),message:element(),action,commandButtons:[element(),element()]};
+}
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));
@@ -1511,6 +1515,33 @@ test('404 reconnect verification renders the active driver empty state without a
   const {R}=setup(),fixture=roleSubscriptionFeedbackLifecycleFixture(R,{verifyLatest:async()=>({status:404})});
   await fixture.lifecycle.enter('driver');await fixture.lifecycle.idle();const record=fixture.subscriptions[0];record.disconnect();const result=await record.bridge.activate(),view=record.commandUi.snapshot();
   assert.equal(result.reason,'ride_not_found');assert.equal(view.outcome,'confirmed');assert.equal(view.action,null);assert.equal(view.disableCommands,false);assert.match(view.title,/運行/);assert.match(view.message,/運転手ホーム/);assert.equal((await record.bridge.activate()).reason,'action_not_available');
+});
+test('prototype DOM bridge renders notification recovery state and accessibility locks', () => {
+  const {R}=setup(),commandUi=R.createCommandUiController('passenger'),elements=feedbackDomElements(),bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:async()=>({processed:true})});
+  bridge.attach();commandUi.applyFeedback('passenger',commandUi.snapshot().generation,'unresolved',{title:'依頼の通知に接続できません',message:'通信を確認してください。',disableCommands:true,action:'reconnect'});bridge.render();
+  assert.equal(elements.box.hidden,false);assert.match(elements.box.className,/error/);assert.equal(elements.box.attributes['aria-busy'],'false');assert.equal(elements.title.textContent,'依頼の通知に接続できません');assert.equal(elements.action.textContent,'通知を再接続する');assert.equal(elements.action.hidden,false);assert.equal(elements.action.disabled,false);assert.equal(elements.action.attributes['aria-disabled'],'false');
+  for(const button of elements.commandButtons){assert.equal(button.disabled,true);assert.equal(button.attributes['aria-disabled'],'true');}
+});
+test('prototype DOM feedback action is single-flight and exposes pending ARIA state', async () => {
+  const {R}=setup(),commandUi=R.createCommandUiController('driver'),elements=feedbackDomElements();let calls=0,release;
+  const bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:()=>{calls+=1;return new Promise(resolve=>{release=resolve;});}});bridge.attach();commandUi.applyFeedback('driver',commandUi.snapshot().generation,'unresolved',{title:'運行の通知に接続できません',message:'再接続してください。',disableCommands:true,action:'reconnect'});bridge.render();
+  const pending=bridge.activate();await Promise.resolve();const duplicate=await bridge.activate();assert.equal(calls,1);assert.equal(duplicate.reason,'action_in_progress');assert.equal(elements.action.disabled,true);assert.equal(elements.action.attributes['aria-disabled'],'true');assert.equal(elements.box.attributes['aria-busy'],'true');
+  release({processed:true,reason:'reconnected'});assert.equal((await pending).reason,'reconnected');assert.equal(elements.box.attributes['aria-busy'],'false');
+});
+test('role-page exit removes the actual feedback click listener and hides its banner', async () => {
+  const {R}=setup(),commandUi=R.createCommandUiController('passenger'),elements=feedbackDomElements();let calls=0;
+  const bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:async()=>{calls+=1;return {processed:true};}});bridge.attach();commandUi.applyFeedback('passenger',commandUi.snapshot().generation,'unresolved',{title:'確認が必要です',message:'',disableCommands:true,action:'refresh'});bridge.render();assert.equal(elements.action.listenerCount('click'),1);
+  bridge.detach();elements.action.dispatch('click');await Promise.resolve();assert.equal(calls,0);assert.equal(elements.action.listenerCount('click'),0);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal((await bridge.activate()).reason,'dom_bridge_inactive');
+});
+test('delayed feedback completion cannot repaint after role-page exit', async () => {
+  const {R}=setup(),commandUi=R.createCommandUiController('driver'),elements=feedbackDomElements();let release;
+  const bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:()=>new Promise(resolve=>{release=resolve;})});bridge.attach();commandUi.applyFeedback('driver',commandUi.snapshot().generation,'reauth',{title:'再ログインが必要です',message:'認証してください。',disableCommands:true,action:'reauth'});bridge.render();const pending=bridge.activate();await Promise.resolve();bridge.detach();release({processed:true,reason:'reauthentication_requested'});
+  assert.equal((await pending).reason,'dom_bridge_stale');assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(bridge.snapshot().attached,false);
+});
+test('same-role page re-entry uses a fresh DOM generation without duplicate listeners', async () => {
+  const {R}=setup(),commandUi=R.createCommandUiController('passenger'),elements=feedbackDomElements();let calls=0;
+  const bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:async()=>{calls+=1;return {processed:true,reason:'refreshed'};}});bridge.attach();const first=bridge.snapshot().generation;bridge.detach();bridge.attach();const second=bridge.snapshot().generation;
+  commandUi.applyFeedback('passenger',commandUi.snapshot().generation,'unresolved',{title:'最新状態を確認',message:'',disableCommands:true,action:'refresh'});bridge.render();elements.action.dispatch('click');await Promise.resolve();await Promise.resolve();assert.ok(second>first);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.action.addCount('click'),2);assert.equal(calls,1);assert.deepEqual(Object.keys(bridge.snapshot()).sort(),['attached','busy','generation','lastEvent']);
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);

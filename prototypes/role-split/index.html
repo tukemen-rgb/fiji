@@ -1126,6 +1126,38 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);await subscription.idle();paint(version);return snapshot();};
     return Object.freeze({snapshot,attach,activate,reconnect,refresh,reauthenticate,detach,idle});
   }
+  function createCommandFeedbackDomBridge({commandUi,elements,activate}){
+    const box=elements?.box,title=elements?.title,message=elements?.message,action=elements?.action,commandButtons=Array.from(elements?.commandButtons||[]);
+    if(!commandUi||typeof commandUi.snapshot!=='function'||!box||!title||!message||!action||typeof action.addEventListener!=='function'||typeof action.removeEventListener!=='function'||typeof activate!=='function')throw Error('共通フィードバックDOM接続の設定が不正です。');
+    const labels=Object.freeze({reconnect:'通知を再接続する',refresh:'最新状態を確認する',reauth:'役割選択へ戻る'});let attached=false,busy=false,generation=0,lastEvent='idle';
+    const attr=(node,name,value)=>{if(typeof node.setAttribute==='function')node.setAttribute(name,String(value));else node[name]=String(value);};
+    const snapshot=()=>Object.freeze({attached,busy,generation,lastEvent});
+    const paint=(view=commandUi.snapshot())=>{
+      const visible=view.outcome!=='idle'&&Boolean(view.title||view.message||view.action),pending=busy||view.outcome==='pending',allowed=Object.prototype.hasOwnProperty.call(labels,view.action);
+      box.hidden=!visible;box.className='banner command-feedback'+(['unresolved','reauth','conflict'].includes(view.outcome)?' error':'');attr(box,'aria-busy',pending?'true':'false');
+      title.textContent=view.title||'';message.textContent=view.message||'';
+      action.hidden=!allowed;action.textContent=allowed?labels[view.action]:'';action.disabled=!allowed||pending;attr(action,'aria-disabled',action.disabled?'true':'false');
+      for(const button of commandButtons){button.disabled=Boolean(view.disableCommands);attr(button,'aria-disabled',button.disabled?'true':'false');}
+      return snapshot();
+    };
+    const run=()=>{
+      if(!attached)return Promise.resolve({processed:false,reason:'dom_bridge_inactive',state:snapshot()});
+      if(busy)return Promise.resolve({processed:false,reason:'action_in_progress',state:snapshot()});
+      const view=commandUi.snapshot(),selected=view.action;
+      if(!Object.prototype.hasOwnProperty.call(labels,selected))return Promise.resolve({processed:false,reason:'action_not_available',state:snapshot()});
+      const token=generation;busy=true;lastEvent=selected;paint(view);
+      return Promise.resolve().then(()=>activate(selected)).then(result=>{
+        if(!attached||token!==generation)return {processed:false,reason:'dom_bridge_stale',result,state:snapshot()};
+        lastEvent=result?.reason||selected;return {processed:result?.processed!==false,reason:lastEvent,result,state:snapshot()};
+      },()=>({processed:false,reason:attached&&token===generation?'action_failed':'dom_bridge_stale',state:snapshot()})).finally(()=>{
+        if(attached&&token===generation){busy=false;paint();}
+      });
+    };
+    const onClick=()=>{void run();};
+    const attach=()=>{if(attached)return {started:false,reason:'already_attached',state:snapshot()};attached=true;generation+=1;lastEvent='attached';action.addEventListener('click',onClick);paint();return {started:true,reason:'attached',state:snapshot()};};
+    const detach=()=>{if(attached)action.removeEventListener('click',onClick);attached=false;busy=false;generation+=1;lastEvent='detached';box.hidden=true;action.hidden=true;action.disabled=true;attr(box,'aria-busy','false');attr(action,'aria-disabled','true');return snapshot();};
+    return Object.freeze({snapshot,attach,render:paint,activate:run,detach});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1283,7 +1315,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1305,11 +1337,7 @@ const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 let toastTimer;
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(()=> $('toast').hidden = true, 5000); }
 function renderCommandFeedback(){
-  const view=commandUi.snapshot(),box=$('command-feedback');
-  box.hidden=view.outcome==='idle';box.className='banner command-feedback'+(['unresolved','reauth','conflict'].includes(view.outcome)?' error':'');
-  $('command-feedback-title').textContent=view.title;$('command-feedback-message').textContent=view.message;
-  const action=$('command-feedback-action');action.hidden=!view.action;action.textContent=view.action==='reauth'?'役割選択へ戻る':view.action==='reconnect'?'通知を再接続する':'最新状態を確認する';
-  document.querySelectorAll('[data-command-action]').forEach(button=>button.disabled=view.disableCommands);
+  commandFeedbackDom.render();
 }
 function commandOutcomeForError(error){const message=String(error?.message||'');if(/認証|ログイン|セッション/.test(message))return'reauth';if(/別の画面|最新状態/.test(message))return'conflict';return'rejected';}
 function runCommandAction(role,action){
@@ -1319,7 +1347,9 @@ function runCommandAction(role,action){
   try{const value=action();restartGuard.clear();commandUi.finish('confirmed');renderCommandFeedback();return {ok:true,value};}
   catch(error){const outcome=commandOutcomeForError(error);if(['unresolved','reauth','conflict'].includes(outcome))restartGuard.mark(role,outcome);else restartGuard.clear();commandUi.finish(outcome);renderCommandFeedback();throw error;}
 }
-$('command-feedback-action').onclick=()=>{const view=commandUi.snapshot();restartGuard.clear();startupRecovery=null;commandUi.clear();if(view.action==='reauth')show('role');else show(state.page);renderCommandFeedback();};
+const commandFeedbackDom=R.createCommandFeedbackDomBridge({commandUi,elements:{box:$('command-feedback'),title:$('command-feedback-title'),message:$('command-feedback-message'),action:$('command-feedback-action'),commandButtons:document.querySelectorAll('[data-command-action]')},activate:async action=>{
+  restartGuard.clear();startupRecovery=null;commandUi.clear();if(action==='reauth')show('role');else show(state.page);return {processed:true,reason:action};
+}});
 function show(target) {
   if(target==='role')model.leave();
   const page=R.route(model.state.activeRole,model.state.profile,target);
@@ -1344,7 +1374,8 @@ function show(target) {
       else{restartGuard.clear();startupRecovery=null;}
       startupRecoveryApplied=true;
     }
-  }else commandUi.clear();
+    commandFeedbackDom.attach();
+  }else{commandUi.clear();commandFeedbackDom.detach();}
   renderCommandFeedback();
   try{history.replaceState(null,'','#'+page);}catch{}
   window.scrollTo({top:0,behavior:'instant'});
