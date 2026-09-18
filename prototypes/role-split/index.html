@@ -419,8 +419,8 @@
     };
     return Object.freeze({snapshot,recoverOnStartup,resume,beginSession,setVisible,dispose});
   }
-  function createStartupRecoveryEventBridge({flow,eventTarget,documentState}){
-    if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');
+  function createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery}){
+    if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||requestRecovery!==undefined&&typeof requestRecovery!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');
     let attached=false,detached=false,lastEvent='idle',handledEvents=0,onlinePending=null;
     const operations=new Set();
     const isVisible=()=>documentState.visibilityState!=='hidden';
@@ -448,7 +448,7 @@
         if(visibility.processed)return visibility;
         const current=flow.snapshot();
         if(!current.visible||current.disposed||current.controller?.outcome!=='unresolved'||current.controller?.canRetry!==true)return {processed:false,reason:'retry_not_allowed',state:current};
-        return flow.resume('connectivity');
+        return requestRecovery?requestRecovery('connectivity'):flow.resume('connectivity');
       })();
       onlinePending=track('online',work);
       onlinePending.finally(()=>{onlinePending=null;});
@@ -500,7 +500,7 @@
       try{
         flow=createRoleFlow({role:normalized,generation:entryGeneration});
         if(!flow||typeof flow.snapshot!=='function'||typeof flow.recoverOnStartup!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function')throw Error('flow');
-        bridge=createEventBridge({role:normalized,generation:entryGeneration,flow});
+        bridge=createEventBridge({role:normalized,generation:entryGeneration,flow,requestRecovery:reason=>requestRecovery({role:normalized,generation:entryGeneration,reason})});
         if(!bridge||typeof bridge.start!=='function'||typeof bridge.detach!=='function'||typeof bridge.idle!=='function')throw Error('bridge');
         const started=bridge.start();
         if(started?.started!==true)throw Error('bridge_start');

@@ -711,8 +711,8 @@ function roleLifecycleFixture(R,{target=recoveryEventTarget(),documentState={vis
       const bundle=recoveryFlow(R,role,request=>readCurrentRide({role,generation,request}),{accountRef:`${role}-${generation}`,viewerRole:role},{initiallyVisible:documentState.visibilityState!=='hidden'});
       bundles.push({...bundle,role,generation});return bundle.flow;
     },
-    createEventBridge({flow,role,generation}){
-      const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridges.push({bridge,role,generation});return bridge;
+    createEventBridge({flow,role,generation,requestRecovery}){
+      const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState,requestRecovery});bridges.push({bridge,role,generation});return bridge;
     }
   });
   return {lifecycle,target,documentState,bundles,bridges};
@@ -867,6 +867,50 @@ test('lifecycle rejects a stale role or generation before starting recovery', as
   assert.equal((await fixture.lifecycle.requestRecovery({role:'passenger',generation:generation-1,reason:'connectivity'})).reason,'stale_role_generation');
   assert.equal((await fixture.lifecycle.requestRecovery({role:'passenger',generation,reason:'force'})).reason,'invalid_recovery_reason');
   assert.equal(reads,1);
+});
+test('manual latest-state recovery wins over a simultaneous online event with one read', async () => {
+  const {R}=setup();let reads=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('home','passenger');const manual=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();
+  fixture.target.dispatch('online');await fixture.bridges[0].bridge.idle();assert.equal(reads,2);
+  release({status:204});const recovered=await manual;
+  assert.equal(recovered.recovered,true);assert.equal(reads,2);assert.deepEqual(fixture.bundles[0].pages,['home']);
+});
+test('online recovery wins over a simultaneous manual tap with one read', async () => {
+  const {R}=setup();let reads=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('home','passenger');fixture.target.dispatch('online');await Promise.resolve();await Promise.resolve();assert.equal(reads,2);
+  const manual=await boundary.recover('refresh');assert.equal(manual.recovered,false);assert.equal(manual.reason,'recovery_in_progress');assert.equal(reads,2);
+  release({status:204});await fixture.bridges[0].bridge.idle();assert.equal(reads,2);assert.deepEqual(fixture.bundles[0].pages,['home']);
+});
+test('hiding during unified online recovery defers one result and blocks a manual duplicate', async () => {
+  const {R}=setup();let reads=0,release;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('driver-home','driver');fixture.target.dispatch('online');await Promise.resolve();await Promise.resolve();
+  fixture.documentState.visibilityState='hidden';fixture.target.dispatch('visibilitychange');
+  assert.equal((await boundary.recover('refresh')).reason,'recovery_in_progress');assert.equal(reads,2);
+  release({status:204});await fixture.bridges[0].bridge.idle();assert.deepEqual(fixture.bundles[0].pages,[]);assert.equal(fixture.bundles[0].flow.snapshot().deferredResult,true);
+  fixture.documentState.visibilityState='visible';fixture.target.dispatch('pageshow');await fixture.bridges[0].bridge.idle();assert.equal(reads,2);assert.deepEqual(fixture.bundles[0].pages,['driver-home']);
+});
+test('online never consumes the explicit reauthentication action', async () => {
+  const {R}=setup();let reads=0;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return reads===1?{status:401}:{status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('driver-home','driver');fixture.target.dispatch('online');await fixture.bridges[0].bridge.idle();assert.equal(reads,1);
+  const reauthenticated=await boundary.recover('reauth');assert.equal(reauthenticated.recovered,true);assert.equal(reads,2);assert.deepEqual(fixture.bundles[0].pages,['driver-home']);
+});
+test('switching roles during online recovery allows one independent action in the new role', async () => {
+  const {R}=setup();const reads={passenger:0,driver:0};let releasePassenger;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:({role})=>{
+    reads[role]+=1;
+    if(role==='passenger'&&reads.passenger===1)throw Error('offline');
+    if(role==='passenger')return new Promise(resolve=>{releasePassenger=resolve;});
+    if(reads.driver===1)throw Error('offline');
+    return Promise.resolve({status:204});
+  }}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  await boundary.navigate('home','passenger');fixture.target.dispatch('online');await Promise.resolve();await Promise.resolve();
+  await boundary.navigate('driver-home','driver');const fresh=await boundary.recover('refresh');
+  assert.equal(fresh.recovered,true);assert.deepEqual(reads,{passenger:2,driver:2});assert.deepEqual(fixture.bundles[1].pages,['driver-home']);
+  releasePassenger({status:204});await fixture.bridges[0].bridge.idle();assert.deepEqual(fixture.bundles[0].pages,[]);assert.equal(boundary.snapshot().page,'driver-home');
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);
