@@ -907,6 +907,56 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,attach,receive,detach,idle});
   }
+  function createAsyncNotificationSubscriptionBridge({subscribe,onHint}){
+    if(typeof subscribe!=='function'||typeof onHint!=='function')throw Error('非同期通知購読接続の設定が不正です。');
+    let attached=false,connected=false,detached=false,handledEvents=0,lastEvent='idle',version=0,controller=null,cleanup=null;const operations=new Set();
+    const snapshot=()=>Object.freeze({attached,connected,detached,busy:operations.size>0,handledEvents,lastEvent});
+    const reject=reason=>Promise.resolve({processed:false,reason,state:snapshot()});
+    const cleanupOf=value=>{
+      const release=typeof value==='function'?value:value&&typeof value.unsubscribe==='function'?()=>value.unsubscribe():null;
+      if(!release)return null;
+      let called=false;return ()=>{if(called)return;called=true;return release();};
+    };
+    const receive=(token,hint)=>{
+      if(!attached||!connected||detached||token!==version)return reject('subscription_inactive');
+      handledEvents+=1;lastEvent='notification';let task;
+      task=Promise.resolve(onHint(hint)).then(result=>{
+        if(!attached||!connected||detached||token!==version)return {processed:false,reason:'bridge_stale',result,state:snapshot()};
+        lastEvent=result?.reason||'notification';return {...result,state:snapshot()};
+      },()=>{
+        if(attached&&connected&&!detached&&token===version)lastEvent='notification_failed';
+        return {processed:false,reason:attached&&connected&&!detached&&token===version?'notification_failed':'bridge_stale',state:snapshot()};
+      }).finally(()=>operations.delete(task));
+      operations.add(task);return task;
+    };
+    const attach=()=>{
+      if(detached)return {started:false,reason:'bridge_detached',state:snapshot()};
+      if(attached)return {started:false,reason:'already_attached',state:snapshot()};
+      attached=true;connected=false;const token=++version;controller=typeof AbortController==='function'?new AbortController():(()=>{const signal={aborted:false};return {signal,abort(){signal.aborted=true;}};})();lastEvent='connecting';
+      let pending;
+      try{pending=subscribe(Object.freeze({signal:controller.signal,onHint:hint=>receive(token,hint)}));}
+      catch{lastEvent='subscription_failed';return {started:true,reason:'connecting',state:snapshot()};}
+      let task;
+      task=Promise.resolve(pending).then(async value=>{
+        const release=cleanupOf(value);
+        if(!release){if(attached&&!detached&&token===version)lastEvent='subscription_failed';return {connected:false,reason:'invalid_subscription',state:snapshot()};}
+        if(!attached||detached||token!==version){try{await release();}catch{}return {connected:false,reason:'bridge_stale',state:snapshot()};}
+        cleanup=release;connected=true;lastEvent='connected';return {connected:true,reason:'connected',state:snapshot()};
+      },()=>{
+        if(attached&&!detached&&token===version)lastEvent='subscription_failed';
+        return {connected:false,reason:attached&&!detached&&token===version?'subscription_failed':'bridge_stale',state:snapshot()};
+      }).finally(()=>operations.delete(task));
+      operations.add(task);return {started:true,reason:'connecting',state:snapshot()};
+    };
+    const detach=()=>{
+      if(detached)return snapshot();
+      attached=false;connected=false;detached=true;version+=1;controller?.abort();
+      if(cleanup){try{void cleanup();}catch{}cleanup=null;}
+      lastEvent='detached';return snapshot();
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
+    return Object.freeze({snapshot,attach,receive:hint=>receive(version,hint),detach,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1064,7 +1114,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
