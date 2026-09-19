@@ -1,5 +1,12 @@
 # Claude implementation brief — role-separated onboarding, minimalist UI, taxi verification
 
+## GDP authentication-session loss integration update — 2026-09-19
+- The role-page router now listens once for `fiji:auth-session-changed` and re-evaluates the current role through `sessionForRole`. Event detail is ignored, so a caller cannot inject a role or session binding through the notification payload.
+- If the authenticated session disappears during reconnect verification, the active lifecycle is left first: subscription, startup/browser-compatible listeners and DOM action are detached, and the delayed old verification cannot repaint. The shared banner then locks commands and offers only the safe role-selection/re-login path.
+- When a fresh authenticated session becomes available, the same role page enters a new lifecycle/subscription generation and clears the stopped banner. Router/runtime/public feedback snapshots contain no session reference or event-supplied value.
+- Two executable integration cases raise the required Node suites to 330/330 with no failures or TODOs. The nine-operation API checker and local loopback HTTP contract groups also pass.
+- This uses an injected session provider and fake event/DOM targets. Real auth SDK/token invalidation, browser events, HTTP/DB, Push/WebSocket, Android, cross-device and Claude production integration remain unconnected and unverified. Next, coalesce repeated session-change signals while fresh-session entry is pending so no entry can be reported ready before its lifecycle succeeds.
+
 ## GDP router-to-reconnect integration update — 2026-09-19
 - One executable acceptance path now composes `createRolePageRouter`, `createRolePageRuntime`, the allowlisted role-service adapter and the shared DOM reconnect action. A successful startup read for the page already being shown is a navigation no-op, preserving the active router revision instead of creating a redundant generation.
 - An initial notification-subscription failure renders one reconnect action. Rapid double activation starts exactly one reconnect and one authorized latest-state verification; commands remain locked until verification succeeds.
