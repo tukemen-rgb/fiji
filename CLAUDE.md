@@ -1,5 +1,12 @@
 # Claude implementation brief — role-separated onboarding, minimalist UI, taxi verification
 
+## GDP router-to-reconnect integration update — 2026-09-19
+- One executable acceptance path now composes `createRolePageRouter`, `createRolePageRuntime`, the allowlisted role-service adapter and the shared DOM reconnect action. A successful startup read for the page already being shown is a navigation no-op, preserving the active router revision instead of creating a redundant generation.
+- An initial notification-subscription failure renders one reconnect action. Rapid double activation starts exactly one reconnect and one authorized latest-state verification; commands remain locked until verification succeeds.
+- Returning to role selection removes the action/startup listeners and notification subscription. Replacing an account within the same role creates a fresh subscription and discards the old account's pending verification without exposing either private session reference.
+- Two end-to-end fake-service/DOM cases raise the required Node suites to 328/328 with no failures or TODOs. The nine-operation API checker and local loopback HTTP contract groups also pass.
+- This is executable prototype acceptance, not real browser/history, authentication, HTTP/DB, Push/WebSocket, Android, cross-device or Claude production integration. Next, connect explicit authentication-session loss to teardown, re-login guidance and fresh-session re-entry acceptance.
+
 ## GDP allowlisted role-service adapter update — 2026-09-19
 - `createRoleServiceLifecycle` now assembles startup recovery, visibility/online handling, notification subscription and the shared DOM feedback bridge inside the GDP prototype. The injected provider can expose only `sessionForRole`, `readCurrentRide`, `subscribeNotifications`, `verifyLatest`, `handleNotificationHint` and `reauthenticate`, plus `configured: true`; missing methods or any extra public key fail before session lookup or service I/O.
 - Each service call is bound internally to the current role, lifecycle generation and private session reference. Role exit aborts the startup read and connecting subscription, removes browser-compatible and DOM listeners, and unsubscribes; role/account replacement discards delayed old results.

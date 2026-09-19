@@ -1476,7 +1476,7 @@ const commandFeedbackDom=R.createCommandFeedbackDomBridge({commandUi,elements:{b
 const injectedRoleServices=window.FijiPrototypeServices||null;
 const rolePageRuntime=R.createRolePageRuntime({
   services:injectedRoleServices,
-  createLifecycle:services=>R.createRoleServiceLifecycle({services,elements:{box:$('command-feedback'),title:$('command-feedback-title'),message:$('command-feedback-message'),action:$('command-feedback-action'),commandButtons:document.querySelectorAll('[data-command-action]')},eventTarget:window,documentState:document,navigate:page=>show(page),storage:restartStorage}),
+  createLifecycle:services=>R.createRoleServiceLifecycle({services,elements:{box:$('command-feedback'),title:$('command-feedback-title'),message:$('command-feedback-message'),action:$('command-feedback-action'),commandButtons:document.querySelectorAll('[data-command-action]')},eventTarget:window,documentState:document,navigate:page=>state.page===page?null:show(page),storage:restartStorage}),
   renderUnavailable:view=>{
     commandUi.setRole(view.role);
     commandUi.applyFeedback(view.role,commandUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});
