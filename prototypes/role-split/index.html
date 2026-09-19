@@ -1210,7 +1210,10 @@
     let lifecycle=null,active=null,pendingEntry=null,page='role',revision=0,lastAction='idle';const operations=new Set();
     const ownerOf=target=>Object.entries(pages).find(([,list])=>list.includes(target))?.[0]||null;
     const snapshot=()=>Object.freeze({page,activeRole:active?.role||null,serviceState,busy:operations.size>0,revision,lastAction});
-    const feedback=(role,reason)=>Object.freeze({role,outcome:reason==='session_unavailable'?'reauth':'unresolved',title:reason==='session_unavailable'?'認証セッションを確認できません':'接続サービスは未設定です',message:reason==='session_unavailable'?'安全のため通信と状態変更を停止しました。役割選択へ戻り、再ログイン後に開き直してください。':'認証・通知・最新状態の通信は行っていません。試作画面の確認だけ利用できます。',disableCommands:true,action:reason==='session_unavailable'?'reauth':null});
+    const feedback=(role,reason)=>{
+      const sessionMissing=reason==='session_unavailable',entryFailed=reason==='entry_failed';
+      return Object.freeze({role,outcome:sessionMissing?'reauth':'unresolved',title:sessionMissing?'認証セッションを確認できません':entryFailed?'役割画面を開始できません':'接続サービスは未設定です',message:sessionMissing?'安全のため通信と状態変更を停止しました。役割選択へ戻り、再ログイン後に開き直してください。':entryFailed?'安全のためこの役割の通信と状態変更を停止しました。役割選択へ戻り、接続を確認してから開き直してください。':'認証・通知・最新状態の通信は行っていません。試作画面の確認だけ利用できます。',disableCommands:true,action:sessionMissing||entryFailed?'reauth':null});
+    };
     const stop=(role,reason)=>{
       try{lifecycle?.leave();}catch{}
       active=Object.freeze({role,sessionBinding:null});lastAction=reason;
@@ -1243,10 +1246,10 @@
       task=Promise.resolve(runtime.enter(normalized,{sessionBinding})).then(result=>{
         if(requestRevision!==revision||active!==activeEntry)return {entered:false,reason:'stale_entry',result,state:snapshot()};
         const entered=result?.entered===true||result?.reason==='already_entered';lastAction=entered?'entered':result?.reason||'entry_failed';
-        if(!entered)return {...stop(normalized,'services_unavailable'),result};
+        if(!entered)return {...stop(normalized,'entry_failed'),result};
         active=Object.freeze({role:normalized,sessionBinding,ready:true});
         return {entered,reason:lastAction,result,state:snapshot()};
-      },()=>requestRevision!==revision||active!==activeEntry?{entered:false,reason:'stale_entry',state:snapshot()}:stop(normalized,'services_unavailable')).finally(()=>{operations.delete(task);if(pendingEntry===task)pendingEntry=null;});
+      },()=>requestRevision!==revision||active!==activeEntry?{entered:false,reason:'stale_entry',state:snapshot()}:stop(normalized,'entry_failed')).finally(()=>{operations.delete(task);if(pendingEntry===task)pendingEntry=null;});
       pendingEntry=task;operations.add(task);return task;
     };
     const leave=()=>{

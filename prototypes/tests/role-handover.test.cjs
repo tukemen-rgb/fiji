@@ -1701,6 +1701,22 @@ test('cross-role navigation replaces a pending authentication sync with the new 
   const switched=await router.navigate('driver-home');assert.equal(switched.navigated,true);assert.equal(runtime.snapshot().activeRole,'driver');target.dispatch('fiji:auth-session-changed');await Promise.resolve();releasePassenger({entered:true,reason:'entered'});await router.idle();
   assert.equal(entries.length,3);assert.deepEqual(entries.map(([role])=>role),['passenger','passenger','driver']);assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().lastAction,'within_role');assert.equal(JSON.stringify([router.snapshot(),runtime.snapshot()]).includes('passenger-'),false);
 });
+test('switching to a role without a session stops there and never restores the old role', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),passenger=Object.freeze({accountRef:'passenger-a'}),views=[];let entries=0,leaves=0,page='role';
+  const lifecycle={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:true,reason:'entered'};},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
+  const services=allowedRoleServices({sessionForRole:role=>role==='passenger'?passenger:null}),runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle,renderUnavailable:view=>views.push(view)});
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:targetPage.startsWith('driver')?'driver':'passenger'},render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');const failed=await router.navigate('driver-home');
+  assert.equal(failed.navigated,false);assert.equal(failed.reason,'session_unavailable');assert.equal(entries,1);assert.equal(leaves,1);assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(views.at(-1).role,'driver');assert.equal(views.at(-1).action,'reauth');assert.equal(views.at(-1).disableCommands,true);
+  await router.navigate('role');assert.equal(router.snapshot().activeRole,null);assert.equal(runtime.snapshot().activeRole,null);assert.notEqual(router.snapshot().page,'home');
+});
+test('a failed target-role entry remains locked even when an auth sync joined it', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),passenger=Object.freeze({accountRef:'passenger-a'}),driver=Object.freeze({accountRef:'driver-a'}),views=[];let page='role',rejectDriver,entries=0,leaves=0;
+  const lifecycle={snapshot:()=>({}),enter:(role)=>{entries+=1;return role==='driver'?new Promise((_resolve,reject)=>{rejectDriver=reject;}):Promise.resolve({entered:true,reason:'entered'});},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
+  const services=allowedRoleServices({sessionForRole:role=>role==='driver'?driver:passenger}),runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle,renderUnavailable:view=>views.push(view)});
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:targetPage.startsWith('driver')?'driver':'passenger'},render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');const switching=router.navigate('driver-home');while(!rejectDriver)await new Promise(resolve=>setImmediate(resolve));target.dispatch('fiji:auth-session-changed');await Promise.resolve();assert.equal(entries,2);rejectDriver(Error('driver startup failed'));await switching;await router.idle();
+  assert.equal(entries,2);assert.equal(leaves,1);assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');assert.equal(router.snapshot().lastAction,'entry_failed');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entry_failed');assert.equal(views.length,1);assert.equal(views[0].role,'driver');assert.equal(views[0].action,'reauth');assert.match(views[0].title,/開始できません/);assert.equal(views[0].disableCommands,true);
+  await router.navigate('role');assert.equal(router.snapshot().activeRole,null);assert.equal(runtime.snapshot().activeRole,null);
+});
 test('role-page runtime stops safely when injected services are not configured', async () => {
   const {R}=setup(),views=[];let factories=0;
   const runtime=R.createRolePageRuntime({services:null,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
@@ -1737,7 +1753,7 @@ test('configured lifecycle entry failure stops and cannot be reused as an active
   const services=allowedRoleServices({sessionForRole:()=>session});
   const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle,renderUnavailable:view=>views.push(view)});
   const first=await runtime.enter('home','passenger'),second=await runtime.enter('passenger-history','passenger');
-  assert.equal(first.reason,'services_unavailable');assert.equal(second.reason,'services_unavailable');assert.equal(entries,2);assert.equal(leaves,2);assert.equal(views.length,2);assert.equal(runtime.snapshot().lastAction,'services_unavailable');
+  assert.equal(first.reason,'entry_failed');assert.equal(second.reason,'entry_failed');assert.equal(entries,2);assert.equal(leaves,2);assert.equal(views.length,2);assert.equal(views[0].action,'reauth');assert.match(views[0].title,/開始できません/);assert.equal(runtime.snapshot().lastAction,'entry_failed');
 });
 test('role switch rejects a delayed old runtime entry without exposing session bindings', async () => {
   const {R}=setup(),passengerSession={account:'private-a'},driverSession={account:'private-b'};let releasePassenger;
