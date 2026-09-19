@@ -1289,6 +1289,7 @@
     const onHashChange=()=>{void navigate(readHash());};
     const syncAuthSession=()=>{
       if(detached||!activeRole||page==='role')return Promise.resolve({navigated:false,reason:'auth_sync_unavailable',state:snapshot()});
+      if(runtime.snapshot()?.lastAction==='entry_failed')return Promise.resolve({navigated:false,reason:'entry_retry_requires_navigation',state:snapshot()});
       authSyncQueued=true;if(authSyncTask)return authSyncTask;
       const syncRevision=authSyncRevision;let task;
       task=Promise.resolve().then(async()=>{let result;while(authSyncQueued&&syncRevision===authSyncRevision&&!detached&&activeRole&&page!=='role'){authSyncQueued=false;result=await route(page,syncRevision);}return result||{navigated:false,reason:'auth_sync_cancelled',state:snapshot()};}).finally(()=>{if(authSyncTask===task)authSyncTask=null;});
