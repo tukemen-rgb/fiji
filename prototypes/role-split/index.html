@@ -1259,10 +1259,12 @@
   }
   function createRolePageRouter({runtime,eventTarget,readHash,resolve,render}){
     if(!runtime||typeof runtime.snapshot!=='function'||typeof runtime.enter!=='function'||typeof runtime.leave!=='function'||typeof runtime.idle!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||typeof readHash!=='function'||typeof resolve!=='function'||typeof render!=='function')throw Error('役割ページルーターの設定が不正です。');
-    let attached=false,detached=false,page='role',activeRole=null,revision=0,lastAction='idle',authSyncTask=null,authSyncQueued=false;const operations=new Set();
+    let attached=false,detached=false,page='role',activeRole=null,revision=0,lastAction='idle',authSyncTask=null,authSyncQueued=false,authSyncRevision=0;const operations=new Set();
     const snapshot=()=>Object.freeze({attached,detached,page,activeRole,revision,busy:operations.size>0||Boolean(authSyncTask),lastAction});
-    const navigate=target=>{
+    const route=(target,authRevision=null)=>{
       if(detached)return Promise.resolve({navigated:false,reason:'router_detached',state:snapshot()});
+      if(authRevision===null){authSyncRevision+=1;authSyncQueued=false;authSyncTask=null;}
+      else if(authRevision!==authSyncRevision)return Promise.resolve({navigated:false,reason:'stale_auth_sync',state:snapshot()});
       const requestRevision=++revision;let destination;
       try{destination=resolve(target);}catch{lastAction='resolve_failed';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}
       const role=destination?.role==='driver'?'driver':destination?.role==='passenger'?'passenger':null,nextPage=destination?.page;
@@ -1280,17 +1282,18 @@
       }).finally(()=>operations.delete(task));
       operations.add(task);return task;
     };
+    const navigate=target=>route(target);
     const onHashChange=()=>{void navigate(readHash());};
     const syncAuthSession=()=>{
       if(detached||!activeRole||page==='role')return Promise.resolve({navigated:false,reason:'auth_sync_unavailable',state:snapshot()});
       authSyncQueued=true;if(authSyncTask)return authSyncTask;
-      let task;
-      task=Promise.resolve().then(async()=>{let result;while(authSyncQueued&&!detached&&activeRole&&page!=='role'){authSyncQueued=false;result=await navigate(page);}return result||{navigated:false,reason:'auth_sync_cancelled',state:snapshot()};}).finally(()=>{if(authSyncTask===task)authSyncTask=null;});
+      const syncRevision=authSyncRevision;let task;
+      task=Promise.resolve().then(async()=>{let result;while(authSyncQueued&&syncRevision===authSyncRevision&&!detached&&activeRole&&page!=='role'){authSyncQueued=false;result=await route(page,syncRevision);}return result||{navigated:false,reason:'auth_sync_cancelled',state:snapshot()};}).finally(()=>{if(authSyncTask===task)authSyncTask=null;});
       authSyncTask=task;return task;
     };
     const onAuthSessionChanged=()=>{void syncAuthSession();};
     const attach=()=>{if(detached)return {started:false,reason:'router_detached',state:snapshot()};if(attached)return {started:false,reason:'already_attached',state:snapshot()};eventTarget.addEventListener('hashchange',onHashChange);eventTarget.addEventListener('fiji:auth-session-changed',onAuthSessionChanged);attached=true;lastAction='attached';return {started:true,reason:'attached',state:snapshot()};};
-    const detach=()=>{if(detached)return snapshot();if(attached){eventTarget.removeEventListener('hashchange',onHashChange);eventTarget.removeEventListener('fiji:auth-session-changed',onAuthSessionChanged);}attached=false;detached=true;authSyncQueued=false;revision+=1;activeRole=null;page='role';runtime.leave();lastAction='detached';return snapshot();};
+    const detach=()=>{if(detached)return snapshot();if(attached){eventTarget.removeEventListener('hashchange',onHashChange);eventTarget.removeEventListener('fiji:auth-session-changed',onAuthSessionChanged);}attached=false;detached=true;authSyncRevision+=1;authSyncQueued=false;authSyncTask=null;revision+=1;activeRole=null;page='role';runtime.leave();lastAction='detached';return snapshot();};
     const idle=async()=>{while(authSyncTask||operations.size>0){if(authSyncTask)await authSyncTask;if(operations.size>0)await Promise.all([...operations]);}await runtime.idle();return snapshot();};
     return Object.freeze({snapshot,attach,navigate,detach,idle});
   }
