@@ -1,5 +1,12 @@
 # Claude implementation brief — role-separated onboarding, minimalist UI, taxi verification
 
+## GDP allowlisted role-service adapter update — 2026-09-19
+- `createRoleServiceLifecycle` now assembles startup recovery, visibility/online handling, notification subscription and the shared DOM feedback bridge inside the GDP prototype. The injected provider can expose only `sessionForRole`, `readCurrentRide`, `subscribeNotifications`, `verifyLatest`, `handleNotificationHint` and `reauthenticate`, plus `configured: true`; missing methods or any extra public key fail before session lookup or service I/O.
+- Each service call is bound internally to the current role, lifecycle generation and private session reference. Role exit aborts the startup read and connecting subscription, removes browser-compatible and DOM listeners, and unsubscribes; role/account replacement discards delayed old results.
+- The prototype runtime now creates this adapter itself instead of accepting an arbitrary provider-owned lifecycle factory. Its public state continues to exclude account/session references, notification bodies and service responses.
+- Four executable acceptance cases cover the exact allowlist, one assembled startup/subscription/DOM entry, complete teardown and delayed cross-role recovery. The required Node suites pass 326/326 with no failures or TODOs; the nine-operation API checker and local loopback HTTP contract groups also pass.
+- The provider remains absent by default. Real browser execution, authentication, HTTP/DB, Push/WebSocket, Android, cross-device state and Claude production implementation remain unconnected and unverified.
+
 ## GDP role-page router update — 2026-09-19
 - `createRolePageRouter` is now the single entry for direct `show()` calls and `hashchange` navigation. The prior standalone hash listener and direct runtime call were removed, so bottom-menu, role-selection and browser-hash paths share one navigation revision.
 - Same-role passenger/driver pages reuse one injected runtime generation. Returning to the role chooser calls runtime leave before rendering; invalid cross-role destinations stop before render or service entry; detach removes the hash listener and rejects later navigation.

@@ -792,6 +792,17 @@ function roleSubscriptionDomLifecycleFixture(R,{subscribe,verifyLatest=async()=>
   });
   return {lifecycle,subscriptions,startupTarget};
 }
+function allowedRoleServices(overrides={}) {
+  return {
+    configured:true,
+    sessionForRole:overrides.sessionForRole||(()=>({accountRef:'demo-account',viewerRole:'passenger'})),
+    readCurrentRide:overrides.readCurrentRide||(async()=>({status:204})),
+    subscribeNotifications:overrides.subscribeNotifications||(async()=>()=>{}),
+    verifyLatest:overrides.verifyLatest||(async()=>({verified:true})),
+    handleNotificationHint:overrides.handleNotificationHint||(async()=>({processed:true})),
+    reauthenticate:overrides.reauthenticate||(async()=>({requested:true}))
+  };
+}
 test('role screen entry creates one flow and bridge without duplicate startup reads', async () => {
   const {R}=setup();let reads=0;
   const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}});
@@ -1582,6 +1593,41 @@ test('same-role account re-entry replaces the prototype DOM subscription generat
   const {R}=setup();let connections=0;const fixture=roleSubscriptionDomLifecycleFixture(R,{subscribe:async()=>{connections+=1;throw Error('offline');}});await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});await fixture.lifecycle.idle();const old=fixture.subscriptions[0];await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});await fixture.lifecycle.idle();const fresh=fixture.subscriptions[1];
   old.elements.action.dispatch('click');await Promise.resolve();assert.equal(connections,2);assert.equal(old.elements.action.listenerCount('click'),0);assert.equal(fresh.elements.action.listenerCount('click'),1);assert.equal(fresh.elements.action.textContent,'通知を再接続する');assert.equal(old.bridge.snapshot().detached,true);assert.equal(fresh.bridge.snapshot().detached,false);assert.ok(fresh.generation>old.generation);
 });
+test('role service provider accepts only the explicit six-method allowlist', async () => {
+  const {R}=setup();let calls=0;
+  const valid=allowedRoleServices({sessionForRole:()=>{calls+=1;return {accountRef:'passenger-a',viewerRole:'passenger'};}});
+  assert.equal(R.isAllowedRoleServiceProvider(valid),true);
+  assert.equal(R.isAllowedRoleServiceProvider({...valid,token:'secret'}),false);
+  const {verifyLatest,...missing}=valid;assert.equal(R.isAllowedRoleServiceProvider(missing),false);
+  const runtime=R.createRolePageRuntime({services:{...valid,endpoint:'https://example.invalid'},createLifecycle:()=>{throw Error('must not create');}});
+  assert.equal((await runtime.enter('home','passenger')).reason,'services_unavailable');assert.equal(calls,0);assert.equal(runtime.snapshot().serviceState,'unconfigured');
+});
+test('allowed service adapter assembles startup recovery, notification subscription and DOM once', async () => {
+  const {R}=setup(),eventTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},elements=feedbackDomElements(),navigations=[],contexts=[];let subscription,unsubscribes=0;
+  const services=allowedRoleServices({
+    readCurrentRide:async context=>{contexts.push(['read',context]);return {status:204};},
+    subscribeNotifications:async context=>{contexts.push(['subscribe',context]);subscription=context;return()=>{unsubscribes+=1;};},
+    handleNotificationHint:async context=>{contexts.push(['hint',context]);return {processed:true};}
+  });
+  const lifecycle=R.createRoleServiceLifecycle({services,elements,eventTarget,documentState,navigate:page=>navigations.push(page),storage:memoryStorage()});
+  const sessionBinding=Object.freeze({accountRef:'passenger-a',viewerRole:'passenger'}),entered=await lifecycle.enter('passenger',{sessionBinding});await lifecycle.idle();
+  assert.equal(entered.entered,true);assert.deepEqual(navigations,['home']);assert.deepEqual(contexts.map(([name])=>name),['subscribe','read']);assert.equal(elements.action.listenerCount('click'),1);
+  await subscription.onHint({type:'ride.changed',rideId:'fixture-ride',revision:2});await lifecycle.idle();assert.deepEqual(contexts.map(([name])=>name),['subscribe','read','hint']);
+  for(const [,context] of contexts){assert.equal(context.role,'passenger');assert.equal(context.generation,1);assert.equal(context.sessionBinding,sessionBinding);}
+  const state=lifecycle.snapshot(),encoded=JSON.stringify(state);assert.deepEqual(Object.keys(state).sort(),['activeRole','busy','entered','generation','lastAction']);assert.equal(encoded.includes('passenger-a'),false);assert.equal(encoded.includes('fixture-ride'),false);assert.equal(unsubscribes,0);
+});
+test('allowed service adapter aborts and detaches every injected entry on role exit', async () => {
+  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements();let signal,unsubscribes=0;
+  const services=allowedRoleServices({subscribeNotifications:async context=>{signal=context.signal;return()=>{unsubscribes+=1;};}}),lifecycle=R.createRoleServiceLifecycle({services,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:()=>{},storage:memoryStorage()});
+  await lifecycle.enter('driver',{sessionBinding:{accountRef:'driver-a',viewerRole:'driver'}});await lifecycle.idle();assert.equal(signal.aborted,false);for(const type of ['visibilitychange','pageshow','online'])assert.equal(eventTarget.listenerCount(type),1);
+  const left=lifecycle.leave();assert.equal(left.left,true);assert.equal(signal.aborted,true);assert.equal(unsubscribes,1);assert.equal(elements.action.listenerCount('click'),0);for(const type of ['visibilitychange','pageshow','online'])assert.equal(eventTarget.listenerCount(type),0);
+});
+test('allowed service adapter drops delayed old-account recovery after a role switch', async () => {
+  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),navigations=[];let releasePassenger;
+  const services=allowedRoleServices({readCurrentRide:context=>context.role==='passenger'?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({status:204})}),lifecycle=R.createRoleServiceLifecycle({services,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:page=>navigations.push(page),storage:memoryStorage()});
+  const old=lifecycle.enter('passenger',{sessionBinding:{accountRef:'passenger-a',viewerRole:'passenger'}});while(!releasePassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await lifecycle.enter('driver',{sessionBinding:{accountRef:'driver-b',viewerRole:'driver'}});releasePassenger({status:200,body:currentRideView('passenger')});const stale=await old;await lifecycle.idle();
+  assert.equal(fresh.entered,true);assert.equal(stale.reason,'stale_entry');assert.deepEqual(navigations,['driver-home']);assert.equal(lifecycle.snapshot().activeRole,'driver');const publicState=JSON.stringify(lifecycle.snapshot());assert.equal(publicState.includes('passenger-a'),false);assert.equal(publicState.includes('driver-b'),false);
+});
 test('role-page runtime stops safely when injected services are not configured', async () => {
   const {R}=setup(),views=[];let factories=0;
   const runtime=R.createRolePageRuntime({services:null,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
@@ -1599,7 +1645,7 @@ test('partial role service injection cannot be mistaken for a live connection', 
 test('configured role-page runtime enters once and preserves its generation across role navigation', async () => {
   const {R}=setup(),session={account:'private-passenger'},calls=[];let factories=0,clears=0;
   const lifecycle={snapshot:()=>({activeRole:'passenger'}),enter:async(role,options)=>{calls.push(['enter',role,options.sessionBinding]);return {entered:true,reason:'entered'};},leave:()=>{calls.push(['leave']);return {left:true};},idle:async()=>({})};
-  const services={configured:true,sessionForRole:()=>session,createRoleLifecycle(){}};
+  const services=allowedRoleServices({sessionForRole:()=>session});
   const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>{factories+=1;assert.equal(injected,services);return lifecycle;},clearUnavailable:()=>{clears+=1;}});
   assert.equal((await runtime.enter('home','passenger')).reason,'entered');assert.equal((await runtime.enter('passenger-history','passenger')).reason,'within_role');
   assert.equal(factories,1);assert.equal(calls.length,1);assert.equal(calls[0][2],session);assert.equal(runtime.snapshot().page,'passenger-history');assert.equal(runtime.snapshot().activeRole,'passenger');assert.ok(clears>=2);assert.equal(JSON.stringify(runtime.snapshot()).includes('private-passenger'),false);
@@ -1607,7 +1653,7 @@ test('configured role-page runtime enters once and preserves its generation acro
 });
 test('missing authenticated session blocks lifecycle creation and all service I/O', async () => {
   const {R}=setup(),views=[];let factories=0;
-  const services={configured:true,sessionForRole:()=>null,createRoleLifecycle(){}};
+  const services=allowedRoleServices({sessionForRole:()=>null});
   const runtime=R.createRolePageRuntime({services,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
   const result=await runtime.enter('driver-trips','driver');
   assert.equal(result.reason,'session_unavailable');assert.equal(factories,0);assert.equal(views[0].role,'driver');assert.match(views[0].title,/認証セッション/);assert.equal(views[0].disableCommands,true);assert.equal(views[0].action,null);
@@ -1615,7 +1661,7 @@ test('missing authenticated session blocks lifecycle creation and all service I/
 test('configured lifecycle entry failure stops and cannot be reused as an active page', async () => {
   const {R}=setup(),session={account:'private'},views=[];let entries=0,leaves=0;
   const lifecycle={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:false,reason:'entry_rejected'};},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
-  const services={configured:true,sessionForRole:()=>session,createRoleLifecycle(){}};
+  const services=allowedRoleServices({sessionForRole:()=>session});
   const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle,renderUnavailable:view=>views.push(view)});
   const first=await runtime.enter('home','passenger'),second=await runtime.enter('passenger-history','passenger');
   assert.equal(first.reason,'services_unavailable');assert.equal(second.reason,'services_unavailable');assert.equal(entries,2);assert.equal(leaves,2);assert.equal(views.length,2);assert.equal(runtime.snapshot().lastAction,'services_unavailable');
@@ -1623,7 +1669,7 @@ test('configured lifecycle entry failure stops and cannot be reused as an active
 test('role switch rejects a delayed old runtime entry without exposing session bindings', async () => {
   const {R}=setup(),passengerSession={account:'private-a'},driverSession={account:'private-b'};let releasePassenger;
   const lifecycle={snapshot:()=>({}),enter:role=>role==='passenger'?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({entered:true,reason:'entered'}),leave:()=>({left:true}),idle:async()=>({})};
-  const services={configured:true,sessionForRole:role=>role==='passenger'?passengerSession:driverSession,createRoleLifecycle(){}};
+  const services=allowedRoleServices({sessionForRole:role=>role==='passenger'?passengerSession:driverSession});
   const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle});
   const old=runtime.enter('home','passenger');while(!releasePassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await runtime.enter('driver-home','driver');releasePassenger({entered:true,reason:'entered'});const stale=await old;
   assert.equal(fresh.entered,true);assert.equal(stale.reason,'stale_entry');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().page,'driver-home');const publicState=JSON.stringify(runtime.snapshot());assert.equal(publicState.includes('private-a'),false);assert.equal(publicState.includes('private-b'),false);
@@ -1638,7 +1684,7 @@ test('role-page router attaches one hash listener and routes its current target'
 test('bottom-menu navigation preserves one injected role lifecycle generation', async () => {
   const {R}=setup(),target=recoveryEventTarget(),session={account:'private'},renders=[];let entries=0;
   const lifecycle={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:true,reason:'entered'};},leave:()=>({left:true}),idle:async()=>({})};
-  const services={configured:true,sessionForRole:()=>session,createRoleLifecycle(){}};
+  const services=allowedRoleServices({sessionForRole:()=>session});
   const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle});
   const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:page=>({page,role:'passenger'}),render:value=>renders.push(value.page)});
   assert.equal((await router.navigate('home')).navigated,true);assert.equal((await router.navigate('passenger-history')).reason,'within_role');assert.equal((await router.navigate('passenger-account')).reason,'within_role');

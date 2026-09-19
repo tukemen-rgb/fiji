@@ -1174,9 +1174,39 @@
     const idle=async()=>{await Promise.resolve();await feedback.idle();await Promise.resolve();if(attached&&!detached)dom.render();return snapshot();};
     return Object.freeze({snapshot,attach,activate,reconnect,refresh,reauthenticate,detach,idle});
   }
+  const roleServiceMethods=Object.freeze(['sessionForRole','readCurrentRide','subscribeNotifications','verifyLatest','handleNotificationHint','reauthenticate']);
+  function isAllowedRoleServiceProvider(services){
+    const keys=services&&typeof services==='object'&&!Array.isArray(services)?Object.keys(services).sort():[];
+    const allowed=['configured',...roleServiceMethods].sort();
+    return keys.join(',')===allowed.join(',')&&services.configured===true&&roleServiceMethods.every(name=>typeof services[name]==='function');
+  }
+  function createRoleServiceLifecycle({services,elements,eventTarget,documentState,navigate,storage=null,render=()=>{}}={}){
+    if(!isAllowedRoleServiceProvider(services)||!elements||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string'||typeof navigate!=='function'||typeof render!=='function')throw Error('役割サービスアダプターの設定が不正です。');
+    const fallback=new Map(),markerStorage=storage&&typeof storage.getItem==='function'&&typeof storage.setItem==='function'&&typeof storage.removeItem==='function'?storage:{getItem:key=>fallback.has(key)?fallback.get(key):null,setItem:(key,value)=>fallback.set(key,String(value)),removeItem:key=>fallback.delete(key)};
+    let lifecycle;
+    lifecycle=createRoleRecoveryLifecycle({
+      createRoleFlow({role,generation,sessionBinding}){
+        const guard=createCommandRestartGuard(markerStorage);guard.mark(role,'unresolved');
+        const commandUi=createCommandUiController(role);
+        const controller=createStartupRecoveryController({guard,role,principal:sessionBinding,readCurrentRide:request=>services.readCurrentRide(Object.freeze({role,generation,sessionBinding,request}))});
+        const uiAdapter=createStartupRecoveryUiAdapter({role,navigate,commandUi});
+        return createStartupRecoveryFlow({role,controller,uiAdapter,initiallyVisible:documentState.visibilityState!=='hidden'});
+      },
+      createEventBridge({flow,requestRecovery}){return createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery});},
+      createSubscriptionBridge({role,generation,sessionBinding}){
+        return createNotificationSubscriptionDomBridge({role,generation,lifecycle,elements,
+          subscribe:input=>services.subscribeNotifications(Object.freeze({role,generation,sessionBinding,signal:input.signal,onHint:input.onHint,onDisconnect:input.onDisconnect})),
+          onHint:hint=>services.handleNotificationHint(Object.freeze({role,generation,sessionBinding,hint})),
+          verifyLatest:()=>services.verifyLatest(Object.freeze({role,generation,sessionBinding})),
+          onReauthenticate:()=>services.reauthenticate(Object.freeze({role,generation,sessionBinding})),render
+        });
+      }
+    });
+    return lifecycle;
+  }
   function createRolePageRuntime({services=null,createLifecycle,renderUnavailable=()=>{},clearUnavailable=()=>{}}={}){
     if(createLifecycle!==undefined&&typeof createLifecycle!=='function'||typeof renderUnavailable!=='function'||typeof clearUnavailable!=='function')throw Error('役割ページランタイムの設定が不正です。');
-    const serviceState=services?.configured===true&&typeof services.sessionForRole==='function'&&typeof services.createRoleLifecycle==='function'&&typeof createLifecycle==='function'?'ready':'unconfigured';
+    const serviceState=isAllowedRoleServiceProvider(services)&&typeof createLifecycle==='function'?'ready':'unconfigured';
     let lifecycle=null,active=null,page='role',revision=0,lastAction='idle';const operations=new Set();
     const ownerOf=target=>Object.entries(pages).find(([,list])=>list.includes(target))?.[0]||null;
     const snapshot=()=>Object.freeze({page,activeRole:active?.role||null,serviceState,busy:operations.size>0,revision,lastAction});
@@ -1408,7 +1438,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1446,7 +1476,7 @@ const commandFeedbackDom=R.createCommandFeedbackDomBridge({commandUi,elements:{b
 const injectedRoleServices=window.FijiPrototypeServices||null;
 const rolePageRuntime=R.createRolePageRuntime({
   services:injectedRoleServices,
-  createLifecycle:services=>services.createRoleLifecycle({roles:R,elements:{box:$('command-feedback'),title:$('command-feedback-title'),message:$('command-feedback-message'),action:$('command-feedback-action'),commandButtons:document.querySelectorAll('[data-command-action]')}}),
+  createLifecycle:services=>R.createRoleServiceLifecycle({services,elements:{box:$('command-feedback'),title:$('command-feedback-title'),message:$('command-feedback-message'),action:$('command-feedback-action'),commandButtons:document.querySelectorAll('[data-command-action]')},eventTarget:window,documentState:document,navigate:page=>show(page),storage:restartStorage}),
   renderUnavailable:view=>{
     commandUi.setRole(view.role);
     commandUi.applyFeedback(view.role,commandUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});
@@ -1468,6 +1498,7 @@ function renderPage({page}) {
   if(page==='driver-requests')renderDriverRequests();
   if(page==='driver-trips')renderDriverTrips();
   if(page==='driver-account')renderDriverProfile();
+  const injectedLifecycleReady=rolePageRuntime.snapshot().serviceState==='ready';
   if(model.state.activeRole){
     commandUi.setRole(model.state.activeRole);
     if(startupRecovery&&!startupRecoveryApplied){
@@ -1475,9 +1506,9 @@ function renderPage({page}) {
       else{restartGuard.clear();startupRecovery=null;}
       startupRecoveryApplied=true;
     }
-    commandFeedbackDom.attach();
+    if(injectedLifecycleReady)commandFeedbackDom.detach();else commandFeedbackDom.attach();
   }else{commandUi.clear();commandFeedbackDom.detach();}
-  renderCommandFeedback();
+  if(!injectedLifecycleReady)renderCommandFeedback();
   try{history.replaceState(null,'','#'+page);}catch{}
   window.scrollTo({top:0,behavior:'instant'});
 }
