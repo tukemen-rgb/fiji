@@ -1628,8 +1628,56 @@ test('role switch rejects a delayed old runtime entry without exposing session b
   const old=runtime.enter('home','passenger');while(!releasePassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await runtime.enter('driver-home','driver');releasePassenger({entered:true,reason:'entered'});const stale=await old;
   assert.equal(fresh.entered,true);assert.equal(stale.reason,'stale_entry');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().page,'driver-home');const publicState=JSON.stringify(runtime.snapshot());assert.equal(publicState.includes('private-a'),false);assert.equal(publicState.includes('private-b'),false);
 });
-test('prototype show path is wired to the explicit role-page dependency runtime', () => {
-  assert.match(source,/window\.FijiPrototypeServices\|\|null/);assert.match(source,/rolePageRuntime\.enter\(page,model\.state\.activeRole\)/);assert.match(source,/rolePageRuntime\.leave\(\)/);
+test('role-page router attaches one hash listener and routes its current target', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),entries=[],renders=[];let hash='home';
+  const runtime={snapshot:()=>({}),enter:async(page,role)=>{entries.push([page,role]);return {entered:true,reason:'entered'};},leave:()=>({left:true}),idle:async()=>({})};
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>hash,resolve:page=>({page,role:'passenger'}),render:value=>renders.push(value.page)});
+  assert.equal(router.attach().started,true);assert.equal(router.attach().reason,'already_attached');assert.equal(target.listenerCount('hashchange'),1);assert.equal(target.addCount('hashchange'),1);
+  target.dispatch('hashchange');await router.idle();assert.deepEqual(entries,[['home','passenger']]);assert.deepEqual(renders,['home']);assert.equal(router.snapshot().page,'home');
+});
+test('bottom-menu navigation preserves one injected role lifecycle generation', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),session={account:'private'},renders=[];let entries=0;
+  const lifecycle={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:true,reason:'entered'};},leave:()=>({left:true}),idle:async()=>({})};
+  const services={configured:true,sessionForRole:()=>session,createRoleLifecycle(){}};
+  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle});
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:page=>({page,role:'passenger'}),render:value=>renders.push(value.page)});
+  assert.equal((await router.navigate('home')).navigated,true);assert.equal((await router.navigate('passenger-history')).reason,'within_role');assert.equal((await router.navigate('passenger-account')).reason,'within_role');
+  assert.equal(entries,1);assert.deepEqual(renders,['home','passenger-history','passenger-account']);assert.equal(runtime.snapshot().revision,3);assert.equal(router.snapshot().revision,3);
+});
+test('role chooser leaves the runtime before rendering the chooser', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),order=[];
+  const runtime={snapshot:()=>({}),enter:async()=>({entered:true}),leave:()=>{order.push('leave');return {left:true};},idle:async()=>({})};
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:()=>({page:'role',role:null}),render:()=>order.push('render')});
+  const result=await router.navigate('role');assert.equal(result.reason,'role_chooser');assert.deepEqual(order,['leave','render']);assert.equal(router.snapshot().activeRole,null);
+});
+test('rapid role navigation cannot repaint or restore a delayed old page', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),renders=[];let releasePassenger;
+  const runtime={snapshot:()=>({}),enter:(page,role)=>role==='passenger'?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({entered:true,reason:'entered'}),leave:()=>({left:true}),idle:async()=>({})};
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:page=>({page,role:page.startsWith('driver-')?'driver':'passenger'}),render:value=>renders.push(value.page)});
+  const old=router.navigate('home');while(!releasePassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await router.navigate('driver-home');releasePassenger({entered:true,reason:'entered'});const stale=await old;
+  assert.equal(fresh.navigated,true);assert.equal(stale.reason,'stale_navigation');assert.deepEqual(renders,['home','driver-home']);assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');
+});
+test('delayed failure from a departed role cannot replace the fresh router result', async () => {
+  const {R}=setup(),target=recoveryEventTarget();let rejectPassenger;
+  const runtime={snapshot:()=>({}),enter:(page,role)=>role==='passenger'?new Promise((resolve,reject)=>{rejectPassenger=reject;}):Promise.resolve({entered:true,reason:'entered'}),leave:()=>({left:true}),idle:async()=>({})};
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:page=>({page,role:page.startsWith('driver-')?'driver':'passenger'}),render:()=>{}});
+  const old=router.navigate('home');while(!rejectPassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await router.navigate('driver-home');rejectPassenger(Error('offline'));const stale=await old;
+  assert.equal(fresh.navigated,true);assert.equal(stale.reason,'stale_navigation');assert.equal(router.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');
+});
+test('detached role-page router ignores future hash changes and leaves its runtime', async () => {
+  const {R}=setup(),target=recoveryEventTarget();let entries=0,leaves=0,hash='home';
+  const runtime={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:true};},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>hash,resolve:page=>({page,role:'passenger'}),render:()=>{}});router.attach();router.detach();target.dispatch('hashchange');await Promise.resolve();
+  assert.equal(entries,0);assert.equal(leaves,1);assert.equal(target.listenerCount('hashchange'),0);assert.equal((await router.navigate('home')).reason,'router_detached');
+});
+test('invalid router destination stops before rendering or entering services', async () => {
+  const {R}=setup(),target=recoveryEventTarget();let entries=0,renders=0;
+  const runtime={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:true};},leave:()=>({left:true}),idle:async()=>({})};
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:()=>({page:'driver-home',role:'passenger'}),render:()=>{renders+=1;}});
+  const result=await router.navigate('driver-home');assert.equal(result.reason,'invalid_destination');assert.equal(entries,0);assert.equal(renders,0);
+});
+test('prototype show path is wired through one explicit role-page router', () => {
+  assert.match(source,/window\.FijiPrototypeServices\|\|null/);assert.match(source,/R\.createRolePageRouter\(/);assert.match(source,/rolePageRouter\.attach\(\)/);assert.match(source,/function show\(target\)\{return rolePageRouter\.navigate\(target\);\}/);
 });
 test('profile and contact/payment preferences survive an in-document role switch', () => {
   const {m}=setup(),p=passenger(m);

@@ -1,5 +1,8 @@
 # Passenger / driver entry, onboarding and role-specific screens
 
+## Latest acceptance update — one role-page router
+Direct `show()` calls, `hashchange`, bottom navigation and role selection now pass through one `createRolePageRouter`. It registers one hash listener, preserves the active injected runtime generation across pages owned by the same role, and leaves the role runtime before rendering the role chooser. A navigation revision prevents delayed entry success or failure from repainting, restoring or overwriting the result of a newer passenger/driver page after a rapid switch. Cross-role destinations stop before render or service entry, and detach removes the listener and rejects later navigation. The seven new cases use a fake event target and injected runtime; they do not claim real browser history/back-forward or service connectivity.
+
 ## Latest acceptance update — role-page dependency runtime
 The prototype's real `show()` path now enters and leaves a `createRolePageRuntime` boundary. Role services are opt-in dependencies: a provider must explicitly declare itself configured, return the current role's private authenticated-session binding and create the role lifecycle. Missing or partial providers and missing sessions stop before lifecycle creation or service I/O. The standalone prototype therefore shows a stopped, role-specific banner and locks state-changing controls instead of pretending that authentication, latest-state reads or notifications are connected. Same-role page navigation reuses the active generation; role/account replacement and role-chooser exit invalidate delayed entry completion, and public state does not expose the session binding. This is Node acceptance with injected fakes, not a real browser or backend connection.
 

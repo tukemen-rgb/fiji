@@ -1222,6 +1222,35 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(lifecycle)await lifecycle.idle();return snapshot();};
     return Object.freeze({snapshot,enter,leave,idle});
   }
+  function createRolePageRouter({runtime,eventTarget,readHash,resolve,render}){
+    if(!runtime||typeof runtime.snapshot!=='function'||typeof runtime.enter!=='function'||typeof runtime.leave!=='function'||typeof runtime.idle!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||typeof readHash!=='function'||typeof resolve!=='function'||typeof render!=='function')throw Error('役割ページルーターの設定が不正です。');
+    let attached=false,detached=false,page='role',activeRole=null,revision=0,lastAction='idle';const operations=new Set();
+    const snapshot=()=>Object.freeze({attached,detached,page,activeRole,revision,busy:operations.size>0,lastAction});
+    const navigate=target=>{
+      if(detached)return Promise.resolve({navigated:false,reason:'router_detached',state:snapshot()});
+      const requestRevision=++revision;let destination;
+      try{destination=resolve(target);}catch{lastAction='resolve_failed';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}
+      const role=destination?.role==='driver'?'driver':destination?.role==='passenger'?'passenger':null,nextPage=destination?.page;
+      if(typeof nextPage!=='string'||!role&&nextPage!=='role'||role&&!pages[role].includes(nextPage)){lastAction='invalid_destination';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}
+      page=nextPage;activeRole=role;
+      if(!role){runtime.leave();lastAction='role_chooser';try{render(destination);}catch{lastAction='render_failed';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}return Promise.resolve({navigated:true,reason:'role_chooser',state:snapshot()});}
+      try{render(destination);}catch{lastAction='render_failed';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}
+      lastAction='entering';let task;
+      task=Promise.resolve(runtime.enter(nextPage,role)).then(result=>{
+        if(requestRevision!==revision||page!==nextPage||activeRole!==role)return {navigated:false,reason:'stale_navigation',result,state:snapshot()};
+        const navigated=result?.entered===true;lastAction=navigated?result.reason||'entered':result?.reason||'entry_failed';return {navigated,reason:lastAction,result,state:snapshot()};
+      },()=>{
+        if(requestRevision!==revision||page!==nextPage||activeRole!==role)return {navigated:false,reason:'stale_navigation',state:snapshot()};
+        lastAction='entry_failed';return {navigated:false,reason:'entry_failed',state:snapshot()};
+      }).finally(()=>operations.delete(task));
+      operations.add(task);return task;
+    };
+    const onHashChange=()=>{void navigate(readHash());};
+    const attach=()=>{if(detached)return {started:false,reason:'router_detached',state:snapshot()};if(attached)return {started:false,reason:'already_attached',state:snapshot()};eventTarget.addEventListener('hashchange',onHashChange);attached=true;lastAction='attached';return {started:true,reason:'attached',state:snapshot()};};
+    const detach=()=>{if(detached)return snapshot();if(attached)eventTarget.removeEventListener('hashchange',onHashChange);attached=false;detached=true;revision+=1;activeRole=null;page='role';runtime.leave();lastAction='detached';return snapshot();};
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);await runtime.idle();return snapshot();};
+    return Object.freeze({snapshot,attach,navigate,detach,idle});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1379,7 +1408,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,createRolePageRuntime};
+    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1424,9 +1453,7 @@ const rolePageRuntime=R.createRolePageRuntime({
     commandFeedbackDom.render();
   }
 });
-function show(target) {
-  if(target==='role')model.leave();
-  const page=R.route(model.state.activeRole,model.state.profile,target);
+function renderPage({page}) {
   state.page=page;
   document.querySelectorAll('.page').forEach(el=>el.hidden=el.id!==page+'-page');
   $('current-role').textContent=model.state.activeRole==='passenger'?'利用者 · DEMO':model.state.activeRole==='driver'?'運転手 · DEMO':'DEMO';
@@ -1449,12 +1476,18 @@ function show(target) {
       startupRecoveryApplied=true;
     }
     commandFeedbackDom.attach();
-    void rolePageRuntime.enter(page,model.state.activeRole);
-  }else{rolePageRuntime.leave();commandUi.clear();commandFeedbackDom.detach();}
+  }else{commandUi.clear();commandFeedbackDom.detach();}
   renderCommandFeedback();
   try{history.replaceState(null,'','#'+page);}catch{}
   window.scrollTo({top:0,behavior:'instant'});
 }
+const rolePageRouter=R.createRolePageRouter({
+  runtime:rolePageRuntime,eventTarget:window,readHash:()=>location.hash.slice(1)||'role',
+  resolve:target=>{if(target==='role')model.leave();const page=R.route(model.state.activeRole,model.state.profile,target);return {page,role:model.state.activeRole};},
+  render:renderPage
+});
+rolePageRouter.attach();
+function show(target){return rolePageRouter.navigate(target);}
 function openDialog(id) { if (!$(id).open) $(id).showModal(); }
 document.querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click',()=>show(b.dataset.nav)));
 document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click',()=>$(b.dataset.close).close()));
@@ -1690,7 +1723,6 @@ $('role-switch').onclick=()=>show('role');
 $('choose-passenger').onclick=()=>show(model.chooseRole('passenger'));
 $('choose-driver').onclick=()=>show(model.chooseRole('driver'));
 $('open-reviewed-driver').onclick=()=>{model.useReviewedFixture();show('driver-home');toast('審査済みの別の見本を開きました。申請中の情報は変わりません。');};
-window.addEventListener('hashchange',()=>show(location.hash.slice(1)||'role'));
 $('fill-passenger').onclick=()=>{
   const form=$('passenger-form').elements;
   const sample={name:'Sample Guest',phone:'+819000000000',email:'guest@example.com',language:'ja',pickup:'Ramada Wailoaloa · デモ',payment:'cash'};

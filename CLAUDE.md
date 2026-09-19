@@ -1,5 +1,12 @@
 # Claude implementation brief — role-separated onboarding, minimalist UI, taxi verification
 
+## GDP role-page router update — 2026-09-19
+- `createRolePageRouter` is now the single entry for direct `show()` calls and `hashchange` navigation. The prior standalone hash listener and direct runtime call were removed, so bottom-menu, role-selection and browser-hash paths share one navigation revision.
+- Same-role passenger/driver pages reuse one injected runtime generation. Returning to the role chooser calls runtime leave before rendering; invalid cross-role destinations stop before render or service entry; detach removes the hash listener and rejects later navigation.
+- A delayed page entry cannot repaint or restore an older page after a rapid role switch. Router snapshots expose page, role and revision only, not the injected session binding.
+- Seven executable acceptance cases cover single listener registration, hash navigation, same-role menu reuse, leave-before-render, delayed cross-role success/failure, detach and invalid destinations. The required Node suites now pass 322/322 with no failures or TODOs; the nine-operation API checker and local loopback HTTP contract groups also pass.
+- Tests use a fake event target and injected lifecycle. Actual browser history/back-forward behavior, authentication, HTTP/DB, Push/WebSocket, Android, cross-device state and Claude production implementation remain unconnected and unverified.
+
 ## GDP role-page dependency runtime update — 2026-09-19
 - `createRolePageRuntime` now connects the prototype `show()` role-page entry/exit path to an explicitly injected lifecycle provider. A provider must opt in with `configured: true`, supply a stable private session for the selected role and supply a lifecycle factory; partial or absent injection never starts recovery, subscription or authentication I/O.
 - The default standalone prototype has no provider. It therefore displays a role-specific stopped banner stating that authentication, notifications and latest-state communication are not running, locks state-changing controls and offers no reconnect action. This is intentionally not a simulated success path.
