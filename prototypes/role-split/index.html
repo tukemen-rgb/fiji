@@ -1156,7 +1156,7 @@
     };
     const onClick=()=>{void run();};
     const attach=()=>{if(attached)return {started:false,reason:'already_attached',state:snapshot()};attached=true;generation+=1;lastEvent='attached';action.addEventListener('click',onClick);paint();return {started:true,reason:'attached',state:snapshot()};};
-    const detach=()=>{if(attached)action.removeEventListener('click',onClick);attached=false;busy=false;generation+=1;lastEvent='detached';box.hidden=true;action.hidden=true;action.disabled=true;attr(box,'aria-busy','false');attr(action,'aria-disabled','true');return snapshot();};
+    const detach=()=>{if(attached)action.removeEventListener('click',onClick);attached=false;busy=false;generation+=1;lastEvent='detached';box.hidden=true;action.hidden=true;action.disabled=true;attr(box,'aria-busy','false');attr(action,'aria-disabled','true');for(const button of commandButtons){button.disabled=false;attr(button,'aria-disabled','false');}return snapshot();};
     return Object.freeze({snapshot,attach,render:paint,activate:run,detach});
   }
   function createNotificationSubscriptionDomBridge({role,generation,lifecycle,elements,subscribe,onHint,verifyLatest,onReauthenticate=async()=>({requested:true}),render=()=>{}}){
