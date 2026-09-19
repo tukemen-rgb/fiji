@@ -1028,7 +1028,14 @@
     };
     const startConnection=kind=>{
       const token=++version;commandsLocked=true;action=null;guidance=kind==='initial'?'connecting':'retrying';lastEvent=guidance;
-      const bridge=createAsyncNotificationSubscriptionBridge({subscribe:({signal,onHint:deliver})=>subscribe(Object.freeze({signal,onHint:deliver,onDisconnect:()=>disconnected(token)})),onHint});
+      let bridge;
+      const settleNotification=result=>{
+        if(result?.reason==='notification_failed'&&active(token,bridge)){
+          commandsLocked=true;action='refresh';guidance='verification_connectivity';lastEvent='notification_failed';paint();
+        }
+        return result;
+      };
+      bridge=createAsyncNotificationSubscriptionBridge({subscribe:({signal,onHint:deliver})=>subscribe(Object.freeze({signal,onHint:hint=>Promise.resolve(deliver(hint)).then(settleNotification),onDisconnect:()=>disconnected(token)})),onHint});
       current={token,bridge};bridge.attach();paint();
       const settled=tracked((async()=>{
         await bridge.idle();
