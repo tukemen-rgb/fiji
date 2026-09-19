@@ -1207,7 +1207,7 @@
   function createRolePageRuntime({services=null,createLifecycle,renderUnavailable=()=>{},clearUnavailable=()=>{}}={}){
     if(createLifecycle!==undefined&&typeof createLifecycle!=='function'||typeof renderUnavailable!=='function'||typeof clearUnavailable!=='function')throw Error('役割ページランタイムの設定が不正です。');
     const serviceState=isAllowedRoleServiceProvider(services)&&typeof createLifecycle==='function'?'ready':'unconfigured';
-    let lifecycle=null,active=null,page='role',revision=0,lastAction='idle';const operations=new Set();
+    let lifecycle=null,active=null,pendingEntry=null,page='role',revision=0,lastAction='idle';const operations=new Set();
     const ownerOf=target=>Object.entries(pages).find(([,list])=>list.includes(target))?.[0]||null;
     const snapshot=()=>Object.freeze({page,activeRole:active?.role||null,serviceState,busy:operations.size>0,revision,lastAction});
     const feedback=(role,reason)=>Object.freeze({role,outcome:reason==='session_unavailable'?'reauth':'unresolved',title:reason==='session_unavailable'?'認証セッションを確認できません':'接続サービスは未設定です',message:reason==='session_unavailable'?'安全のため通信と状態変更を停止しました。役割選択へ戻り、再ログイン後に開き直してください。':'認証・通知・最新状態の通信は行っていません。試作画面の確認だけ利用できます。',disableCommands:true,action:reason==='session_unavailable'?'reauth':null});
@@ -1224,28 +1224,33 @@
       lifecycle=created;return lifecycle;
     };
     const enter=(target,role)=>{
-      const requestRevision=++revision,normalized=role==='driver'?'driver':role==='passenger'?'passenger':null,targetRole=ownerOf(target);
-      if(!normalized||targetRole!==normalized){lastAction=targetRole?'role_mismatch':'unknown_page';return Promise.resolve({entered:false,reason:lastAction,state:snapshot()});}
+      const normalized=role==='driver'?'driver':role==='passenger'?'passenger':null,targetRole=ownerOf(target);
+      if(!normalized||targetRole!==normalized){revision+=1;lastAction=targetRole?'role_mismatch':'unknown_page';return Promise.resolve({entered:false,reason:lastAction,state:snapshot()});}
       page=target;
-      if(serviceState!=='ready')return Promise.resolve(stop(normalized,'services_unavailable'));
+      if(serviceState!=='ready'){revision+=1;return Promise.resolve(stop(normalized,'services_unavailable'));}
       let sessionBinding;
-      try{sessionBinding=services.sessionForRole(normalized);}catch{return Promise.resolve(stop(normalized,'session_unavailable'));}
-      if(!sessionBinding||typeof sessionBinding!=='object'||Array.isArray(sessionBinding))return Promise.resolve(stop(normalized,'session_unavailable'));
-      if(active?.role===normalized&&active.sessionBinding===sessionBinding){lastAction='within_role';try{clearUnavailable();}catch{}return Promise.resolve({entered:true,reason:'within_role',state:snapshot()});}
+      try{sessionBinding=services.sessionForRole(normalized);}catch{revision+=1;return Promise.resolve(stop(normalized,'session_unavailable'));}
+      if(!sessionBinding||typeof sessionBinding!=='object'||Array.isArray(sessionBinding)){revision+=1;return Promise.resolve(stop(normalized,'session_unavailable'));}
+      if(active?.role===normalized&&active.sessionBinding===sessionBinding){
+        if(active.ready===true){revision+=1;lastAction='within_role';try{clearUnavailable();}catch{}return Promise.resolve({entered:true,reason:'within_role',state:snapshot()});}
+        if(pendingEntry){lastAction='entry_joined';return pendingEntry;}
+      }
+      const requestRevision=++revision;
       let runtime;
       try{runtime=ensureLifecycle();}catch{return Promise.resolve(stop(normalized,'services_unavailable'));}
-      active=Object.freeze({role:normalized,sessionBinding});lastAction='entering';try{clearUnavailable();}catch{}
+      const activeEntry=Object.freeze({role:normalized,sessionBinding,ready:false});active=activeEntry;lastAction='entering';try{clearUnavailable();}catch{}
       let task;
       task=Promise.resolve(runtime.enter(normalized,{sessionBinding})).then(result=>{
-        if(requestRevision!==revision||active?.role!==normalized||active?.sessionBinding!==sessionBinding)return {entered:false,reason:'stale_entry',result,state:snapshot()};
+        if(requestRevision!==revision||active!==activeEntry)return {entered:false,reason:'stale_entry',result,state:snapshot()};
         const entered=result?.entered===true||result?.reason==='already_entered';lastAction=entered?'entered':result?.reason||'entry_failed';
         if(!entered)return {...stop(normalized,'services_unavailable'),result};
+        active=Object.freeze({role:normalized,sessionBinding,ready:true});
         return {entered,reason:lastAction,result,state:snapshot()};
-      },()=>stop(normalized,'services_unavailable')).finally(()=>operations.delete(task));
-      operations.add(task);return task;
+      },()=>requestRevision!==revision||active!==activeEntry?{entered:false,reason:'stale_entry',state:snapshot()}:stop(normalized,'services_unavailable')).finally(()=>{operations.delete(task);if(pendingEntry===task)pendingEntry=null;});
+      pendingEntry=task;operations.add(task);return task;
     };
     const leave=()=>{
-      revision+=1;const previous=active;active=null;page='role';lastAction=previous?'left':'not_entered';
+      revision+=1;const previous=active;active=null;pendingEntry=null;page='role';lastAction=previous?'left':'not_entered';
       try{lifecycle?.leave();}catch{}try{clearUnavailable();}catch{}
       return {left:Boolean(previous),reason:lastAction,state:snapshot()};
     };
@@ -1254,8 +1259,8 @@
   }
   function createRolePageRouter({runtime,eventTarget,readHash,resolve,render}){
     if(!runtime||typeof runtime.snapshot!=='function'||typeof runtime.enter!=='function'||typeof runtime.leave!=='function'||typeof runtime.idle!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||typeof readHash!=='function'||typeof resolve!=='function'||typeof render!=='function')throw Error('役割ページルーターの設定が不正です。');
-    let attached=false,detached=false,page='role',activeRole=null,revision=0,lastAction='idle';const operations=new Set();
-    const snapshot=()=>Object.freeze({attached,detached,page,activeRole,revision,busy:operations.size>0,lastAction});
+    let attached=false,detached=false,page='role',activeRole=null,revision=0,lastAction='idle',authSyncTask=null,authSyncQueued=false;const operations=new Set();
+    const snapshot=()=>Object.freeze({attached,detached,page,activeRole,revision,busy:operations.size>0||Boolean(authSyncTask),lastAction});
     const navigate=target=>{
       if(detached)return Promise.resolve({navigated:false,reason:'router_detached',state:snapshot()});
       const requestRevision=++revision;let destination;
@@ -1276,10 +1281,17 @@
       operations.add(task);return task;
     };
     const onHashChange=()=>{void navigate(readHash());};
-    const onAuthSessionChanged=()=>{if(activeRole&&page!=='role')void navigate(page);};
+    const syncAuthSession=()=>{
+      if(detached||!activeRole||page==='role')return Promise.resolve({navigated:false,reason:'auth_sync_unavailable',state:snapshot()});
+      authSyncQueued=true;if(authSyncTask)return authSyncTask;
+      let task;
+      task=Promise.resolve().then(async()=>{let result;while(authSyncQueued&&!detached&&activeRole&&page!=='role'){authSyncQueued=false;result=await navigate(page);}return result||{navigated:false,reason:'auth_sync_cancelled',state:snapshot()};}).finally(()=>{if(authSyncTask===task)authSyncTask=null;});
+      authSyncTask=task;return task;
+    };
+    const onAuthSessionChanged=()=>{void syncAuthSession();};
     const attach=()=>{if(detached)return {started:false,reason:'router_detached',state:snapshot()};if(attached)return {started:false,reason:'already_attached',state:snapshot()};eventTarget.addEventListener('hashchange',onHashChange);eventTarget.addEventListener('fiji:auth-session-changed',onAuthSessionChanged);attached=true;lastAction='attached';return {started:true,reason:'attached',state:snapshot()};};
-    const detach=()=>{if(detached)return snapshot();if(attached){eventTarget.removeEventListener('hashchange',onHashChange);eventTarget.removeEventListener('fiji:auth-session-changed',onAuthSessionChanged);}attached=false;detached=true;revision+=1;activeRole=null;page='role';runtime.leave();lastAction='detached';return snapshot();};
-    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);await runtime.idle();return snapshot();};
+    const detach=()=>{if(detached)return snapshot();if(attached){eventTarget.removeEventListener('hashchange',onHashChange);eventTarget.removeEventListener('fiji:auth-session-changed',onAuthSessionChanged);}attached=false;detached=true;authSyncQueued=false;revision+=1;activeRole=null;page='role';runtime.leave();lastAction='detached';return snapshot();};
+    const idle=async()=>{while(authSyncTask||operations.size>0){if(authSyncTask)await authSyncTask;if(operations.size>0)await Promise.all([...operations]);}await runtime.idle();return snapshot();};
     return Object.freeze({snapshot,attach,navigate,detach,idle});
   }
   function create(){

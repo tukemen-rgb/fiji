@@ -1661,6 +1661,30 @@ test('auth session listener is single, ignores event payload and is removed with
   const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>({page:targetPage,role:'passenger'}),render:value=>{page=value.page;}});router.attach();router.attach();await router.navigate('home');target.dispatch('fiji:auth-session-changed',{detail:{role:'driver',sessionBinding:{accountRef:'injected'}}});await router.idle();
   assert.equal(target.listenerCount('fiji:auth-session-changed'),1);assert.equal(target.addCount('fiji:auth-session-changed'),1);assert.deepEqual(entries,[['home','passenger'],['home','passenger']]);assert.equal(JSON.stringify(entries).includes('injected'),false);router.detach();assert.equal(target.listenerCount('fiji:auth-session-changed'),0);target.dispatch('fiji:auth-session-changed');await Promise.resolve();assert.equal(entries.length,2);
 });
+test('same-session entry joins the pending lifecycle and never reports success early', async () => {
+  const {R}=setup(),session=Object.freeze({accountRef:'passenger-a'});let release,calls=0,settled=false;
+  const lifecycle={snapshot:()=>({}),enter:()=>{calls+=1;return new Promise(resolve=>{release=resolve;});},leave:()=>({left:true}),idle:async()=>({})};
+  const runtime=R.createRolePageRuntime({services:allowedRoleServices({sessionForRole:()=>session}),createLifecycle:()=>lifecycle});
+  const first=runtime.enter('home','passenger');while(!release)await new Promise(resolve=>setImmediate(resolve));const joined=runtime.enter('passenger-history','passenger');joined.then(()=>{settled=true;});await Promise.resolve();
+  assert.equal(first,joined);assert.equal(calls,1);assert.equal(settled,false);assert.equal(runtime.snapshot().lastAction,'entry_joined');assert.equal(runtime.snapshot().busy,true);
+  release({entered:true,reason:'entered'});const [one,two]=await Promise.all([first,joined]);assert.equal(one.entered,true);assert.equal(two.entered,true);assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(runtime.snapshot().page,'passenger-history');
+});
+test('a delayed old-session rejection cannot stop a newer successful entry', async () => {
+  const {R}=setup(),accountA=Object.freeze({accountRef:'passenger-a'}),accountB=Object.freeze({accountRef:'passenger-b'});let session=accountA,rejectOld,leaves=0;
+  const lifecycle={snapshot:()=>({}),enter:(_role,{sessionBinding})=>sessionBinding===accountA?new Promise((_resolve,reject)=>{rejectOld=reject;}):Promise.resolve({entered:true,reason:'entered'}),leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
+  const runtime=R.createRolePageRuntime({services:allowedRoleServices({sessionForRole:()=>session}),createLifecycle:()=>lifecycle});
+  const old=runtime.enter('home','passenger');while(!rejectOld)await new Promise(resolve=>setImmediate(resolve));session=accountB;const fresh=await runtime.enter('passenger-history','passenger');rejectOld(Error('old session failed'));const stale=await old;
+  assert.equal(fresh.entered,true);assert.equal(stale.reason,'stale_entry');assert.equal(runtime.snapshot().activeRole,'passenger');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(leaves,0);assert.equal(JSON.stringify(runtime.snapshot()).includes('passenger-a'),false);assert.equal(JSON.stringify(runtime.snapshot()).includes('passenger-b'),false);
+});
+test('auth-change bursts coalesce before and during a pending fresh-session entry', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),accountA=Object.freeze({accountRef:'passenger-a'}),accountB=Object.freeze({accountRef:'passenger-b'});let session=accountA,page='role',releaseFresh,calls=0;
+  const lifecycle={snapshot:()=>({}),enter:(_role,{sessionBinding})=>{calls+=1;return sessionBinding===accountB?new Promise(resolve=>{releaseFresh=resolve;}):Promise.resolve({entered:true,reason:'entered'});},leave:()=>({left:true}),idle:async()=>({})};
+  const runtime=R.createRolePageRuntime({services:allowedRoleServices({sessionForRole:()=>session}),createLifecycle:()=>lifecycle});
+  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>({page:targetPage,role:'passenger'}),render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');session=accountB;
+  target.dispatch('fiji:auth-session-changed');target.dispatch('fiji:auth-session-changed');target.dispatch('fiji:auth-session-changed');while(!releaseFresh)await new Promise(resolve=>setImmediate(resolve));assert.equal(calls,2);assert.equal(router.snapshot().revision,2);assert.equal(router.snapshot().lastAction,'entering');
+  target.dispatch('fiji:auth-session-changed');target.dispatch('fiji:auth-session-changed');await Promise.resolve();assert.equal(calls,2);releaseFresh({entered:true,reason:'entered'});await router.idle();
+  assert.equal(calls,2);assert.equal(router.snapshot().revision,3);assert.equal(router.snapshot().lastAction,'within_role');assert.equal(runtime.snapshot().lastAction,'within_role');assert.equal(router.snapshot().busy,false);
+});
 test('role-page runtime stops safely when injected services are not configured', async () => {
   const {R}=setup(),views=[];let factories=0;
   const runtime=R.createRolePageRuntime({services:null,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
