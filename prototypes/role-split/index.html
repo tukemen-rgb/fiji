@@ -993,6 +993,7 @@
       if(guidance==='retrying')return Object.freeze({title:`${subject}の通知を再接続中`,message:'接続が終わるまで状態を変更しないでください。',disableCommands:true,action:null});
       if(guidance==='verifying')return Object.freeze({title:`${subject}の最新状態を確認中`,message:'確認が終わるまで状態を変更しないでください。',disableCommands:true,action:null});
       if(guidance==='verification_connectivity')return Object.freeze({title:`${subject}の最新状態を取得できません`,message:'通信を確認し、「最新状態を確認する」を押してください。',disableCommands:true,action:'refresh'});
+      if(guidance==='verification_failed')return Object.freeze({title:`${subject}の最新状態を確認できません`,message:'自動確認は停止しました。通信を確認してサポートへ連絡してください。',disableCommands:true,action:null});
       if(guidance==='reauth')return Object.freeze({title:'再ログインが必要です',message:`${subject}の最新状態を確認するため、再ログインしてください。`,disableCommands:true,action:'reauth'});
       if(guidance==='reauthenticating')return Object.freeze({title:'再ログインへ移動中',message:'安全な認証画面を開いています。状態を変更しないでください。',disableCommands:true,action:null});
       if(guidance==='reauth_pending')return Object.freeze({title:'再ログインを完了してください',message:'完了後に役割画面へ入り直すまで状態変更を停止します。',disableCommands:true,action:null});
@@ -1017,7 +1018,9 @@
       if(result?.verified===true){commandsLocked=false;action=null;guidance='connected';lastEvent=manual?'verification_refreshed':'reconnected';paint();return {reconnected:!manual,verified:true,reason:manual?'verification_refreshed':'reconnected',state:snapshot()};}
       if(status===401||status===403){commandsLocked=true;action='reauth';guidance='reauth';lastEvent='verification_reauthentication_required';paint();return {reconnected:false,verified:false,reason:'reauthentication_required',state:snapshot()};}
       if(status===404){commandsLocked=false;action=null;guidance='empty';lastEvent='verification_empty';paint();return {reconnected:true,verified:false,reason:'ride_not_found',state:snapshot()};}
-      if(result?.network===true||status===0||status===429||status>=500){commandsLocked=true;action='refresh';guidance='verification_connectivity';lastEvent='verification_connectivity_required';paint();return {reconnected:false,verified:false,reason:'connectivity_required',state:snapshot()};}
+      if(result?.network===true||status===0||status===429||status>=500){
+        commandsLocked=true;action=manual?null:'refresh';guidance=manual?'verification_failed':'verification_connectivity';lastEvent=manual?'verification_refresh_failed':'verification_connectivity_required';paint();return {reconnected:false,verified:false,reason:manual?'verification_refresh_failed':'connectivity_required',state:snapshot()};
+      }
       fail('reconnect');return {reconnected:false,verified:false,reason:'verification_failed',state:snapshot()};
     };
     const verifyConnection=async(token,bridge,manual=false)=>{
@@ -1092,7 +1095,7 @@
     if(!normalized||!Number.isInteger(generation)||generation<1||!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.handleSubscriptionAction!=='function'||!commandUi||typeof commandUi.snapshot!=='function'||typeof commandUi.applyFeedback!=='function'||initial?.role!==normalized||(listens&&(typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'))||typeof subscribe!=='function'||typeof onHint!=='function'||typeof verifyLatest!=='function'||typeof onReauthenticate!=='function'||typeof render!=='function')throw Error('通知購読フィードバック接続の設定が不正です。');
     const uiGeneration=initial.generation;let attached=false,detached=false,version=0,handledEvents=0,lastEvent='idle';const operations=new Set();let subscription;
     const current=()=>{const state=lifecycle.snapshot(),ui=commandUi.snapshot();return attached&&!detached&&state.activeRole===normalized&&state.generation===generation&&ui.role===normalized&&ui.generation===uiGeneration;};
-    const outcome=state=>state.busy||['connecting','retrying','verifying','reauthenticating'].includes(state.guidance)?'pending':['reauth','reauth_pending'].includes(state.guidance)?'reauth':['connectivity','verification_connectivity','retry_failed'].includes(state.guidance)?'unresolved':state.guidance==='empty'?'confirmed':'idle';
+    const outcome=state=>state.busy||['connecting','retrying','verifying','reauthenticating'].includes(state.guidance)?'pending':['reauth','reauth_pending'].includes(state.guidance)?'reauth':['connectivity','verification_connectivity','verification_failed','retry_failed'].includes(state.guidance)?'unresolved':state.guidance==='empty'?'confirmed':'idle';
     const snapshot=()=>{const state=subscription?.snapshot?.()||{};return Object.freeze({attached,detached,busy:operations.size>0||Boolean(state.busy),handledEvents,lastEvent,action:state.action||null,commandsLocked:Boolean(state.commandsLocked)});};
     const paint=token=>{
       if(token!==version||!current())return false;
