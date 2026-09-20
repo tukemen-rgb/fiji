@@ -54,6 +54,33 @@ test('client-decoded Google claims remain input assistance until trusted server 
   const verified=R.googleIdentityConnectionView({credentialImported:true,verification:{source:'authenticated_server',signature:true,audience:true,issuer:true,notExpired:true}});
   assert.deepEqual({...verified},{state:'verified',label:'Google本人確認済み',canAuthenticate:true,persistSubject:true});
 });
+test('Google input assistance registration snapshot strips unverified link and subject claims', () => {
+  const {R}=setup();
+  const snapshot=R.googleIdentityRegistrationSnapshot({
+    credentialImported:true,googleLinked:true,googleSub:'10769150350006150715113082367',serverVerified:true,
+    verification:{source:'client',signature:true,audience:true,issuer:true,notExpired:true}
+  });
+  assert.deepEqual({...snapshot},{
+    googleInputAssisted:true,googleIdentityState:'unverified',
+    label:'Google入力補助済み（本人確認未接続）',canAuthenticate:false,needsServerRefresh:false
+  });
+  assert.equal('googleLinked' in snapshot,false);assert.equal('googleSub' in snapshot,false);assert.equal('subject' in snapshot,false);
+});
+test('Google identity cannot be restored as verified or authenticating from client storage', () => {
+  const {R}=setup();
+  const tampered=JSON.stringify({
+    googleInputAssisted:true,googleIdentityState:'verified',googleLinked:true,
+    googleSub:'10769150350006150715113082367',subject:'10769150350006150715113082367',
+    canAuthenticate:true,verification:{source:'authenticated_server',signature:true,audience:true,issuer:true,notExpired:true}
+  });
+  const restored=R.restoreGoogleIdentityRegistrationSnapshot(tampered);
+  assert.deepEqual({...restored},{
+    googleInputAssisted:true,googleIdentityState:'unverified',
+    label:'Google入力補助済み（本人確認未接続）',canAuthenticate:false,needsServerRefresh:false
+  });
+  const corrupt=R.restoreGoogleIdentityRegistrationSnapshot('{bad json');
+  assert.equal(corrupt.googleIdentityState,'unavailable');assert.equal(corrupt.canAuthenticate,false);
+});
 test('Google Maps reports connected only after API load and map idle, then fails closed', () => {
   const {R}=setup();
   assert.deepEqual({...R.googleMapsConnectionView({})},{state:'demo',label:'略地図・デモ表示（Google Maps 未接続）',live:false,action:'configure'});

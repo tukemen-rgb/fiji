@@ -1326,6 +1326,27 @@
     if(input.credentialImported===true)return Object.freeze({state:'input_assist',label:'Google入力補助（本人確認未接続）',canAuthenticate:false,persistSubject:false});
     return Object.freeze({state:'unavailable',label:'Google入力補助は未接続',canAuthenticate:false,persistSubject:false});
   }
+  // Only non-authoritative input-assistance metadata may cross the local
+  // registration-storage boundary. Identity must be re-established from an
+  // authenticated server response after every reload.
+  function googleIdentityRegistrationSnapshot(input={}){
+    const view=googleIdentityConnectionView(input);
+    const assisted=view.state==='input_assist'||input.googleInputAssisted===true;
+    return Object.freeze({
+      googleInputAssisted:assisted,
+      googleIdentityState:assisted?'unverified':'unavailable',
+      label:assisted?'Google入力補助済み（本人確認未接続）':'Google入力補助は未接続',
+      canAuthenticate:false,
+      needsServerRefresh:view.state==='verified'
+    });
+  }
+  function restoreGoogleIdentityRegistrationSnapshot(value){
+    let input={};
+    try{input=typeof value==='string'?JSON.parse(value):value||{};}catch{}
+    // Local storage can be edited by the client. Never restore linked,
+    // verified, subject, or authentication authority from it.
+    return googleIdentityRegistrationSnapshot({googleInputAssisted:input.googleInputAssisted===true});
+  }
   function googleMapsConnectionView(input={}){
     if(input.authFailure===true||input.loadFailed===true)return Object.freeze({state:'failed',label:'略地図・デモ表示（Google Maps 接続失敗）',live:false,action:'retry'});
     if(input.configured===true&&input.apiLoaded===true&&input.mapIdle===true)return Object.freeze({state:'connected',label:'Google Maps 接続済み',live:true,action:null});
@@ -1489,7 +1510,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleMapsConnectionView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
