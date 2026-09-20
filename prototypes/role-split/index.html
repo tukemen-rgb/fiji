@@ -1427,6 +1427,12 @@
     if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw Error('メールアドレスを確認してください。');
     return Object.freeze({name,phone:normalizedPhone,email,language:['ja','en'].includes(input.language)?input.language:'ja',pickup,payment:['cash','card'].includes(input.payment)?input.payment:'cash',consent:true});
   }
+  function googlePlaceDestination(place={}){
+    const location=place.location,lat=typeof location?.lat==='function'?Number(location.lat()):Number(location?.lat),lng=typeof location?.lng==='function'?Number(location.lng()):Number(location?.lng);
+    if(!Number.isFinite(lat)||!Number.isFinite(lng))return null;
+    const label=text(place.formattedAddress||place.displayName,160)||'選択した地点';
+    return Object.freeze({label,route:Object.freeze({lat,lng})});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1596,7 +1602,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,passengerRegistrationInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,passengerRegistrationInput,googlePlaceDestination,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1936,7 +1942,8 @@ $('connect-maps').onclick = async () => {
       const ac = new PlaceAutocompleteElement({includedRegionCodes:['fj']});
       ac.addEventListener('gmp-select',async e=>{
         try { const p=e.placePrediction.toPlace(); await p.fetchFields({fields:['displayName','formattedAddress','location']});
-          if(!p.location)return; state.destination={lat:p.location.lat(),lng:p.location.lng()};$('destination').value=p.displayName||p.formattedAddress||'選択した地点';
+          const selected=R.googlePlaceDestination(p);if(!selected)return;if(!invalidateCurrentSearch({destination:selected.label}))return;
+          state.destination=selected.route;$('destination').value=selected.label;
           await drawRoute();
         }catch{toast('目的地を取得できません。再選択してください。');}
       });

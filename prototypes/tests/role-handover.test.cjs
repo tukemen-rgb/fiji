@@ -119,6 +119,22 @@ test('Google Maps retry rejects stale callbacks and auth failure removes connect
   assert.equal(maps.snapshot().state,'connected');assert.equal(maps.snapshot().locationReady,false);
   assert.equal(maps.snapshot().label,'Google Maps 接続済み');
 });
+test('Google place selection uses a stable address and rejects missing coordinates', () => {
+  const {R}=setup();
+  const selected=R.googlePlaceDestination({displayName:'Airport',formattedAddress:'Nadi International Airport, Fiji',location:{lat:()=>-17.755,lng:()=>177.443}});
+  assert.deepEqual({...selected},{label:'Nadi International Airport, Fiji',route:selected.route});
+  assert.deepEqual({...selected.route},{lat:-17.755,lng:177.443});
+  assert.equal(R.googlePlaceDestination({displayName:'No location'}),null);
+  assert.equal(R.googlePlaceDestination({location:{lat:NaN,lng:177.443}}),null);
+});
+test('Google place selection invalidates old quotes before replacing the route destination', () => {
+  assert.match(source,/const selected=R\.googlePlaceDestination\(p\);if\(!selected\)return;if\(!invalidateCurrentSearch\(\{destination:selected\.label\}\)\)return;\s*state\.destination=selected\.route;\$\('destination'\)\.value=selected\.label;/);
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Nadi Town'}),offer=m.getOffers(ride.id)[0];
+  const selected=R.googlePlaceDestination({displayName:'Airport',formattedAddress:'Nadi International Airport, Fiji',location:{lat:-17.755,lng:177.443}});
+  assert.equal(m.invalidateRideSearch(ride.id,{destination:selected.label}).invalidated,true);
+  assert.equal(ride.status,'cancelled');assert.equal(offer.status,'expired');assert.throws(()=>m.selectOffer(offer.id));
+});
 test('manual pickup survives map and geolocation failure and can still create a request', () => {
   const {R,m}=setup(),pickup=R.createPickupInputController('Ramada Wailoaloa');
   const locating=pickup.beginLocation();
