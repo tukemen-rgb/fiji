@@ -201,6 +201,29 @@ test('missing pickup opens manual recovery and explicit input enables the reques
   const ride=m.requestRide({pickup:ready.value,destination:'Nadi Airport'});
   assert.equal(ride.pickup,'Ramada Suites Wailoaloa');
 });
+test('airport pickup requires an explicit manual confirmation', () => {
+  const {R}=setup();
+  assert.equal(R.pickupAirportScope({source:'manual',confirmedAirport:true}),true);
+  for(const input of [
+    {source:'manual',confirmedAirport:false},
+    {source:'geolocation',confirmedAirport:true},
+    {source:'empty',confirmedAirport:true},
+    {source:'manual',confirmedAirport:'true'}
+  ])assert.equal(R.pickupAirportScope(input),false);
+});
+test('switching an airport pickup to current location clears airport dispatch scope', () => {
+  assert.match(source,/state\.airport=R\.pickupAirportScope\(\{source:'geolocation',confirmedAirport:state\.airport\}\);\$\('airport-pickup'\)\.checked=false;\$\('airport-check'\)\.checked=false;/);
+  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi Airport');
+  passenger(m);pickup.setManual('Nadi Airport');
+  let airport=R.pickupAirportScope({source:'manual',confirmedAirport:true});
+  const first=m.requestRide({pickup:pickup.snapshot().value,destination:'Denarau',airport});
+  assert.equal(first.airport,true);
+  const locating=pickup.beginLocation(),located=pickup.locationSuccess(locating.token,'現在地');
+  assert.equal(located.accepted,true);
+  airport=R.pickupAirportScope({source:located.state.source,confirmedAirport:airport});
+  const second=m.requestRide({pickup:located.state.value,destination:'Denarau',airport});
+  assert.equal(second.airport,false);assert.equal(first.status,'cancelled');assert.equal(second.status,'collecting');
+});
 function selected() {
   const s=setup(), {m}=s;
   passenger(m);
