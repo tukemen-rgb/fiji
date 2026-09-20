@@ -41,6 +41,31 @@ function passenger(m) {
 function application(V) {
   return {name:'Review Applicant', phone:'+6790000000', plate:'DEMO 005', holder:'Demo Holder', vehicle:'Demo Car', taxiPermit:'DEMO-TAXI', driverLicence:'DEMO-LIC', psvPermit:'DEMO-PSV', base:'Nadi demo', consent:true, documents:Object.fromEntries(V.REQUIRED.map(k => [k,{attachment:'DEMO-'+k+'.pdf', expiresAt:new Date(Date.now()+86400000).toISOString()}]))};
 }
+test('client-decoded Google claims remain input assistance until trusted server verification', () => {
+  const {R,m}=setup();
+  const clientOnly=R.googleIdentityConnectionView({
+    credentialImported:true,googleLinked:true,serverVerified:true,sub:'10769150350006150715113082367',
+    verification:{source:'client',signature:true,audience:true,issuer:true,notExpired:true}
+  });
+  assert.deepEqual({...clientOnly},{state:'input_assist',label:'Google入力補助（本人確認未接続）',canAuthenticate:false,persistSubject:false});
+  m.chooseRole('passenger');
+  const p=m.registerPassenger({name:'Google Input Guest',phone:'+6790000000',language:'ja',payment:'card',pickup:'Demo Hotel',consent:true,googleLinked:true,googleSub:'10769150350006150715113082367'});
+  assert.equal('googleLinked' in p,false);assert.equal('googleSub' in p,false);
+  const verified=R.googleIdentityConnectionView({credentialImported:true,verification:{source:'authenticated_server',signature:true,audience:true,issuer:true,notExpired:true}});
+  assert.deepEqual({...verified},{state:'verified',label:'Google本人確認済み',canAuthenticate:true,persistSubject:true});
+});
+test('Google Maps reports connected only after API load and map idle, then fails closed', () => {
+  const {R}=setup();
+  assert.deepEqual({...R.googleMapsConnectionView({})},{state:'demo',label:'略地図・デモ表示（Google Maps 未接続）',live:false,action:'configure'});
+  for(const input of [{configured:true},{configured:true,apiLoaded:true},{configured:true,mapIdle:true}]){
+    const view=R.googleMapsConnectionView(input);assert.equal(view.state,'connecting');assert.equal(view.live,false);assert.doesNotMatch(view.label,/接続済み/);
+  }
+  const connected=R.googleMapsConnectionView({configured:true,apiLoaded:true,mapIdle:true});
+  assert.equal(connected.state,'connected');assert.equal(connected.live,true);assert.match(connected.label,/接続済み/);
+  for(const failure of [{configured:true,apiLoaded:true,mapIdle:true,authFailure:true},{configured:true,loadFailed:true}]){
+    const view=R.googleMapsConnectionView(failure);assert.equal(view.state,'failed');assert.equal(view.live,false);assert.equal(view.action,'retry');assert.match(view.label,/デモ表示/);
+  }
+});
 function selected() {
   const s=setup(), {m}=s;
   passenger(m);

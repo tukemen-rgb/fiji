@@ -1317,6 +1317,21 @@
     const idle=async()=>{while(authSyncTask||operations.size>0){if(authSyncTask)await authSyncTask;if(operations.size>0)await Promise.all([...operations]);}await runtime.idle();return snapshot();};
     return Object.freeze({snapshot,attach,navigate,detach,idle});
   }
+  // Acceptance contract for optional Google input assistance and live maps.
+  // Client-decoded claims are never authoritative identity evidence.
+  function googleIdentityConnectionView(input={}){
+    const proof=input.verification;
+    const serverVerified=proof?.source==='authenticated_server'&&proof.signature===true&&proof.audience===true&&proof.issuer===true&&proof.notExpired===true;
+    if(serverVerified)return Object.freeze({state:'verified',label:'Google本人確認済み',canAuthenticate:true,persistSubject:true});
+    if(input.credentialImported===true)return Object.freeze({state:'input_assist',label:'Google入力補助（本人確認未接続）',canAuthenticate:false,persistSubject:false});
+    return Object.freeze({state:'unavailable',label:'Google入力補助は未接続',canAuthenticate:false,persistSubject:false});
+  }
+  function googleMapsConnectionView(input={}){
+    if(input.authFailure===true||input.loadFailed===true)return Object.freeze({state:'failed',label:'略地図・デモ表示（Google Maps 接続失敗）',live:false,action:'retry'});
+    if(input.configured===true&&input.apiLoaded===true&&input.mapIdle===true)return Object.freeze({state:'connected',label:'Google Maps 接続済み',live:true,action:null});
+    if(input.configured===true)return Object.freeze({state:'connecting',label:'Google Maps 接続確認中',live:false,action:null});
+    return Object.freeze({state:'demo',label:'略地図・デモ表示（Google Maps 未接続）',live:false,action:'configure'});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1474,7 +1489,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleMapsConnectionView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
