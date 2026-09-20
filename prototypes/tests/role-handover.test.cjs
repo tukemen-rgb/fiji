@@ -93,6 +93,32 @@ test('Google Maps reports connected only after API load and map idle, then fails
     const view=R.googleMapsConnectionView(failure);assert.equal(view.state,'failed');assert.equal(view.live,false);assert.equal(view.action,'retry');assert.match(view.label,/デモ表示/);
   }
 });
+test('Google Maps geolocation cannot report connected before the active map reaches idle', () => {
+  const {R}=setup(),maps=R.createGoogleMapsReadinessController();
+  const first=maps.begin(true);
+  assert.equal(first.state.state,'connecting');
+  const located=maps.location(first.token);
+  assert.equal(located.state.locationReady,true);assert.equal(located.state.live,false);assert.doesNotMatch(located.state.label,/接続済み/);
+  const loaded=maps.apiReady(first.token);
+  assert.equal(loaded.state.live,false);assert.doesNotMatch(loaded.state.label,/接続済み/);
+  const idle=maps.idle(first.token);
+  assert.equal(idle.state.live,true);assert.equal(idle.state.label,'Google Maps 接続済み・現在地を表示');
+});
+test('Google Maps retry rejects stale callbacks and auth failure removes connected state', () => {
+  const {R}=setup(),maps=R.createGoogleMapsReadinessController();
+  const first=maps.begin(true);
+  maps.apiReady(first.token);maps.location(first.token);maps.idle(first.token);
+  assert.equal(maps.snapshot().state,'connected');
+  const failed=maps.fail(first.token);
+  assert.equal(failed.state.state,'failed');assert.equal(failed.state.live,false);assert.equal(failed.state.locationReady,false);
+  const retry=maps.begin(true);
+  assert.equal(maps.idle(first.token).accepted,false);
+  assert.equal(maps.location(first.token).accepted,false);
+  assert.equal(maps.snapshot().generation,retry.token);assert.equal(maps.snapshot().state,'connecting');
+  maps.apiReady(retry.token);maps.idle(retry.token);
+  assert.equal(maps.snapshot().state,'connected');assert.equal(maps.snapshot().locationReady,false);
+  assert.equal(maps.snapshot().label,'Google Maps 接続済み');
+});
 function selected() {
   const s=setup(), {m}=s;
   passenger(m);

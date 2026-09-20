@@ -1353,6 +1353,27 @@
     if(input.configured===true)return Object.freeze({state:'connecting',label:'Google Maps 接続確認中',live:false,action:null});
     return Object.freeze({state:'demo',label:'略地図・デモ表示（Google Maps 未接続）',live:false,action:'configure'});
   }
+  function createGoogleMapsReadinessController(){
+    let generation=0,configured=false,apiLoaded=false,mapIdle=false,locationReady=false,failed=false;
+    const snapshot=()=>{
+      const base=googleMapsConnectionView({configured,apiLoaded,mapIdle,loadFailed:failed});
+      return Object.freeze({...base,generation,locationReady,
+        label:base.state==='connected'&&locationReady?'Google Maps 接続済み・現在地を表示':base.label});
+    };
+    const update=(token,change)=>{
+      if(token!==generation)return Object.freeze({accepted:false,reason:'stale_generation',state:snapshot()});
+      change();return Object.freeze({accepted:true,reason:'updated',state:snapshot()});
+    };
+    const begin=(enabled=true)=>{
+      generation+=1;configured=enabled===true;apiLoaded=false;mapIdle=false;locationReady=false;failed=false;
+      return Object.freeze({token:generation,state:snapshot()});
+    };
+    const apiReady=token=>update(token,()=>{if(configured&&!failed)apiLoaded=true;});
+    const idle=token=>update(token,()=>{if(configured&&apiLoaded&&!failed)mapIdle=true;});
+    const location=token=>update(token,()=>{if(configured&&!failed)locationReady=true;});
+    const fail=token=>update(token,()=>{failed=true;apiLoaded=false;mapIdle=false;locationReady=false;});
+    return Object.freeze({snapshot,begin,apiReady,idle,location,fail});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1510,7 +1531,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
