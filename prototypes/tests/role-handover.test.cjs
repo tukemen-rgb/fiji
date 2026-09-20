@@ -75,14 +75,16 @@ function registrationWizard() {
   const state={regStep:0,documents:{}};
   let attempts=0;
   const sandbox=vm.createContext({$,state,V,names:{},esc:String,
-    document:{querySelectorAll:()=>[]},
+    document:{querySelectorAll:()=>[],querySelector:()=>null},
     model:{state:m.state,registerDriver(input){attempts++;return m.registerDriver(input);}},
     records:m.state.records,show:page=>pages.push(page),toast:message=>messages.push(message),
     FormData:class {constructor(form){this.form=form;}entries(){return Object.entries(this.form.elements).filter(([k])=>k!=='consent').map(([k,field])=>[k,field.value]);}}
   });
   vm.runInContext(source.slice(source.indexOf('function currentTypes()'),source.indexOf('// Optional live map.')),sandbox);
   sandbox.setStep(0);
-  return {m,$,fields,state,reports,pages,messages,attempts:()=>attempts,
+  return {m,V,$,fields,state,reports,pages,messages,attempts:()=>attempts,
+    issues:now=>JSON.parse(JSON.stringify(sandbox.registrationDocumentIssues(now))),
+    updateFeedback:key=>sandbox.updateDocumentFeedback(key),
     submit(){let prevented=false;$('registration-form').onsubmit({currentTarget:$('registration-form'),preventDefault(){prevented=true;}});assert.equal(prevented,true);}};
 }
 test('registration wizard submit advances each step before creating a pending driver', () => {
@@ -124,10 +126,44 @@ test('registration wizard keeps final document and consent rejection on the revi
     const w=registrationWizard();w.$('fill-sample').onclick();
     w.$('reg-next').onclick();w.$('reg-next').onclick();
     if(invalid==='documents')w.state.documents={};else w.fields.consent.checked=false;
-    w.submit();assert.equal(w.attempts(),1);assert.equal(w.state.regStep,2);
+    w.submit();assert.equal(w.attempts(),invalid==='documents'?0:1);assert.equal(w.state.regStep,2);
     assert.equal(w.$('registration-error').hidden,false);assert.deepEqual(w.pages,[]);
     assert.equal(w.m.state.profiles.driver,null);
   }
+});
+test('registration wizard names missing, invalid and expired document evidence per item', () => {
+  const w=registrationWizard(),now=Date.parse('2030-01-10T00:00:00Z');
+  w.$('register-airport').checked=true;
+  w.state.documents=Object.fromEntries([...w.V.REQUIRED,'airport_authorization'].map(k=>[k,{attachment:'DEMO-'+k+'.pdf',expiresAt:'2031-01-10T00:00:00+12:00'}]));
+  w.state.documents.taxi_permit.attachment='';
+  w.state.documents.vehicle_licence.expiresAt='not-a-date';
+  w.state.documents.driver_licence.expiresAt='2029-01-10T00:00:00+12:00';
+  w.state.documents.psv_driver_permit.expiresAt='';
+  const issues=w.issues(now);
+  assert.deepEqual(issues.taxi_permit,['デモ書類を添付してください。']);
+  assert.deepEqual(issues.vehicle_licence,['有効期限を確認してください。']);
+  assert.deepEqual(issues.driver_licence,['有効期限が切れています。将来の日付を入力してください。']);
+  assert.deepEqual(issues.psv_driver_permit,['有効期限を入力してください。']);
+  assert.deepEqual(issues.fitness,[]);assert.deepEqual(issues.airport_authorization,[]);
+});
+test('registration wizard shows document-level alerts and accepts a corrected retry', () => {
+  const w=registrationWizard();w.$('fill-sample').onclick();
+  w.$('reg-next').onclick();w.$('reg-next').onclick();
+  delete w.state.documents.taxi_permit.attachment;
+  w.state.documents.vehicle_licence.expiresAt='2020-01-01T00:00:00+12:00';
+  w.submit();
+  assert.equal(w.attempts(),0);assert.equal(w.$('registration-error').hidden,false);
+  assert.match(w.$('registration-error').textContent,/2件の書類/);
+  assert.match(w.$('doc-fields').innerHTML,/id="doc-error-taxi_permit"[^>]*data-doc-error role="alert"/);
+  assert.match(w.$('doc-fields').innerHTML,/デモ書類を添付してください/);
+  assert.match(w.$('doc-fields').innerHTML,/有効期限が切れています/);
+  w.state.documents.taxi_permit.attachment='DEMO-taxi_permit.pdf';w.updateFeedback('taxi_permit');
+  assert.match(w.$('registration-error').textContent,/1件の書類/);
+  w.state.documents.vehicle_licence.expiresAt=new Date(Date.now()+86400000).toISOString();w.updateFeedback('vehicle_licence');
+  assert.equal(w.$('registration-error').hidden,true);
+  w.$('fill-sample').onclick();w.submit();
+  assert.equal(w.attempts(),1);assert.deepEqual(w.pages,['driver-home']);
+  assert.equal(w.m.state.profile.status,'submitted');assert.equal(w.m.gate().eligible,false);
 });
 test('role routing keeps passenger and driver controls separate', () => {
   const {R}=setup();

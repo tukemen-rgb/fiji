@@ -6,7 +6,7 @@
 .text-control{background:white;border:0;font-size:11px;color:var(--muted);min-height:44px;padding:6px}.welcome{padding:28px 0 14px}.welcome h1{font-size:31px;letter-spacing:-1px;line-height:1.45;margin:10px 0}.flow-steps{display:flex;gap:18px;font-size:10px;color:var(--muted);padding:10px 0 25px}.flow-steps b{font-size:10px;font-weight:500;margin-right:3px;color:#313b34}.role-card{display:flex;gap:14px;align-items:center;width:100%;padding:23px 16px;border:1px solid #d8ddd6;border-radius:12px;background:white;text-align:left;color:var(--ink);margin-bottom:14px;min-height:138px}.role-card:hover{border-color:#7b887a}.role-icon{width:42px;height:42px;display:grid;place-items:center;background:var(--wash);border-radius:10px;flex:none}.role-copy{flex:1;min-width:0}.role-copy small{display:block;letter-spacing:.12em;font-size:9px;color:var(--muted);margin-bottom:7px}.role-copy strong{display:block;font-size:18px;font-weight:600;line-height:1.5}.role-copy span{display:block;font-size:11px;color:var(--muted);margin-top:4px;line-height:1.6}.role-copy em{display:block;font-style:normal;font-size:11px;margin-top:12px;color:#4e6155}.role-card>.icon{width:16px}.demo-note{font-size:11px;color:var(--muted);padding:12px 0;line-height:1.7}.demo-note p{margin-bottom:7px}.test-tools{border-top:1px solid var(--line);padding:16px 0;font-size:12px}.test-tools summary{padding:8px 0;cursor:pointer;min-height:44px}.test-tools .secondary{font-size:12px}.role-nav{grid-template-columns:repeat(4,1fr)}.role-nav .icon{width:21px;height:21px}.preference-line{display:flex;gap:8px;font-size:11px;color:var(--muted);margin-bottom:10px}.dashboard-header{display:flex;gap:14px;align-items:center;margin-bottom:15px}.status-dot{width:7px;height:7px;background:#747c75;border-radius:50%;display:inline-block;margin-right:5px}.status-dot.online{background:var(--accent)}.driver-stats{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--line);border-radius:12px;margin:15px 0}.driver-stats>div{padding:16px}.driver-stats>div+div{border-left:1px solid var(--line)}.driver-stats b{font-size:24px;font-weight:600;display:block}.driver-stats span{font-size:11px;color:var(--muted)}.small-title{font-size:13px;font-weight:600;margin:22px 0 12px}.trip-route{border-left:1px solid #aab5a9;margin:16px 0 16px 5px;padding-left:14px;font-size:14px;line-height:1.6;overflow-wrap:anywhere}.trip-route span{font-size:10px;color:var(--muted);display:block}.trip-route>div+div{margin-top:15px}.offer-form{border-top:1px solid var(--line);margin-top:15px;padding-top:2px}.two-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}.two-fields .field{margin:10px 0}.offer-status{font-size:12px;color:var(--accent);margin:12px 0}.review-step{display:flex;gap:10px;align-items:baseline;padding:10px 0;border-bottom:1px solid var(--line);font-size:12px}.review-step small{color:var(--muted);font-size:10px;min-width:20px}.review-step strong{font-size:11px;margin-left:auto;font-weight:400;color:var(--muted)}.trip-status{font-size:11px;margin-bottom:12px;color:var(--muted)}.empty{padding:24px 16px;border:1px dashed var(--line);border-radius:12px;color:var(--muted);font-size:12px;line-height:1.8}.evidence-summary{font-size:11px;color:var(--muted);margin:15px 0}.inline-list{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:10px 0}.profile-info{overflow-wrap:anywhere}#passenger-preferences:empty{display:none}.booking-banner{margin-bottom:15px}.card h2{overflow-wrap:anywhere}.field textarea{width:100%;border:1px solid var(--line);border-radius:8px;font:inherit}#current-role{white-space:nowrap}@media(max-width:370px){.role-card{padding:20px 12px;gap:10px}.role-copy strong{font-size:17px}.brand{font-size:15px}.topbar{padding-left:16px;padding-right:12px}.top-actions{gap:3px}.panel{padding-left:16px;padding-right:16px}}
 
 #passenger-greeting{text-transform:none;letter-spacing:.02em}.command-feedback{margin:0 20px 12px}.command-feedback h2{font-size:13px;margin-bottom:4px}.command-feedback p{margin:0}.command-feedback .secondary{margin-top:10px;min-height:42px;font-size:12px}
-</style></head>
+</style><style>.doc-row.invalid{border-left:2px solid var(--warning);padding-left:10px}.doc-row [aria-invalid="true"]{border-color:var(--warning)}.field-error{color:var(--warning);font-size:11px;line-height:1.6;margin:8px 0 0}</style></head>
 <body>
 <svg style="display:none" aria-hidden="true"><defs>
 <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
@@ -1679,10 +1679,36 @@ $('airport-check').onchange = () => {invalidateVehicleCheck();$('lookup-result')
 document.querySelectorAll('[data-plate]').forEach(b => b.onclick = () => { $('plate-input').value = b.dataset.plate; lookup(); });
 
 function currentTypes() { return $('register-airport').checked ? [...V.REQUIRED,'airport_authorization'] : V.REQUIRED; }
+function registrationDocumentIssues(now=Date.now()) {
+  return Object.fromEntries(currentTypes().map(k => {
+    const d=state.documents[k]||{},issues=[],expiry=d.expiresAt ? Date.parse(d.expiresAt) : NaN;
+    if(!d.attachment) issues.push('デモ書類を添付してください。');
+    if(!d.expiresAt) issues.push('有効期限を入力してください。');
+    else if(!Number.isFinite(expiry)) issues.push('有効期限を確認してください。');
+    else if(expiry<=now) issues.push('有効期限が切れています。将来の日付を入力してください。');
+    return [k,issues];
+  }));
+}
+function updateDocumentFeedback(k) {
+  if(!state.documentValidationActive)return;
+  const allIssues=registrationDocumentIssues(),issues=allIssues[k]||[],remaining=Object.values(allIssues).filter(item=>item.length).length;
+  $('registration-error').hidden=remaining===0;
+  $('registration-error').textContent=remaining ? `${remaining}件の書類を確認してください。各項目の案内に沿って修正できます。` : '';
+  const row=document.querySelector(`[data-doc-row="${k}"]`);
+  if(!row)return;
+  const error=row.querySelector('[data-doc-error]'),attachment=row.querySelector('[data-doc]'),expiry=row.querySelector('[data-expiry]');
+  row.classList.toggle('invalid',issues.length>0);error.hidden=issues.length===0;error.textContent=issues.join(' ');
+  attachment.setAttribute('aria-invalid',String(issues.some(x=>x.includes('添付'))));
+  expiry.setAttribute('aria-invalid',String(issues.some(x=>x.includes('有効期限'))));
+}
 function renderDocs() {
-  $('doc-fields').innerHTML = currentTypes().map(k => `<div class="doc-row"><header><span>${esc(names[k])}</span><button type="button" data-doc="${k}">${state.documents[k]?.attachment ? '見本を添付済み' : 'デモ書類を添付'}</button></header><label>有効期限<input type="date" data-expiry="${k}" value="${esc(state.documents[k]?.expiresAt?.slice(0,10)||'')}"></label></div>`).join('');
-  document.querySelectorAll('[data-doc]').forEach(b => b.onclick = () => { const k = b.dataset.doc; state.documents[k] = {...state.documents[k],attachment:'DEMO-'+k+'.pdf'}; b.textContent = '見本を添付済み'; });
-  document.querySelectorAll('[data-expiry]').forEach(el => el.onchange = () => { const k = el.dataset.expiry; state.documents[k] = {...state.documents[k],expiresAt:el.value ? el.value+'T00:00:00+12:00' : ''}; });
+  const allIssues=registrationDocumentIssues();
+  $('doc-fields').innerHTML = currentTypes().map(k => {
+    const issues=state.documentValidationActive ? allIssues[k] : [],errorId='doc-error-'+k;
+    return `<div class="doc-row${issues.length?' invalid':''}" data-doc-row="${k}"><header><span>${esc(names[k])}</span><button type="button" data-doc="${k}" aria-describedby="${errorId}" aria-invalid="${issues.some(x=>x.includes('添付'))}">${state.documents[k]?.attachment ? '見本を添付済み' : 'デモ書類を添付'}</button></header><label>有効期限<input type="date" data-expiry="${k}" aria-describedby="${errorId}" aria-invalid="${issues.some(x=>x.includes('有効期限'))}" value="${esc(state.documents[k]?.expiresAt?.slice(0,10)||'')}"></label><p class="field-error" id="${errorId}" data-doc-error role="alert"${issues.length?'':' hidden'}>${esc(issues.join(' '))}</p></div>`;
+  }).join('');
+  document.querySelectorAll('[data-doc]').forEach(b => b.onclick = () => { const k = b.dataset.doc; state.documents[k] = {...state.documents[k],attachment:'DEMO-'+k+'.pdf'}; b.textContent = '見本を添付済み'; updateDocumentFeedback(k); });
+  document.querySelectorAll('[data-expiry]').forEach(el => el.onchange = () => { const k = el.dataset.expiry; state.documents[k] = {...state.documents[k],expiresAt:el.value ? el.value+'T00:00:00+12:00' : ''}; updateDocumentFeedback(k); });
 }
 function setStep(step) {
   state.regStep = step;
@@ -1720,6 +1746,17 @@ $('registration-form').onsubmit = e => {
   // Implicit submit (for example Enter) follows the same steps as Next.
   if(state.regStep<2) { advanceRegistration(); return; }
   for(let step=0;step<2;step++) if(!validateRegistrationStep(step)) return;
+  state.documentValidationActive=true;
+  const invalidDocuments=Object.entries(registrationDocumentIssues()).filter(([,issues])=>issues.length);
+  if(invalidDocuments.length) {
+    renderDocs();
+    $('registration-error').hidden=false;
+    $('registration-error').textContent=`${invalidDocuments.length}件の書類を確認してください。各項目の案内に沿って修正できます。`;
+    const [first]=invalidDocuments[0],firstIssue=registrationDocumentIssues()[first];
+    document.querySelector(`[data-doc-row="${first}"] ${firstIssue.some(x=>x.includes('添付'))?'[data-doc]':'[data-expiry]'}`)?.focus();
+    return;
+  }
+  state.documentValidationActive=false;
   const input=Object.fromEntries(new FormData(e.currentTarget).entries());
   input.airport=$('register-airport').checked;input.consent=e.currentTarget.elements.consent.checked;input.documents=state.documents;
   try{
