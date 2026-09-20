@@ -191,7 +191,7 @@ test('pickup request view distinguishes missing, locating and ready states', () 
 });
 test('missing pickup opens manual recovery and explicit input enables the request', () => {
   assert.match(source,/if\(!pickupView\.ready\)\{if\(pickupView\.action==='edit_pickup'\)showPickupFallback\(pickupView\.message\);else toast\(pickupView\.message\);return;\}/);
-  assert.match(source,/if\(!pickupInput\.snapshot\(\)\.canRequest\)\{\$\('pickup-text'\)\.value='';openDialog\('pickup-dialog'\);\$\('pickup-text'\)\.focus\(\);\}/);
+  assert.match(source,/if\(!pickupInput\.snapshot\(\)\.canRequest\)openPickupEditor\(\);/);
   const {R,m}=setup(),pickup=R.createPickupInputController('');
   m.chooseRole('passenger');m.registerPassenger({name:'No Pickup Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'',consent:true});
   assert.equal(R.pickupRequestView(pickup.snapshot()).action,'edit_pickup');
@@ -223,6 +223,27 @@ test('switching an airport pickup to current location clears airport dispatch sc
   airport=R.pickupAirportScope({source:located.state.source,confirmedAirport:airport});
   const second=m.requestRide({pickup:located.state.value,destination:'Denarau',airport});
   assert.equal(second.airport,false);assert.equal(first.status,'cancelled');assert.equal(second.status,'collecting');
+});
+test('pickup editor restores only the active manual pickup and its airport confirmation', () => {
+  const {R}=setup();
+  assert.deepEqual({...R.pickupEditorView({source:'manual',value:'Nadi Airport',airport:true})},{value:'Nadi Airport',airport:true,placeholder:'例：ホテル名・施設名'});
+  assert.deepEqual({...R.pickupEditorView({source:'geolocation',value:'現在地',airport:true})},{value:'',airport:false,placeholder:'現在地を使用中です。施設名へ変更する場合は入力してください。'});
+  assert.deepEqual({...R.pickupEditorView({source:'empty',value:'Old Hotel',airport:true})},{value:'',airport:false,placeholder:'例：ホテル名・施設名'});
+  assert.match(source,/\$\('pickup-open'\)\.onclick = openPickupEditor;/);
+  assert.match(source,/const editor=R\.pickupEditorView\(\{\.\.\.pickupInput\.snapshot\(\),airport:state\.airport\}\);/);
+});
+test('opening the editor after current location cannot revive an old airport pickup', () => {
+  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi Airport');
+  passenger(m);pickup.setManual('Nadi Airport');
+  let airport=R.pickupAirportScope({source:'manual',confirmedAirport:true});
+  const locating=pickup.beginLocation(),located=pickup.locationSuccess(locating.token,'現在地');
+  airport=R.pickupAirportScope({source:located.state.source,confirmedAirport:airport});
+  const editor=R.pickupEditorView({...located.state,airport});
+  assert.equal(editor.value,'');assert.equal(editor.airport,false);
+  assert.throws(()=>m.requestRide({pickup:editor.value,destination:'Denarau',airport:editor.airport}),/乗車地点と目的地/);
+  pickup.setManual('Radisson Blu Denarau');
+  const ride=m.requestRide({pickup:pickup.snapshot().value,destination:'Denarau',airport:editor.airport});
+  assert.equal(ride.pickup,'Radisson Blu Denarau');assert.equal(ride.airport,false);
 });
 function selected() {
   const s=setup(), {m}=s;

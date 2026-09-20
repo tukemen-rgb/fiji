@@ -1412,6 +1412,14 @@
   function pickupAirportScope(input={}){
     return input.source==='manual'&&input.confirmedAirport===true;
   }
+  function pickupEditorView(input={}){
+    const source=['manual','geolocation'].includes(input.source)?input.source:'empty';
+    return Object.freeze({
+      value:source==='manual'?text(input.value,160):'',
+      airport:source==='manual'&&input.airport===true,
+      placeholder:source==='geolocation'?'現在地を使用中です。施設名へ変更する場合は入力してください。':'例：ホテル名・施設名'
+    });
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1569,7 +1577,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1654,14 +1662,19 @@ const rolePageRouter=R.createRolePageRouter({
 rolePageRouter.attach();
 function show(target){return rolePageRouter.navigate(target);}
 function openDialog(id) { if (!$(id).open) $(id).showModal(); }
+function openPickupEditor(){
+  const editor=R.pickupEditorView({...pickupInput.snapshot(),airport:state.airport});
+  $('pickup-text').value=editor.value;$('pickup-text').placeholder=editor.placeholder;$('airport-pickup').checked=editor.airport;
+  openDialog('pickup-dialog');$('pickup-text').focus();
+}
 function showPickupFallback(message){
-  if(!pickupInput.snapshot().canRequest){$('pickup-text').value='';openDialog('pickup-dialog');$('pickup-text').focus();}
+  if(!pickupInput.snapshot().canRequest)openPickupEditor();
   toast(message);
 }
 document.querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click',()=>show(b.dataset.nav)));
 document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click',()=>$(b.dataset.close).close()));
 $('settings-open').onclick = $('maps-open').onclick = () => openDialog('settings-dialog');
-$('pickup-open').onclick = () => openDialog('pickup-dialog');
+$('pickup-open').onclick = openPickupEditor;
 $('schedule-open').onclick = () => {
   const minimum=new Date(Date.now()+60000).toISOString();
   $('schedule-time').min=localDateTimeValue(minimum);
