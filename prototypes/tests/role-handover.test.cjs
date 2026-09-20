@@ -50,6 +50,85 @@ function selected() {
   m.chooseRole('passenger'); m.selectOffer(offer.id);
   return {...s,ride,offer};
 }
+// Run the actual registration DOM handlers with deterministic form controls.
+// This checks submit routing, not native browser keyboard/constraint behavior.
+function registrationWizard() {
+  const {m,V}=setup();m.chooseRole('driver');
+  const nodes={},fields={},reports=[],pages=[],messages=[];
+  const stepFields=[['name','phone','driverLicence','psvPermit'],['plate','vehicle','taxiPermit','holder','base'],[]];
+  const $=id=>nodes[id] ||= {hidden:false};
+  stepFields.forEach((keys,step)=>{
+    const html=source.split(`<div id="reg-step-${step}"`)[1].split('</div>')[0];
+    keys.forEach(key=>{
+      assert.match(html,new RegExp(`name="${key}"[^>]*required`));
+      fields[key]={value:'',checkValidity(){return !!this.value.trim();},reportValidity(){
+        assert.equal($('reg-step-'+step).hidden,false,'invalid field must be visible');
+        reports.push(key);return this.checkValidity();
+      }};
+    });
+    $('reg-step-'+step).querySelectorAll=()=>keys.map(key=>fields[key]);
+  });
+  fields.consent={checked:false};
+  $('register-airport').checked=false;
+  $('registration-form').elements=fields;
+  $('progress').children=stepFields.map(()=>({classList:{toggle(){}}}));
+  const state={regStep:0,documents:{}};
+  let attempts=0;
+  const sandbox=vm.createContext({$,state,V,names:{},esc:String,
+    document:{querySelectorAll:()=>[]},
+    model:{state:m.state,registerDriver(input){attempts++;return m.registerDriver(input);}},
+    records:m.state.records,show:page=>pages.push(page),toast:message=>messages.push(message),
+    FormData:class {constructor(form){this.form=form;}entries(){return Object.entries(this.form.elements).filter(([k])=>k!=='consent').map(([k,field])=>[k,field.value]);}}
+  });
+  vm.runInContext(source.slice(source.indexOf('function currentTypes()'),source.indexOf('// Optional live map.')),sandbox);
+  sandbox.setStep(0);
+  return {m,$,fields,state,reports,pages,messages,attempts:()=>attempts,
+    submit(){let prevented=false;$('registration-form').onsubmit({currentTarget:$('registration-form'),preventDefault(){prevented=true;}});assert.equal(prevented,true);}};
+}
+test('registration wizard submit advances each step before creating a pending driver', () => {
+  const w=registrationWizard();w.$('fill-sample').onclick();
+  for(const step of [1,2]){
+    w.submit();assert.equal(w.state.regStep,step);assert.equal(w.attempts(),0);
+    assert.equal(w.m.state.profiles.driver,null);assert.deepEqual(w.pages,[]);
+  }
+  assert.equal(w.$('reg-submit').hidden,false);
+  w.submit();assert.equal(w.attempts(),1);assert.deepEqual(w.pages,['driver-home']);
+  assert.equal(w.m.state.profile.status,'submitted');assert.equal(w.m.gate().eligible,false);
+  assert.throws(()=>w.m.setOnline(true));assert.equal(w.m.driverRequests().length,0);
+  assert.throws(()=>w.m.submitOffer('sample-city',{fare:'20',eta:'5'}));
+});
+test('registration wizard next and submit both stop on missing current-step fields', () => {
+  for(const action of ['next','submit']){
+    const w=registrationWizard();w.$('fill-sample').onclick();
+    w.fields.phone.value='';
+    const advance=()=>action==='next'?w.$('reg-next').onclick():w.submit();
+    advance();assert.equal(w.state.regStep,0);assert.equal(w.reports.at(-1),'phone');
+    w.fields.phone.value='+6790000000';advance();assert.equal(w.state.regStep,1);
+    w.fields.plate.value='';advance();assert.equal(w.state.regStep,1);
+    assert.equal(w.reports.at(-1),'plate');assert.equal(w.attempts(),0);assert.deepEqual(w.pages,[]);
+  }
+});
+test('registration wizard final submit reveals invalid earlier fields without losing input', () => {
+  for(const [key,step] of [['name',0],['vehicle',1]]){
+    const w=registrationWizard();w.$('fill-sample').onclick();
+    w.$('reg-next').onclick();w.$('reg-next').onclick();
+    const documents=JSON.stringify(w.state.documents),phone=w.fields.phone.value;
+    w.fields[key].value='';w.submit();
+    assert.equal(w.state.regStep,step);assert.equal(w.$('reg-step-'+step).hidden,false);
+    assert.equal(w.reports.at(-1),key);assert.equal(w.attempts(),0);assert.deepEqual(w.pages,[]);
+    assert.equal(w.fields.phone.value,phone);assert.equal(JSON.stringify(w.state.documents),documents);
+  }
+});
+test('registration wizard keeps final document and consent rejection on the review step', () => {
+  for(const invalid of ['documents','consent']){
+    const w=registrationWizard();w.$('fill-sample').onclick();
+    w.$('reg-next').onclick();w.$('reg-next').onclick();
+    if(invalid==='documents')w.state.documents={};else w.fields.consent.checked=false;
+    w.submit();assert.equal(w.attempts(),1);assert.equal(w.state.regStep,2);
+    assert.equal(w.$('registration-error').hidden,false);assert.deepEqual(w.pages,[]);
+    assert.equal(w.m.state.profiles.driver,null);
+  }
+});
 test('role routing keeps passenger and driver controls separate', () => {
   const {R}=setup();
   assert.equal(R.route(null,null,'driver-home'),'role');

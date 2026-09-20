@@ -1690,10 +1690,20 @@ function setStep(step) {
   $('reg-back').hidden = step===0; $('reg-next').hidden = step===2; $('reg-submit').hidden = step!==2;
   $('registration-error').hidden = true; if(step===2) renderDocs();
 }
-$('reg-next').onclick = () => {
-  for(const el of $('reg-step-'+state.regStep).querySelectorAll('input[required]')) if(!el.reportValidity()) return;
+function validateRegistrationStep(step) {
+  for(const el of $('reg-step-'+step).querySelectorAll('input[required]')) {
+    if(el.checkValidity()) continue;
+    // Reveal earlier fields before native validation tries to focus them.
+    if(state.regStep!==step) setStep(step);
+    el.reportValidity(); return false;
+  }
+  return true;
+}
+function advanceRegistration() {
+  if(!validateRegistrationStep(state.regStep)) return;
   setStep(Math.min(2,state.regStep+1));
-};
+}
+$('reg-next').onclick = advanceRegistration;
 $('reg-back').onclick = () => setStep(Math.max(0,state.regStep-1));
 $('register-airport').onchange = renderDocs;
 $('fill-sample').onclick = () => {
@@ -1707,6 +1717,9 @@ $('fill-sample').onclick = () => {
 $('registration-form').noValidate = true;
 $('registration-form').onsubmit = e => {
   e.preventDefault();
+  // Implicit submit (for example Enter) follows the same steps as Next.
+  if(state.regStep<2) { advanceRegistration(); return; }
+  for(let step=0;step<2;step++) if(!validateRegistrationStep(step)) return;
   const input=Object.fromEntries(new FormData(e.currentTarget).entries());
   input.airport=$('register-airport').checked;input.consent=e.currentTarget.elements.consent.checked;input.documents=state.documents;
   try{
