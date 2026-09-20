@@ -141,7 +141,7 @@ test('late geolocation result cannot overwrite a newer manual pickup', () => {
   assert.equal(applied.accepted,true);assert.equal(applied.state.value,'現在地');assert.equal(applied.state.source,'geolocation');
 });
 test('passenger registration synchronizes its default pickup into the first ride request', () => {
-  assert.match(source,/const p=model\.registerPassenger\(input\);state\.pickup=p\.pickup\|\|'Nadi, Fiji';\s*pickupInput\.setManual\(state\.pickup\);/);
+  assert.match(source,/const p=model\.registerPassenger\(input\);state\.pickup=p\.pickup\|\|'';\s*pickupInput\.setManual\(state\.pickup\);/);
   const {R,m}=setup(),pickup=R.createPickupInputController('Nadi, Fiji');
   m.chooseRole('passenger');
   const profile=m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Ramada Suites Wailoaloa',consent:true});
@@ -160,6 +160,28 @@ test('profile pickup change wins over a location request started before re-regis
   assert.equal(stale.accepted,false);assert.equal(stale.state.value,'Radisson Blu Denarau');
   const ride=m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'});
   assert.equal(ride.pickup,'Radisson Blu Denarau');
+});
+test('blank registered pickup remains unset and blocks a ride until explicit input', () => {
+  assert.match(source,/\$\('pickup-label'\)\.textContent=state\.pickup\?state\.pickup\+' · デモ':'乗車地点を設定';/);
+  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi, Fiji');
+  m.chooseRole('passenger');
+  const profile=m.registerPassenger({name:'No Pickup Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'   ',consent:true});
+  pickup.setManual(profile.pickup||'');
+  assert.equal(pickup.snapshot().value,'');assert.equal(pickup.snapshot().source,'empty');assert.equal(pickup.snapshot().canRequest,false);
+  assert.throws(()=>m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'}),/乗車地点と目的地/);
+  assert.equal(m.myRequests().length,0);
+});
+test('clearing profile pickup discards an old value and rejects delayed geolocation', () => {
+  const {R,m}=setup(),pickup=R.createPickupInputController('Ramada Suites Wailoaloa');
+  m.chooseRole('passenger');
+  m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Ramada Suites Wailoaloa',consent:true});
+  const oldLocation=pickup.beginLocation();
+  const updated=m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'',consent:true});
+  pickup.setManual(updated.pickup||'');
+  const stale=pickup.locationSuccess(oldLocation.token,'現在地');
+  assert.equal(stale.accepted,false);assert.equal(stale.state.value,'');assert.equal(stale.state.canRequest,false);
+  assert.throws(()=>m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'}),/乗車地点と目的地/);
+  assert.equal(m.myRequests().length,0);
 });
 function selected() {
   const s=setup(), {m}=s;

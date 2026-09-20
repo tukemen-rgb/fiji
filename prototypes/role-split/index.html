@@ -1938,9 +1938,9 @@ $('fill-passenger').onclick=()=>{
 $('passenger-form').onsubmit=e=>{
   e.preventDefault();const input=Object.fromEntries(new FormData(e.currentTarget).entries());input.consent=e.currentTarget.elements.consent.checked;
   try{
-    const p=model.registerPassenger(input);state.pickup=p.pickup||'Nadi, Fiji';
+    const p=model.registerPassenger(input);state.pickup=p.pickup||'';
     pickupInput.setManual(state.pickup);
-    $('pickup-text').value=state.pickup;$('pickup-label').textContent=state.pickup+' · デモ';
+    $('pickup-text').value=state.pickup;$('pickup-label').textContent=state.pickup?state.pickup+' · デモ':'乗車地点を設定';
     $('passenger-error').hidden=true;show('home');toast('登録情報を利用者画面へ引き継ぎました。');
   }catch(e){$('passenger-error').hidden=false;$('passenger-error').textContent=e.message;}
 };
