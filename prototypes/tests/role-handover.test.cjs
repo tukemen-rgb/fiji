@@ -183,6 +183,24 @@ test('clearing profile pickup discards an old value and rejects delayed geolocat
   assert.throws(()=>m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'}),/乗車地点と目的地/);
   assert.equal(m.myRequests().length,0);
 });
+test('pickup request view distinguishes missing, locating and ready states', () => {
+  const {R}=setup();
+  assert.deepEqual({...R.pickupRequestView({value:'',pending:false})},{ready:false,value:'',action:'edit_pickup',message:'乗車地点を入力してください。'});
+  assert.deepEqual({...R.pickupRequestView({value:'Ramada Suites Wailoaloa',pending:true})},{ready:false,value:'Ramada Suites Wailoaloa',action:'wait_or_edit',message:'現在地を確認中です。完了を待つか、乗車地点を手入力してください。'});
+  assert.deepEqual({...R.pickupRequestView({value:'Ramada Suites Wailoaloa',pending:false})},{ready:true,value:'Ramada Suites Wailoaloa',action:null,message:''});
+});
+test('missing pickup opens manual recovery and explicit input enables the request', () => {
+  assert.match(source,/if\(!pickupView\.ready\)\{if\(pickupView\.action==='edit_pickup'\)showPickupFallback\(pickupView\.message\);else toast\(pickupView\.message\);return;\}/);
+  assert.match(source,/if\(!pickupInput\.snapshot\(\)\.canRequest\)\{\$\('pickup-text'\)\.value='';openDialog\('pickup-dialog'\);\$\('pickup-text'\)\.focus\(\);\}/);
+  const {R,m}=setup(),pickup=R.createPickupInputController('');
+  m.chooseRole('passenger');m.registerPassenger({name:'No Pickup Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'',consent:true});
+  assert.equal(R.pickupRequestView(pickup.snapshot()).action,'edit_pickup');
+  pickup.setManual('Ramada Suites Wailoaloa');
+  const ready=R.pickupRequestView(pickup.snapshot());
+  assert.equal(ready.ready,true);
+  const ride=m.requestRide({pickup:ready.value,destination:'Nadi Airport'});
+  assert.equal(ride.pickup,'Ramada Suites Wailoaloa');
+});
 function selected() {
   const s=setup(), {m}=s;
   passenger(m);

@@ -1403,6 +1403,12 @@
     };
     return Object.freeze({snapshot,setManual,beginLocation,locationSuccess,locationFailure,mapFailure});
   }
+  function pickupRequestView(input={}){
+    const value=text(input.value,160);
+    if(input.pending===true)return Object.freeze({ready:false,value,action:'wait_or_edit',message:'現在地を確認中です。完了を待つか、乗車地点を手入力してください。'});
+    if(!value)return Object.freeze({ready:false,value:'',action:'edit_pickup',message:'乗車地点を入力してください。'});
+    return Object.freeze({ready:true,value,action:null,message:''});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1560,7 +1566,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1645,6 +1651,10 @@ const rolePageRouter=R.createRolePageRouter({
 rolePageRouter.attach();
 function show(target){return rolePageRouter.navigate(target);}
 function openDialog(id) { if (!$(id).open) $(id).showModal(); }
+function showPickupFallback(message){
+  if(!pickupInput.snapshot().canRequest){$('pickup-text').value='';openDialog('pickup-dialog');$('pickup-text').focus();}
+  toast(message);
+}
 document.querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click',()=>show(b.dataset.nav)));
 document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click',()=>$(b.dataset.close).close()));
 $('settings-open').onclick = $('maps-open').onclick = () => openDialog('settings-dialog');
@@ -1691,8 +1701,10 @@ document.querySelectorAll('[data-destination]').forEach(b => b.onclick = () => {
 });
 $('find-offers').onclick = () => {
   try {
+    const pickupView=R.pickupRequestView(pickupInput.snapshot());
+    if(!pickupView.ready){if(pickupView.action==='edit_pickup')showPickupFallback(pickupView.message);else toast(pickupView.message);return;}
     if (!state.destination) { $('destination').focus();return toast('先に目的地を入力してください。'); }
-    const r=model.requestRide({pickup:pickupInput.snapshot().value,destination:$('destination').value,airport:state.airport,pickupAt:state.pickupAt});
+    const r=model.requestRide({pickup:pickupView.value,destination:$('destination').value,airport:state.airport,pickupAt:state.pickupAt});
     state.currentRequest=r.id;state.expectedId=null;state.selected=null;state.pickupAt=r.pickupAt;updateScheduleControl();
     if(state.mapReady)drawRoute();show('offers');
   }catch(e){toast(e.message);}
@@ -1903,10 +1915,10 @@ async function drawRoute(){
   }catch{if(seq===state.routeSeq){$('route-status').textContent='ルート取得失敗。目的地・API設定を確認してください。';}}
 }
 $('locate').onclick=()=>{
-  if(!state.mapReady)return toast('現在地表示には設定からGoogle Mapsを接続してください。');
-  if(!navigator.geolocation)return toast('位置情報を利用できません。乗車地点を手入力してください。');
+  if(!state.mapReady)return showPickupFallback('現在地を使えません。乗車地点を手入力してください。');
+  if(!navigator.geolocation)return showPickupFallback('位置情報を利用できません。乗車地点を手入力してください。');
   const locating=pickupInput.beginLocation();
-  navigator.geolocation.getCurrentPosition(p=>{const applied=pickupInput.locationSuccess(locating.token,'現在地');if(!applied.accepted)return;state.pickup={lat:p.coords.latitude,lng:p.coords.longitude};state.map.setCenter(state.pickup);$('pickup-label').textContent='現在地（取得済み）';$('map-caption').textContent='Google Maps · 位置精度 約'+Math.round(p.coords.accuracy)+'m';if(state.destination)drawRoute();},()=>toast(pickupInput.locationFailure(locating.token).state.message),{timeout:10000,maximumAge:30000,enableHighAccuracy:true});
+  navigator.geolocation.getCurrentPosition(p=>{const applied=pickupInput.locationSuccess(locating.token,'現在地');if(!applied.accepted)return;state.pickup={lat:p.coords.latitude,lng:p.coords.longitude};state.map.setCenter(state.pickup);$('pickup-label').textContent='現在地（取得済み）';$('map-caption').textContent='Google Maps · 位置精度 約'+Math.round(p.coords.accuracy)+'m';if(state.destination)drawRoute();},()=>{const failed=pickupInput.locationFailure(locating.token);showPickupFallback(failed.state.message);},{timeout:10000,maximumAge:30000,enableHighAccuracy:true});
 };
 // Role-specific UI; all registrations/offers remain in this tab's memory.
 const money=cents=>(cents/100).toFixed(2);
