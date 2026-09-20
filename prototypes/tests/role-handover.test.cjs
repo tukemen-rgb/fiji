@@ -162,6 +162,23 @@ test('profile pickup change wins over a location request started before re-regis
   const ride=m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'});
   assert.equal(ride.pickup,'Radisson Blu Denarau');
 });
+test('profile pickup update invalidates the old search and clears its airport scope', () => {
+  assert.match(source,/const pickup=String\(input\.pickup\|\|''\)\.trim\(\);\s*if\(!invalidateCurrentSearch\(\{pickup,airport:false\}\)\)return;\s*const p=model\.registerPassenger/);
+  assert.match(source,/pickupInput\.setManual\(state\.pickup\);state\.airport=false;\$\('airport-pickup'\)\.checked=false;\$\('airport-check'\)\.checked=false;/);
+  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi Airport');
+  m.chooseRole('passenger');m.registerPassenger({name:'Airport Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Nadi Airport',consent:true});
+  const ride=m.requestRide({pickup:'Nadi Airport',destination:'Denarau',airport:true}),offer=m.getOffers(ride.id)[0];
+  const change=m.invalidateRideSearch(ride.id,{pickup:'Radisson Blu Denarau',airport:false});
+  assert.equal(change.invalidated,true);assert.equal(ride.status,'cancelled');assert.throws(()=>m.selectOffer(offer.id));
+  const profile=m.registerPassenger({name:'Airport Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Radisson Blu Denarau',consent:true});pickup.setManual(profile.pickup);
+  assert.equal(pickup.snapshot().value,'Radisson Blu Denarau');assert.equal(R.pickupAirportScope({source:'manual',confirmedAirport:false}),false);
+});
+test('assigned ride blocks profile pickup replacement before the profile is mutated', () => {
+  const {m}=setup();passenger(m);
+  const original=m.state.profile.pickup,ride=m.requestRide({pickup:original,destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];m.selectOffer(offer.id);
+  assert.throws(()=>m.invalidateRideSearch(ride.id,{pickup:'New Hotel',airport:false}),/選択済み・乗車中/);
+  assert.equal(m.state.profile.pickup,original);assert.equal(ride.pickup,original);assert.equal(ride.status,'assigned');
+});
 test('blank registered pickup remains unset and blocks a ride until explicit input', () => {
   assert.match(source,/\$\('pickup-label'\)\.textContent=state\.pickup\?state\.pickup\+' · デモ':'乗車地点を設定';/);
   const {R,m}=setup(),pickup=R.createPickupInputController('Nadi, Fiji');
