@@ -136,6 +136,7 @@ test('late geolocation result cannot overwrite a newer manual pickup', () => {
   pickup.setManual('Radisson Blu Denarau');
   const stale=pickup.locationSuccess(old.token,'現在地');
   assert.equal(stale.accepted,false);assert.equal(stale.reason,'stale_location');assert.equal(stale.state.value,'Radisson Blu Denarau');assert.equal(stale.state.source,'manual');
+  assert.equal(pickup.canApplyLocation(old.token).accepted,false);
   const fresh=pickup.beginLocation();
   const applied=pickup.locationSuccess(fresh.token,'現在地');
   assert.equal(applied.accepted,true);assert.equal(applied.state.value,'現在地');assert.equal(applied.state.source,'geolocation');
@@ -212,7 +213,8 @@ test('airport pickup requires an explicit manual confirmation', () => {
   ])assert.equal(R.pickupAirportScope(input),false);
 });
 test('switching an airport pickup to current location clears airport dispatch scope', () => {
-  assert.match(source,/state\.airport=R\.pickupAirportScope\(\{source:'geolocation',confirmedAirport:state\.airport\}\);\$\('airport-pickup'\)\.checked=false;\$\('airport-check'\)\.checked=false;/);
+  assert.match(source,/const airport=R\.pickupAirportScope\(\{source:'geolocation',confirmedAirport:state\.airport\}\);if\(!invalidateCurrentSearch\(\{pickup:'現在地',airport\}\)\)/);
+  assert.match(source,/state\.airport=airport;\$\('airport-pickup'\)\.checked=false;\$\('airport-check'\)\.checked=false;/);
   const {R,m}=setup(),pickup=R.createPickupInputController('Nadi Airport');
   passenger(m);pickup.setManual('Nadi Airport');
   let airport=R.pickupAirportScope({source:'manual',confirmedAirport:true});
@@ -2626,6 +2628,24 @@ test('changing a collecting route invalidates earlier quotes', () => {
   const first=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}), old=m.getOffers(first.id)[0];
   m.requestRide({pickup:'Demo Hotel',destination:'Demo Town'});
   assert.equal(first.status,'cancelled'); assert.throws(()=>m.selectOffer(old.id));
+});
+test('editing pickup, destination or schedule immediately invalidates the active search and quotes', () => {
+  for(const changes of [{pickup:'New Hotel'},{destination:'Demo Town'},{pickupAt:new Date(Date.now()+3600000).toISOString()}]){
+    const {m}=setup();passenger(m);
+    const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
+    const result=m.invalidateRideSearch(ride.id,changes);
+    assert.equal(result.invalidated,true);assert.equal(result.reason,'search_edited');assert.equal(ride.status,'cancelled');assert.equal(ride.cancelReason,'search_edited');
+    assert.ok(m.state.offers.filter(o=>o.requestId===ride.id).every(o=>o.status==='expired'));assert.throws(()=>m.selectOffer(offer.id));
+  }
+  assert.match(source,/state\.currentRequest=null;state\.expectedId=null;state\.selected=null;\$\('live-summary'\)\.hidden=true;\$\('offers'\)\.replaceChildren\(\);clearLines\(\);/);
+});
+test('unchanged search input is retained and assigned rides cannot be silently edited', () => {
+  const {m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
+  assert.deepEqual({...m.invalidateRideSearch(ride.id,{pickup:'Demo Hotel',destination:'Demo Beach',airport:false,pickupAt:null})},{invalidated:false,reason:'unchanged'});
+  assert.equal(ride.status,'collecting');assert.equal(offer.status,'active');
+  m.selectOffer(offer.id);
+  assert.throws(()=>m.invalidateRideSearch(ride.id,{pickup:'New Hotel'}),/選択済み・乗車中/);assert.equal(ride.status,'assigned');assert.equal(ride.pickup,'Demo Hotel');
 });
 test('a later vehicle mismatch revokes an earlier confirmation', () => {
   const {m,ride}=selected();

@@ -1386,6 +1386,7 @@
       const token=++sequence;pending={token,revision};message='現在地を確認中です。';
       return Object.freeze({token,state:snapshot()});
     };
+    const canApplyLocation=token=>Object.freeze({accepted:!!pending&&pending.token===token&&pending.revision===revision,reason:!pending||pending.token!==token?'stale_location':pending.revision!==revision?'manual_changed':'ready'});
     const locationSuccess=(token,label='現在地')=>{
       if(!pending||pending.token!==token)return Object.freeze({accepted:false,reason:'stale_location',state:snapshot()});
       if(pending.revision!==revision){pending=null;return Object.freeze({accepted:false,reason:'manual_changed',state:snapshot()});}
@@ -1401,7 +1402,7 @@
       pending=null;message=value?'地図に接続できません。手入力した乗車地点を使用します。':'地図に接続できません。乗車地点を手入力してください。';
       return snapshot();
     };
-    return Object.freeze({snapshot,setManual,beginLocation,locationSuccess,locationFailure,mapFailure});
+    return Object.freeze({snapshot,setManual,beginLocation,canApplyLocation,locationSuccess,locationFailure,mapFailure});
   }
   function pickupRequestView(input={}){
     const value=text(input.value,160);
@@ -1514,6 +1515,19 @@
       if(!['collecting','assigned','arriving'].includes(r.status))throw Error('乗車開始後・完了後の依頼は取り消せません。');
       return markCancelled(r,'passenger_requested');
     }
+    function invalidateRideSearch(id,changes={}){
+      const p=need('passenger');
+      if(!id)return Object.freeze({invalidated:false,reason:'no_request'});
+      const r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);
+      if(!r)throw Error('この依頼の検索条件を変更できません。');
+      const has=key=>Object.prototype.hasOwnProperty.call(changes,key);
+      const changed=(has('pickup')&&text(changes.pickup)!==r.pickup)||(has('destination')&&text(changes.destination)!==r.destination)||(has('airport')&&!!changes.airport!==r.airport)||(has('pickupAt')&&normalizePickupAt(changes.pickupAt)!==r.pickupAt);
+      if(!changed)return Object.freeze({invalidated:false,reason:'unchanged'});
+      if(['assigned','arriving','on_trip'].includes(r.status))throw Error('選択済み・乗車中の依頼は検索条件を変更できません。履歴から依頼を確認してください。');
+      if(r.status!=='collecting')return Object.freeze({invalidated:false,reason:'terminal'});
+      markCancelled(r,'search_edited');
+      return Object.freeze({invalidated:true,reason:'search_edited'});
+    }
     function driverRequests(){need('driver');if(!gate().eligible||!state.online[state.profile.recordId])return [];const requests=state.requests.filter(r=>r.status==='collecting'&&eligibleRecord(state.profile.recordId,r));requests.forEach(refreshOffers);return requests;}
     function submitOffer(id,input){
       const p=need('driver'),r=driverRequests().find(r=>r.id===id);if(!r)throw Error('受付状態・依頼・営業資格を再確認してください。');
@@ -1575,7 +1589,7 @@
       state.requests.push({id:'sample-city',passengerId:'sample-p-1',passengerName:'Sample Passenger',pickup:'Nadi Town · 見本',destination:'Wailoaloa Beach · 見本',airport:false,passengers:2,language:'en',payment:'cash',status:'collecting',createdAt:new Date().toISOString()}, {id:'sample-airport',passengerId:'sample-p-2',passengerName:'Sample Guest',pickup:'Nadi Airport · 見本',destination:'Denarau · 見本',airport:true,passengers:2,language:'ja',payment:'card',status:'collecting',createdAt:new Date().toISOString()});
     }
     seedRequests();
-    return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
+    return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
     const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
@@ -1691,27 +1705,40 @@ function pickupTimeLabel(value){
 function updateScheduleControl(){
   $('schedule-open').textContent=state.pickupAt?pickupTimeLabel(state.pickupAt):'今すぐ';
 }
+function invalidateCurrentSearch(changes){
+  try{
+    const result=model.invalidateRideSearch(state.currentRequest,changes);
+    if(!result.invalidated)return true;
+    state.currentRequest=null;state.expectedId=null;state.selected=null;$('live-summary').hidden=true;$('offers').replaceChildren();clearLines();
+    toast('検索条件を変更したため、前の依頼と提示を取り消しました。もう一度料金を比較してください。');
+    return true;
+  }catch(error){toast(error.message);return false;}
+}
 $('save-schedule').onclick = () => {
   const d = new Date($('schedule-time').value);
   if (!Number.isFinite(d.getTime()) || d.getTime() <= Date.now()) return toast('現在より後の日時を選んでください。');
+  if(!invalidateCurrentSearch({pickupAt:d.toISOString()}))return;
   state.pickupAt=d.toISOString();updateScheduleControl();$('schedule-dialog').close();
   toast(d.toLocaleString('ja-JP') + ' を次の依頼に設定しました。実際の予約は送信されません。');
 };
 $('clear-schedule').onclick=()=>{
+  if(!invalidateCurrentSearch({pickupAt:null}))return;
   state.pickupAt=null;$('schedule-time').value='';updateScheduleControl();$('schedule-dialog').close();
   toast('次の依頼を「今すぐ」に戻しました。');
 };
 $('save-pickup').onclick = () => {
   const name = $('pickup-text').value.trim();
   if (!name) return toast('乗車地点を入力してください。');
-  state.pickup = name; pickupInput.setManual(name); state.airport = R.pickupAirportScope({source:'manual',confirmedAirport:$('airport-pickup').checked});
+  const airport=R.pickupAirportScope({source:'manual',confirmedAirport:$('airport-pickup').checked});
+  if(!invalidateCurrentSearch({pickup:name,airport}))return;
+  state.pickup = name; pickupInput.setManual(name); state.airport = airport;
   $('pickup-label').textContent = name + (state.mapReady ? '' : ' · デモ');
   $('airport-check').checked = state.airport;
   $('pickup-dialog').close(); if (state.mapReady && state.destination) drawRoute();
 };
-$('destination').addEventListener('input', () => { state.destination = $('destination').value.trim(); state.routeSeq++; $('live-summary').hidden = true; clearLines(); });
+$('destination').addEventListener('input', () => { const destination=$('destination').value.trim();if(!invalidateCurrentSearch({destination})){$('destination').value=state.destination;return;}state.destination=destination;state.routeSeq++;$('live-summary').hidden=true;clearLines(); });
 document.querySelectorAll('[data-destination]').forEach(b => b.onclick = () => {
-  state.destination = b.dataset.destination; $('destination').value = state.destination;
+  if(!invalidateCurrentSearch({destination:b.dataset.destination}))return;state.destination = b.dataset.destination; $('destination').value = state.destination;
   if (state.mapReady) drawRoute(); else { $('demo-route').hidden = false; $('demo-end').hidden = false; }
   toast('行き先を選びました。料金比較はサンプルです。');
 });
@@ -1934,7 +1961,7 @@ $('locate').onclick=()=>{
   if(!state.mapReady)return showPickupFallback('現在地を使えません。乗車地点を手入力してください。');
   if(!navigator.geolocation)return showPickupFallback('位置情報を利用できません。乗車地点を手入力してください。');
   const locating=pickupInput.beginLocation();
-  navigator.geolocation.getCurrentPosition(p=>{const applied=pickupInput.locationSuccess(locating.token,'現在地');if(!applied.accepted)return;state.pickup={lat:p.coords.latitude,lng:p.coords.longitude};state.airport=R.pickupAirportScope({source:'geolocation',confirmedAirport:state.airport});$('airport-pickup').checked=false;$('airport-check').checked=false;state.map.setCenter(state.pickup);$('pickup-label').textContent='現在地（取得済み）';$('map-caption').textContent='Google Maps · 位置精度 約'+Math.round(p.coords.accuracy)+'m';if(state.destination)drawRoute();},()=>{const failed=pickupInput.locationFailure(locating.token);showPickupFallback(failed.state.message);},{timeout:10000,maximumAge:30000,enableHighAccuracy:true});
+  navigator.geolocation.getCurrentPosition(p=>{if(!pickupInput.canApplyLocation(locating.token).accepted)return;const airport=R.pickupAirportScope({source:'geolocation',confirmedAirport:state.airport});if(!invalidateCurrentSearch({pickup:'現在地',airport})){pickupInput.locationFailure(locating.token);return;}const applied=pickupInput.locationSuccess(locating.token,'現在地');if(!applied.accepted)return;state.pickup={lat:p.coords.latitude,lng:p.coords.longitude};state.airport=airport;$('airport-pickup').checked=false;$('airport-check').checked=false;state.map.setCenter(state.pickup);$('pickup-label').textContent='現在地（取得済み）';$('map-caption').textContent='Google Maps · 位置精度 約'+Math.round(p.coords.accuracy)+'m';if(state.destination)drawRoute();},()=>{const failed=pickupInput.locationFailure(locating.token);showPickupFallback(failed.state.message);},{timeout:10000,maximumAge:30000,enableHighAccuracy:true});
 };
 // Role-specific UI; all registrations/offers remain in this tab's memory.
 const money=cents=>(cents/100).toFixed(2);
