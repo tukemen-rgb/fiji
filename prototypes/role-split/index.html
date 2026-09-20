@@ -1421,6 +1421,12 @@
       placeholder:source==='geolocation'?'現在地を使用中です。施設名へ変更する場合は入力してください。':'例：ホテル名・施設名'
     });
   }
+  function passengerRegistrationInput(input={}){
+    const name=text(input.name,80),normalizedPhone=text(input.phone,24),email=text(input.email),pickup=text(input.pickup);
+    if(!name||!phone(normalizedPhone)||input.consent!==true)throw Error('表示名・国番号付き電話番号・テスト利用の確認が必要です。');
+    if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw Error('メールアドレスを確認してください。');
+    return Object.freeze({name,phone:normalizedPhone,email,language:['ja','en'].includes(input.language)?input.language:'ja',pickup,payment:['cash','card'].includes(input.payment)?input.payment:'cash',consent:true});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1431,9 +1437,8 @@
     function leave(){state.activeRole=null;state.profile=null;}
     function registerPassenger(input){
       if(state.activeRole!=='passenger')throw Error('利用者として登録してください。');
-      if(!text(input.name,80)||!phone(input.phone)||input.consent!==true)throw Error('表示名・国番号付き電話番号・テスト利用の確認が必要です。');
-      if(input.email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email))throw Error('メールアドレスを確認してください。');
-      const p={id:state.profiles.passenger?.id||'passenger-'+(++seq),role:'passenger',name:text(input.name,80),phone:text(input.phone,24),email:text(input.email),language:['ja','en'].includes(input.language)?input.language:'ja',pickup:text(input.pickup),payment:['cash','card'].includes(input.payment)?input.payment:'cash',contactVerified:false,registeredAt:state.profiles.passenger?.registeredAt||new Date().toISOString()};
+      const values=passengerRegistrationInput(input);
+      const p={id:state.profiles.passenger?.id||'passenger-'+(++seq),role:'passenger',name:values.name,phone:values.phone,email:values.email,language:values.language,pickup:values.pickup,payment:values.payment,contactVerified:false,registeredAt:state.profiles.passenger?.registeredAt||new Date().toISOString()};
       state.profiles.passenger=p;state.profile=p;return p;
     }
     function registerDriver(input){
@@ -1591,7 +1596,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,passengerRegistrationInput,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1993,9 +1998,9 @@ $('fill-passenger').onclick=()=>{
 $('passenger-form').onsubmit=e=>{
   e.preventDefault();const input=Object.fromEntries(new FormData(e.currentTarget).entries());input.consent=e.currentTarget.elements.consent.checked;
   try{
-    const pickup=String(input.pickup||'').trim();
+    const validated=R.passengerRegistrationInput(input),pickup=validated.pickup;
     if(!invalidateCurrentSearch({pickup,airport:false}))return;
-    const p=model.registerPassenger(input);state.pickup=p.pickup||'';
+    const p=model.registerPassenger(validated);state.pickup=p.pickup||'';
     pickupInput.setManual(state.pickup);state.airport=false;$('airport-pickup').checked=false;$('airport-check').checked=false;
     $('pickup-text').value=state.pickup;$('pickup-label').textContent=state.pickup?state.pickup+' · デモ':'乗車地点を設定';
     $('passenger-error').hidden=true;show('home');toast('登録情報を利用者画面へ引き継ぎました。');

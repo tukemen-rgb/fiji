@@ -142,7 +142,7 @@ test('late geolocation result cannot overwrite a newer manual pickup', () => {
   assert.equal(applied.accepted,true);assert.equal(applied.state.value,'現在地');assert.equal(applied.state.source,'geolocation');
 });
 test('passenger registration synchronizes its default pickup into the first ride request', () => {
-  assert.match(source,/const p=model\.registerPassenger\(input\);state\.pickup=p\.pickup\|\|'';\s*pickupInput\.setManual\(state\.pickup\);/);
+  assert.match(source,/const validated=R\.passengerRegistrationInput\(input\),pickup=validated\.pickup;\s*if\(!invalidateCurrentSearch\(\{pickup,airport:false\}\)\)return;\s*const p=model\.registerPassenger\(validated\);state\.pickup=p\.pickup\|\|'';/);
   const {R,m}=setup(),pickup=R.createPickupInputController('Nadi, Fiji');
   m.chooseRole('passenger');
   const profile=m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Ramada Suites Wailoaloa',consent:true});
@@ -163,7 +163,7 @@ test('profile pickup change wins over a location request started before re-regis
   assert.equal(ride.pickup,'Radisson Blu Denarau');
 });
 test('profile pickup update invalidates the old search and clears its airport scope', () => {
-  assert.match(source,/const pickup=String\(input\.pickup\|\|''\)\.trim\(\);\s*if\(!invalidateCurrentSearch\(\{pickup,airport:false\}\)\)return;\s*const p=model\.registerPassenger/);
+  assert.match(source,/const validated=R\.passengerRegistrationInput\(input\),pickup=validated\.pickup;\s*if\(!invalidateCurrentSearch\(\{pickup,airport:false\}\)\)return;\s*const p=model\.registerPassenger\(validated\)/);
   assert.match(source,/pickupInput\.setManual\(state\.pickup\);state\.airport=false;\$\('airport-pickup'\)\.checked=false;\$\('airport-check'\)\.checked=false;/);
   const {R,m}=setup(),pickup=R.createPickupInputController('Nadi Airport');
   m.chooseRole('passenger');m.registerPassenger({name:'Airport Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Nadi Airport',consent:true});
@@ -172,6 +172,21 @@ test('profile pickup update invalidates the old search and clears its airport sc
   assert.equal(change.invalidated,true);assert.equal(ride.status,'cancelled');assert.throws(()=>m.selectOffer(offer.id));
   const profile=m.registerPassenger({name:'Airport Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Radisson Blu Denarau',consent:true});pickup.setManual(profile.pickup);
   assert.equal(pickup.snapshot().value,'Radisson Blu Denarau');assert.equal(R.pickupAirportScope({source:'manual',confirmedAirport:false}),false);
+});
+test('invalid passenger profile input leaves the active request and offers untouched', () => {
+  const {R,m}=setup();passenger(m);
+  const oldPickup=m.state.profile.pickup,ride=m.requestRide({pickup:oldPickup,destination:'Nadi Airport'}),offer=m.getOffers(ride.id)[0];
+  assert.throws(()=>R.passengerRegistrationInput({name:'Review Guest',phone:'+819000000000',email:'invalid-email',language:'ja',payment:'card',pickup:'New Hotel',consent:true}),/メールアドレス/);
+  assert.equal(ride.status,'collecting');assert.equal(offer.status,'active');assert.equal(m.state.profile.pickup,oldPickup);
+});
+test('validated passenger profile input invalidates old quotes before profile replacement', () => {
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:m.state.profile.pickup,destination:'Nadi Airport'}),offer=m.getOffers(ride.id)[0];
+  const values=R.passengerRegistrationInput({name:'  Review Guest  ',phone:' +6790000000 ',email:'guest@example.com',language:'en',payment:'cash',pickup:' New Hotel ',consent:true});
+  assert.equal(values.pickup,'New Hotel');assert.equal(values.phone,'+6790000000');
+  assert.equal(m.invalidateRideSearch(ride.id,{pickup:values.pickup,airport:false}).invalidated,true);
+  const updated=m.registerPassenger(values);
+  assert.equal(ride.status,'cancelled');assert.equal(offer.status,'expired');assert.equal(updated.pickup,'New Hotel');
 });
 test('assigned ride blocks profile pickup replacement before the profile is mutated', () => {
   const {m}=setup();passenger(m);
