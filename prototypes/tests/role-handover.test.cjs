@@ -119,6 +119,27 @@ test('Google Maps retry rejects stale callbacks and auth failure removes connect
   assert.equal(maps.snapshot().state,'connected');assert.equal(maps.snapshot().locationReady,false);
   assert.equal(maps.snapshot().label,'Google Maps 接続済み');
 });
+test('manual pickup survives map and geolocation failure and can still create a request', () => {
+  const {R,m}=setup(),pickup=R.createPickupInputController('Ramada Wailoaloa');
+  const locating=pickup.beginLocation();
+  const failed=pickup.locationFailure(locating.token);
+  assert.equal(failed.state.value,'Ramada Wailoaloa');assert.equal(failed.state.source,'manual');assert.equal(failed.state.canRequest,true);assert.match(failed.state.message,/手入力した乗車地点/);
+  const mapFailed=pickup.mapFailure();
+  assert.equal(mapFailed.value,'Ramada Wailoaloa');assert.equal(mapFailed.canRequest,true);assert.match(mapFailed.message,/手入力した乗車地点/);
+  passenger(m);
+  const ride=m.requestRide({pickup:mapFailed.value,destination:'Nadi Airport'});
+  assert.equal(ride.pickup,'Ramada Wailoaloa');assert.equal(ride.destination,'Nadi Airport');
+});
+test('late geolocation result cannot overwrite a newer manual pickup', () => {
+  const {R}=setup(),pickup=R.createPickupInputController('Nadi Town');
+  const old=pickup.beginLocation();
+  pickup.setManual('Radisson Blu Denarau');
+  const stale=pickup.locationSuccess(old.token,'現在地');
+  assert.equal(stale.accepted,false);assert.equal(stale.reason,'stale_location');assert.equal(stale.state.value,'Radisson Blu Denarau');assert.equal(stale.state.source,'manual');
+  const fresh=pickup.beginLocation();
+  const applied=pickup.locationSuccess(fresh.token,'現在地');
+  assert.equal(applied.accepted,true);assert.equal(applied.state.value,'現在地');assert.equal(applied.state.source,'geolocation');
+});
 function selected() {
   const s=setup(), {m}=s;
   passenger(m);
