@@ -127,6 +127,55 @@
     return { value: v };
   }
 
+  // ---- Google 登録連携（クライアント側の取り込みのみ） --------------------
+
+  function base64UrlDecode(s) {
+    try {
+      s = String(s).replace(/-/g, '+').replace(/_/g, '/');
+      while (s.length % 4) s += '=';
+      if (typeof atob === 'function') {
+        var bin = atob(s);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new TextDecoder('utf-8').decode(bytes);
+      }
+      return Buffer.from(s, 'base64').toString('utf8');
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Google Identity Services の ID トークンから表示用の項目だけを取り出す。
+   * これは登録フォームの入力補助であり、認証ではない。
+   * 本番はサーバー側で署名・aud・iss・有効期限を検証すること（未接続）。
+   */
+  function parseGoogleIdToken(jwt) {
+    if (typeof jwt !== 'string') return null;
+    var parts = jwt.split('.');
+    if (parts.length !== 3) return null;
+    var json = base64UrlDecode(parts[1]);
+    if (!json) return null;
+    var payload;
+    try {
+      payload = JSON.parse(json);
+    } catch (e) {
+      return null;
+    }
+    if (!isPlainObject(payload)) return null;
+    var sub = typeof payload.sub === 'string' ? payload.sub.trim() : '';
+    var email = typeof payload.email === 'string' ? payload.email.trim() : '';
+    if (!/^[0-9]{5,64}$/.test(sub)) return null;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || email.length > 80) return null;
+    var name = typeof payload.name === 'string' ? payload.name.trim().slice(0, 40) : '';
+    return {
+      sub: sub,
+      email: email,
+      name: name,
+      emailVerified: payload.email_verified === true
+    };
+  }
+
   // ---- 利用者登録 ---------------------------------------------------------
 
   function validatePassengerProfile(input) {
@@ -161,6 +210,20 @@
 
     if (input.consent !== true) {
       errors.consent = '利用条件への同意が必要です。';
+    }
+
+    // Google連携は入力補助の記録のみ（sub は数字のGoogleアカウントID）。
+    // サーバーでのIDトークン検証が接続されるまで、認証・権限には使わない。
+    if (input.googleLinked === true) {
+      var sub = trimmed(input.googleSub);
+      if (/^[0-9]{5,64}$/.test(sub)) {
+        profile.googleLinked = true;
+        profile.googleSub = sub;
+      } else {
+        errors.googleSub = 'Google連携の情報を確認できませんでした。もう一度連携してください。';
+      }
+    } else {
+      profile.googleLinked = false;
     }
 
     if (Object.keys(errors).length) return { ok: false, errors: errors };
@@ -361,6 +424,7 @@
     LANGUAGES: LANGUAGES,
     PAYMENTS: PAYMENTS,
     DOCUMENT_KEYS: DOCUMENT_KEYS,
+    parseGoogleIdToken: parseGoogleIdToken,
     validatePassengerProfile: validatePassengerProfile,
     validateDriverIdentity: validateDriverIdentity,
     validateDriverVehicle: validateDriverVehicle,

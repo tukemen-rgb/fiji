@@ -345,6 +345,9 @@ input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible
   border-radius: 999px;
   padding: 3px 10px;
 }
+.map-demo.map-tall { height: 220px; }
+.map-demo .gmap { position: absolute; inset: 0; }
+.map-demo .map-tag { z-index: 2; }
 .map-demo .pin {
   position: absolute;
   left: 50%;

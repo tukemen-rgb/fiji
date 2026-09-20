@@ -134,6 +134,57 @@ test('運転手登録: クライアントからの承認系フィールドを拒
   assert.ok(r.errors.documents.reviewer);
 });
 
+// ---- Google 登録連携 ----
+
+function fakeIdToken(payload) {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  return b64({ alg: 'RS256', typ: 'JWT' }) + '.' + b64(payload) + '.sig';
+}
+
+test('Google連携: IDトークンから sub・メール・表示名だけを取り出す', () => {
+  const parsed = Core.parseGoogleIdToken(fakeIdToken({
+    sub: '10769150350006150715113082367',
+    email: 'hana@example.com',
+    email_verified: true,
+    name: '佐藤 花子',
+    picture: 'https://example.com/x.png'
+  }));
+  assert.equal(parsed.sub, '10769150350006150715113082367');
+  assert.equal(parsed.email, 'hana@example.com');
+  assert.equal(parsed.name, '佐藤 花子');
+  assert.equal(parsed.emailVerified, true);
+  assert.equal('picture' in parsed, false);
+});
+
+test('Google連携: 壊れたトークン・不正なsub/メールは null を返す', () => {
+  assert.equal(Core.parseGoogleIdToken('not-a-jwt'), null);
+  assert.equal(Core.parseGoogleIdToken('a.b'), null);
+  assert.equal(Core.parseGoogleIdToken(null), null);
+  assert.equal(Core.parseGoogleIdToken(fakeIdToken({ sub: 'abc', email: 'hana@example.com' })), null);
+  assert.equal(Core.parseGoogleIdToken(fakeIdToken({ sub: '1234567', email: 'bad@' })), null);
+});
+
+test('Google連携: 連携ありの登録は googleLinked と sub を保存し、なしは false になる', () => {
+  const linked = Core.validatePassengerProfile(validPassenger({
+    googleLinked: true, googleSub: '1234567890'
+  }));
+  assert.equal(linked.ok, true);
+  assert.equal(linked.profile.googleLinked, true);
+  assert.equal(linked.profile.googleSub, '1234567890');
+
+  const plain = Core.validatePassengerProfile(validPassenger());
+  assert.equal(plain.ok, true);
+  assert.equal(plain.profile.googleLinked, false);
+});
+
+test('Google連携: sub が不正な連携は拒否する', () => {
+  const r = Core.validatePassengerProfile(validPassenger({
+    googleLinked: true, googleSub: 'DROP TABLE'
+  }));
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.googleSub);
+});
+
 // ---- 審査状態と操作可否 ----
 
 test('審査待ちの運転手は受付・料金提示・迎車のすべてが不可', () => {

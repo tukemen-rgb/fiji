@@ -16,6 +16,44 @@
 
   var store = loadStore();
 
+  // 接続設定は実行中のメモリにのみ保持する。
+  // CLAUDE.md の方針: キー類を公開リポジトリ・URLクエリ・ブラウザ保存に置かない。
+  var runtimeConfig = { googleClientId: '', mapsApiKey: '' };
+  var mapsState = { loading: false, ready: false, failed: false, failReason: '' };
+  var gsiState = { loading: false, ready: false, failed: false };
+  // Google連携の取り込み結果（未登録の間だけメモリ保持。端末には保存しない）
+  var pendingGoogle = null;
+
+  function loadExternalScript(src, timeoutMs, onDone) {
+    var el = document.createElement('script');
+    var done = false;
+    var timer = window.setTimeout(function () {
+      if (done) return;
+      done = true;
+      onDone(new Error('timeout'));
+    }, timeoutMs);
+    el.src = src;
+    el.async = true;
+    el.onload = function () {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      onDone(null);
+    };
+    el.onerror = function () {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      onDone(new Error('load_error'));
+    };
+    document.head.appendChild(el);
+  }
+
+  function maskSecret(v) {
+    if (!v) return '未設定';
+    return '設定済み（…' + v.slice(-4) + '）';
+  }
+
   function loadStore() {
     try {
       return Core.deserializeStore(window.localStorage.getItem(STORAGE_KEY));
@@ -87,6 +125,7 @@
       if (!store.passengerProfile) return go('passenger/register');
       return renderPassengerHome(r[2] || 'ride');
     }
+    if (r[0] === 'settings') return renderSettings();
     if (r[0] === 'driver' && r[1] === 'register') return renderDriverRegister();
     if (r[0] === 'driver' && r[1] === 'home') {
       if (!store.driverApplication) return go('driver/register');
@@ -109,7 +148,7 @@
     var p = store.passengerProfile;
     var d = store.driverApplication;
     root.innerHTML =
-      topbar(false) +
+      topbar(false, '<button class="small-action" data-go="settings">接続設定</button>') +
       '<h1>どちらで利用しますか？</h1>' +
       '<p class="lede">役割ごとに登録内容と画面が分かれます。あとからもう一方も登録できます。</p>' +
       '<div class="stack">' +
@@ -128,11 +167,51 @@
       '</div>' +
       '<p class="footnote">登録内容はこの端末にのみ保存されます（本人確認・サーバー保存・別端末同期は未接続の試験版です）。</p>';
 
+    bindNav();
     bind('#choose-passenger', function () {
       go(store.passengerProfile ? 'passenger/home/ride' : 'passenger/register');
     });
     bind('#choose-driver', function () {
       go(store.driverApplication ? 'driver/home/main' : 'driver/register');
+    });
+  }
+
+  // ---- 接続設定（Google 連携 / Google Maps） -------------------------------
+  function renderSettings() {
+    root.innerHTML =
+      topbar(true) +
+      '<h1>接続設定</h1>' +
+      '<p class="lede">Google登録連携と地図表示に使う、あなたのGoogle Cloudの識別子を設定します。</p>' +
+      '<form class="card stack" id="settings-form" novalidate>' +
+        fieldText('cfg-gsi', 'Google OAuth クライアントID', runtimeConfig.googleClientId, {
+          hint: '（〜.apps.googleusercontent.com）',
+          placeholder: '例: 1234-abc.apps.googleusercontent.com'
+        }) +
+        fieldText('cfg-maps', 'Google Maps ブラウザキー', runtimeConfig.mapsApiKey, {
+          hint: '（HTTPリファラ制限付き）', type: 'password'
+        }) +
+        '<button class="primary" type="submit">この実行中だけ有効にする</button>' +
+        '<p class="inline-note" id="cfg-status" hidden></p>' +
+      '</form>' +
+      '<div class="stack" style="margin-top:16px">' +
+        '<p class="inline-note">現在の状態 — Google連携: <strong>' + esc(maskSecret(runtimeConfig.googleClientId)) +
+          '</strong> ／ Maps: <strong>' + esc(maskSecret(runtimeConfig.mapsApiKey)) + '</strong></p>' +
+        '<p class="footnote">セキュリティ方針（CLAUDE.md）により、キーはリポジトリ・URL・端末保存に置かず、この実行中のメモリにのみ保持します。ページを再読み込みすると再入力が必要です。</p>' +
+        '<p class="footnote">claude.ai のプレビューページでは外部スクリプトが遮断されるため、Google連携・地図は動作しません。README の起動方法（ローカル起動）か、自社ドメインでのホスティングで確認してください。キーには必ずリファラ制限を設定してください。</p>' +
+      '</div>';
+
+    bindNav();
+    document.getElementById('settings-form').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      runtimeConfig.googleClientId = val('cfg-gsi').trim();
+      runtimeConfig.mapsApiKey = val('cfg-maps').trim();
+      // 設定し直したら読み込み状態をリセットして再試行できるようにする
+      mapsState = { loading: false, ready: !!(window.google && window.google.maps), failed: false, failReason: '' };
+      gsiState = { loading: false, ready: !!(window.google && window.google.accounts), failed: false };
+      var status = document.getElementById('cfg-status');
+      status.textContent = '保存しました（この実行中のみ有効） — Google連携: ' +
+        maskSecret(runtimeConfig.googleClientId) + ' ／ Maps: ' + maskSecret(runtimeConfig.mapsApiKey);
+      status.hidden = false;
     });
   }
 
@@ -213,11 +292,36 @@
     var phoneLocal = src.phoneLocal != null ? src.phoneLocal
       : (src.phone ? String(src.phone).split(' ')[1] || '' : '');
 
+    var googleBlock = '';
+    if (!editing) {
+      if (pendingGoogle) {
+        googleBlock =
+          '<div class="banner info" id="google-linked">' + icon('shield', 20) +
+          '<span><strong>Google連携で取り込み済み</strong>' + esc(pendingGoogle.email) +
+          ' の表示名とメールを入力しました。内容は編集できます（サーバー検証は未接続）。</span></div>';
+      } else if (runtimeConfig.googleClientId) {
+        googleBlock =
+          '<div class="card stack" id="google-card">' +
+            '<h2>Googleで登録情報を入力</h2>' +
+            '<div id="gsi-button" aria-label="Googleで続行"></div>' +
+            '<p class="footnote" id="gsi-note">Googleの表示名とメールを取り込んでフォームに入力します。取り込み後も内容は編集でき、同意のうえで登録します。</p>' +
+          '</div>';
+      } else {
+        googleBlock =
+          '<div class="card stack" id="google-card">' +
+            '<h2>Googleで登録情報を入力</h2>' +
+            '<p class="footnote">「接続設定」で Google OAuth クライアントID を設定すると、Googleの表示名とメールを取り込めます。</p>' +
+            '<button class="secondary" type="button" data-go="settings">接続設定を開く</button>' +
+          '</div>';
+      }
+    }
+
     root.innerHTML =
       topbar(true, '<button class="small-action" id="fill-sample" type="button">サンプル情報を入力する</button>') +
       '<h1>' + (editing ? '利用者の登録情報を編集' : '利用者の登録') + '</h1>' +
       '<p class="lede">配車の連絡に必要な項目だけを確認します。免許や営業許可の入力は不要です。</p>' +
-      '<form class="card stack" id="passenger-form" novalidate>' +
+      googleBlock +
+      '<form class="card stack" id="passenger-form" novalidate' + (googleBlock ? ' style="margin-top:12px"' : '') + '>' +
         fieldText('p-name', '表示名', src.displayName, { placeholder: '例: 佐藤 花子' }) +
         fieldPhone('p-cc', 'p-phone', '連絡先（国番号付き）', src.countryCode, phoneLocal) +
         fieldText('p-email', 'メールアドレス', src.email, { type: 'email', hint: '（任意）', placeholder: 'hana@example.com' }) +
@@ -241,8 +345,61 @@
         language: val('p-lang'),
         defaultPickup: val('p-pickup'),
         payment: val('p-pay'),
-        consent: checkedOf('p-consent')
+        consent: checkedOf('p-consent'),
+        googleLinked: !!pendingGoogle,
+        googleSub: pendingGoogle ? pendingGoogle.sub : ''
       };
+    }
+
+    // Google Identity Services: クライアントID設定時のみ読み込み、公式ボタンを描画する。
+    // 取り込みは入力補助であり認証ではない（IDトークンのサーバー検証は未接続）。
+    if (!editing && runtimeConfig.googleClientId && !pendingGoogle) {
+      var mountGsiButton = function () {
+        var slot = document.getElementById('gsi-button');
+        if (!slot || !(window.google && window.google.accounts && window.google.accounts.id)) return;
+        try {
+          window.google.accounts.id.initialize({
+            client_id: runtimeConfig.googleClientId,
+            callback: function (resp) {
+              var parsed = Core.parseGoogleIdToken(resp && resp.credential);
+              var note = document.getElementById('gsi-note');
+              if (!parsed) {
+                if (note) note.textContent = 'Googleからの応答を確認できませんでした。もう一度お試しください。';
+                return;
+              }
+              pendingGoogle = parsed;
+              var nameEl = document.getElementById('p-name');
+              var emailEl = document.getElementById('p-email');
+              if (nameEl && !nameEl.value && parsed.name) nameEl.value = parsed.name;
+              if (emailEl) emailEl.value = parsed.email;
+              renderPassengerRegister();
+            }
+          });
+          window.google.accounts.id.renderButton(slot, {
+            type: 'standard', theme: 'outline', size: 'large', text: 'signup_with', locale: 'ja'
+          });
+          gsiState.ready = true;
+        } catch (e) {
+          gsiState.failed = true;
+          var n = document.getElementById('gsi-note');
+          if (n) n.textContent = 'Google連携を初期化できませんでした。クライアントIDと許可済みオリジンを確認してください。';
+        }
+      };
+      if (window.google && window.google.accounts && window.google.accounts.id) {
+        mountGsiButton();
+      } else if (!gsiState.loading) {
+        gsiState.loading = true;
+        loadExternalScript('https://accounts.google.com/gsi/client', 8000, function (err) {
+          gsiState.loading = false;
+          if (err) {
+            gsiState.failed = true;
+            var n = document.getElementById('gsi-note');
+            if (n) n.textContent = 'Googleに接続できませんでした（この環境では外部接続が遮断されている可能性があります）。ローカル起動または自社ホスティングで確認してください。';
+            return;
+          }
+          mountGsiButton();
+        });
+      }
     }
 
     // 登録途中の復帰: 入力のたびに下書き保存（既存プロフィール編集中は下書きにしない）
@@ -272,6 +429,11 @@
       ev.preventDefault();
       var result = Core.validatePassengerProfile(collect());
       if (!result.ok) {
+        if (result.errors.googleSub) {
+          // 取り込み結果が壊れている場合は連携をやり直せるよう破棄する
+          pendingGoogle = null;
+          return renderPassengerRegister();
+        }
         showErrors(result.errors, {
           displayName: 'p-name', phone: 'p-phone', email: 'p-email',
           language: 'p-lang', defaultPickup: 'p-pickup', payment: 'p-pay', consent: 'p-consent'
@@ -280,6 +442,7 @@
       }
       store.passengerProfile = result.profile;
       store.passengerDraft = null;
+      pendingGoogle = null;
       saveStore();
       go('passenger/home/ride');
     });
@@ -317,14 +480,27 @@
     var body = '';
 
     if (tab === 'ride') {
+      var useLiveMap = !!runtimeConfig.mapsApiKey && !mapsState.failed;
+      var mapBlock = useLiveMap
+        ? '<div class="map-demo map-tall" id="map-box">' +
+            '<div class="gmap" id="gmap"></div>' +
+            '<span class="map-tag" id="map-status">' + (mapsState.ready ? 'Google Maps 接続済み' : 'Google Maps 読み込み中…') + '</span>' +
+          '</div>'
+        : '<div class="map-demo" id="map-box" role="img" aria-label="略地図（デモ表示）">' +
+            '<span class="map-tag">略地図・デモ表示（Google Maps 未接続' +
+            (mapsState.failed ? '・接続に失敗しました' : '') + '）</span>' +
+            '<span class="pin">' + icon('pin', 30) + '</span>' +
+          '</div>' +
+          (mapsState.failed
+            ? '<p class="inline-note">Google Maps に接続できませんでした（' + esc(mapsState.failReason) +
+              '）。キーのリファラ制限と起動方法（README）を確認してください。claude.ai のプレビューでは外部接続が遮断されます。</p>'
+            : (runtimeConfig.mapsApiKey ? '' :
+              '<p class="footnote">「接続設定」で制限付きの Google Maps ブラウザキーを設定すると、実際の地図と現在地を表示します。</p>'));
       body =
         '<h1>こんにちは、' + esc(p.displayName) + ' さん</h1>' +
         '<p class="lede">どこへ行きますか？</p>' +
         '<div class="stack-lg">' +
-          '<div class="map-demo" role="img" aria-label="略地図（デモ表示）">' +
-            '<span class="map-tag">略地図・デモ表示（Google Maps 未接続）</span>' +
-            '<span class="pin">' + icon('pin', 30) + '</span>' +
-          '</div>' +
+          mapBlock +
           '<div class="card stack">' +
             fieldText('ride-pickup', '乗車地点', p.defaultPickup, { placeholder: '例: Nadi マリーナホテル' }) +
             fieldText('ride-dest', '行き先', '', { placeholder: '例: ナンディ国際空港' }) +
@@ -358,6 +534,7 @@
             kvRow('連絡に使う言語', labelOf(Core.LANGUAGES, p.language)) +
             kvRow('既定の乗車地点', p.defaultPickup || '未設定') +
             kvRow('支払い方法', labelOf(Core.PAYMENTS, p.payment)) +
+            kvRow('Google連携', p.googleLinked ? '連携済み（サーバー検証は未接続）' : '未連携') +
           '</dl>' +
           '<button class="secondary" data-go="passenger/register">登録情報を編集する</button>' +
           '<button class="small-action" id="reset-device">この端末の登録データをすべて消す</button>' +
@@ -369,8 +546,112 @@
     bind('#find-offers', function () {
       var note = document.getElementById('ride-note');
       if (note) note.hidden = false;
+      panToDestination();
     });
     bind('#reset-device', resetDevice);
+    if (tab === 'ride' && runtimeConfig.mapsApiKey && !mapsState.failed) ensureLiveMap();
+  }
+
+  // ---- Google Maps（キー設定時のみ・失敗時は略地図へ戻す） -----------------
+  var NADI = { lat: -17.7765, lng: 177.4356 };
+  var liveMap = null;
+  var pickupMarker = null;
+  var destMarker = null;
+
+  function mapsFailed(reason) {
+    mapsState.failed = true;
+    mapsState.failReason = reason;
+    mapsState.loading = false;
+    mapsState.ready = false;
+    var r = currentRoute();
+    if (r[0] === 'passenger' && r[1] === 'home' && (r[2] || 'ride') === 'ride') render();
+  }
+
+  // Maps JS API はキー不正時にこのグローバルを呼ぶ
+  window.gm_authFailure = function () {
+    mapsFailed('キーが無効か、このURLがキーのリファラ制限で許可されていません');
+  };
+
+  function ensureLiveMap() {
+    if (window.google && window.google.maps && window.google.maps.Map) return initLiveMap();
+    if (mapsState.loading) return;
+    mapsState.loading = true;
+    window.__taxiMapsReady = function () {
+      mapsState.loading = false;
+      initLiveMap();
+    };
+    loadExternalScript(
+      'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(runtimeConfig.mapsApiKey) +
+        '&v=weekly&region=FJ&language=ja&callback=__taxiMapsReady',
+      10000,
+      function (err) {
+        if (err && !(window.google && window.google.maps)) {
+          mapsFailed(err.message === 'timeout' ? '応答がありません（タイムアウト）' : '読み込みに失敗しました');
+        }
+      }
+    );
+  }
+
+  function initLiveMap() {
+    var el = document.getElementById('gmap');
+    if (!el || !(window.google && window.google.maps)) return;
+    try {
+      liveMap = new window.google.maps.Map(el, {
+        center: NADI,
+        zoom: 14,
+        disableDefaultUI: true,
+        gestureHandling: 'greedy'
+      });
+      pickupMarker = new window.google.maps.Marker({ map: liveMap, position: NADI, title: '乗車地点' });
+      window.google.maps.event.addListenerOnce(liveMap, 'idle', function () {
+        mapsState.ready = true;
+        var tag = document.getElementById('map-status');
+        if (tag) tag.textContent = 'Google Maps 接続済み';
+      });
+      locatePickup();
+    } catch (e) {
+      mapsFailed('地図を初期化できませんでした');
+    }
+  }
+
+  function locatePickup() {
+    if (!navigator.geolocation || !liveMap) return;
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      var here = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      liveMap.setCenter(here);
+      if (pickupMarker) pickupMarker.setPosition(here);
+      var tag = document.getElementById('map-status');
+      if (tag) tag.textContent = 'Google Maps 接続済み・現在地を表示';
+    }, function () {
+      /* 位置情報が拒否されても Nadi 中心のまま続行 */
+    }, { enableHighAccuracy: true, timeout: 8000 });
+  }
+
+  // 「料金を比較する」押下時: 地図接続中なら行き先を検索して地図上に表示する
+  function panToDestination() {
+    var destInput = document.getElementById('ride-dest');
+    var q = destInput ? destInput.value.trim() : '';
+    if (!q || !mapsState.ready || !liveMap || !(window.google && window.google.maps)) return;
+    try {
+      new window.google.maps.Geocoder().geocode(
+        { address: q, region: 'FJ' },
+        function (results, status) {
+          if (status !== 'OK' || !results || !results[0]) return;
+          var loc = results[0].geometry.location;
+          if (!destMarker) {
+            destMarker = new window.google.maps.Marker({ map: liveMap, position: loc, title: '行き先' });
+          } else {
+            destMarker.setPosition(loc);
+          }
+          var bounds = new window.google.maps.LatLngBounds();
+          bounds.extend(pickupMarker.getPosition());
+          bounds.extend(loc);
+          liveMap.fitBounds(bounds, 48);
+        }
+      );
+    } catch (e) {
+      /* 地図表示の補助機能なので、失敗しても依頼入力は継続できる */
+    }
   }
 
   // ---- 運転手登録（3段階） ------------------------------------------------------
