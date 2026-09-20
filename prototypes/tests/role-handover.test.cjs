@@ -140,6 +140,27 @@ test('late geolocation result cannot overwrite a newer manual pickup', () => {
   const applied=pickup.locationSuccess(fresh.token,'現在地');
   assert.equal(applied.accepted,true);assert.equal(applied.state.value,'現在地');assert.equal(applied.state.source,'geolocation');
 });
+test('passenger registration synchronizes its default pickup into the first ride request', () => {
+  assert.match(source,/const p=model\.registerPassenger\(input\);state\.pickup=p\.pickup\|\|'Nadi, Fiji';\s*pickupInput\.setManual\(state\.pickup\);/);
+  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi, Fiji');
+  m.chooseRole('passenger');
+  const profile=m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Ramada Suites Wailoaloa',consent:true});
+  pickup.setManual(profile.pickup||'Nadi, Fiji');
+  const ride=m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'});
+  assert.equal(ride.pickup,'Ramada Suites Wailoaloa');assert.notEqual(ride.pickup,'Nadi, Fiji');
+});
+test('profile pickup change wins over a location request started before re-registration', () => {
+  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi, Fiji');
+  m.chooseRole('passenger');
+  m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Ramada Suites Wailoaloa',consent:true});
+  const oldLocation=pickup.beginLocation();
+  const updated=m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Radisson Blu Denarau',consent:true});
+  pickup.setManual(updated.pickup||'Nadi, Fiji');
+  const stale=pickup.locationSuccess(oldLocation.token,'現在地');
+  assert.equal(stale.accepted,false);assert.equal(stale.state.value,'Radisson Blu Denarau');
+  const ride=m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'});
+  assert.equal(ride.pickup,'Radisson Blu Denarau');
+});
 function selected() {
   const s=setup(), {m}=s;
   passenger(m);
