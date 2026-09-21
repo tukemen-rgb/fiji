@@ -27,6 +27,7 @@ const ACTORS = new Map([
 ]);
 const FORBIDDEN_INPUTS = new Set(['passengerId', 'driverId', 'reviewerId', 'approved', 'eligible', 'reviewStatus']);
 const AUDIT_FIELDS = Object.freeze(['id', 'type', 'outcome', 'reason', 'actorRole', 'actorRef', 'requestId', 'offerId', 'fromRevision', 'toRevision', 'occurredAt']);
+const CANCELLATION_REASONS = Object.freeze(['passenger_requested', 'route_changed', 'schedule_changed']);
 
 function errorBody(code, message, suffix = 'error') {
   return {code, message, requestId: `trace-mock-${suffix}`};
@@ -282,6 +283,12 @@ function createMockHandler(state = createMockState()) {
     if (req.method === 'POST' && url.pathname === cancelPath) {
       if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
       if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
+      const cancelFields = ['expectedRevision', 'reason'];
+      if (Object.keys(body).some(key => !cancelFields.includes(key)) ||
+          !Number.isInteger(body.expectedRevision) || body.expectedRevision < 1 ||
+          !CANCELLATION_REASONS.includes(body.reason)) {
+        return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
+      }
       if (state.commandDelays.cancel) await new Promise(resolve => setTimeout(resolve, state.commandDelays.cancel));
       const response = await atomicCommand(state, actor, req, url, body, () => {
         const fromRevision = state.ride.revision;
@@ -294,7 +301,7 @@ function createMockHandler(state = createMockState()) {
           return {status: 409, body: errorBody('invalid_transition', 'The request can no longer be cancelled.', 'transition')};
         }
         state.ride.status = 'cancelled'; state.ride.revision += 1; state.ride.cancelReason = body.reason; state.ride.vehicleConfirmation = null;
-        recordAudit(state, actor, {type: 'ride.cancellation', outcome: 'committed', fromRevision, toRevision: state.ride.revision});
+        recordAudit(state, actor, {type: 'ride.cancellation', outcome: 'committed', reason: body.reason, fromRevision, toRevision: state.ride.revision});
         return {status: 200, body: structuredClone(state.ride)};
       });
       return send(res, response.status, response.body);
@@ -880,6 +887,45 @@ async function runMockContract() {
   }
 }
 
+async function runCancellationReasonContract() {
+  const cancel = (mock, key, body) => requestJson(mock.baseUrl, {
+    method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/cancel`, token: FIXTURE.tokens.owner,
+    headers: {'Idempotency-Key': key}, body
+  }, fetch);
+  const allowed = await Promise.all(CANCELLATION_REASONS.map(async (reason, index) => {
+    const mock = await startMockServer();
+    try {
+      const result = await cancel(mock, `cancel-reason-allowed-${index}-0001`, {expectedRevision: FIXTURE.revision, reason});
+      if (result.status !== 200 || result.body?.cancelReason !== reason) throw new Error(`allowed cancellation reason was not preserved: ${reason}`);
+      if (mock.state.auditEvents.length !== 1 || mock.state.auditEvents[0].reason !== reason) throw new Error(`allowed cancellation reason was not audited: ${reason}`);
+      return {reason, result, state: structuredClone(mock.state.ride), auditEvents: structuredClone(mock.state.auditEvents)};
+    } finally {
+      await mock.close();
+    }
+  }));
+  const invalidMock = await startMockServer();
+  try {
+    const invalidBodies = [
+      {expectedRevision: FIXTURE.revision},
+      {expectedRevision: FIXTURE.revision, reason: 'search_edited'},
+      {expectedRevision: FIXTURE.revision, reason: 1},
+      {expectedRevision: FIXTURE.revision, reason: 'passenger_requested', note: 'untrusted'}
+    ];
+    const invalid = [];
+    for (const [index, body] of invalidBodies.entries()) {
+      invalid.push(await cancel(invalidMock, `cancel-reason-invalid-${index}-0001`, body));
+    }
+    if (invalid.some(result => result.status !== 422 || result.body?.code !== 'invalid_request')) throw new Error('invalid cancellation reason or field was accepted');
+    if (invalidMock.state.ride.status !== 'collecting' || invalidMock.state.ride.revision !== FIXTURE.revision ||
+        invalidMock.state.auditEvents.length || invalidMock.state.idempotency.size) {
+      throw new Error('invalid cancellation input changed state, audit, or idempotency records');
+    }
+    return {allowed, invalid, invalidState: structuredClone(invalidMock.state.ride), invalidAuditEvents: structuredClone(invalidMock.state.auditEvents), invalidStoredKeys: invalidMock.state.idempotency.size};
+  } finally {
+    await invalidMock.close();
+  }
+}
+
 async function runConcurrencyContract() {
   const mock = await startMockServer();
   const common = {method: 'POST', token: FIXTURE.tokens.owner};
@@ -1368,7 +1414,7 @@ async function runCommandRecoveryContract() {
 }
 
 if (require.main === module) {
-  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract(), runCommandRecoveryContract(), runCurrentRideDiscoveryContract()]).then(([results, audit, retry, notification, commandRecovery, currentRide]) => {
+  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract(), runCommandRecoveryContract(), runCurrentRideDiscoveryContract(), runCancellationReasonContract()]).then(([results, audit, retry, notification, commandRecovery, currentRide, cancellationReasons]) => {
     const {race, validity, rideSafety, boardingRace} = audit;
     const merge = runRevisionMergeContract();
     const session = runSessionIsolationContract();
@@ -1386,6 +1432,7 @@ if (require.main === module) {
     console.log(`Command session OK: expired and stale-session results stopped without auto-retry; same raw key separated ${commandSession.accountAScope !== commandSession.accountBScope ? 'by account' : 'incorrectly'}`);
     console.log(`Command recovery OK: applied state skipped replay; unchanged state replayed once; changed/access-lost/stale sessions stopped (${commandRecovery.replayCalls.length} explicit replay)`);
     console.log(`Current ride discovery OK: ${currentRide.passenger.body.viewerRole}/${currentRide.driver.body.viewerRole} found one active ride; unrelated and terminal viewers received bodyless 204; ambiguity stopped with 409`);
+    console.log(`HTTP cancellation reason OK: ${cancellationReasons.allowed.map(item => item.reason).join('/')}; invalid values changed no state`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -1393,4 +1440,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, CANCELLATION_REASONS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runCancellationReasonContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};

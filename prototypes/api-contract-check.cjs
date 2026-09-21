@@ -16,6 +16,7 @@ const OPERATIONS = [
   ['post', '/v1/rides/{requestId}/transitions', 'transitionRide', 'expectedRevision']
 ];
 const FORBIDDEN_INPUT_FIELDS = new Set(['passengerId', 'driverId', 'reviewerId', 'approved', 'eligible', 'reviewStatus']);
+const CANCELLATION_REASONS = Object.freeze(['passenger_requested', 'route_changed', 'schedule_changed']);
 
 function loadContract(file = DEFAULT_SPEC) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -95,6 +96,14 @@ function validateContract(spec) {
   if (quote?.readOnly !== true || quote?.properties?.selectedAt?.format !== 'date-time') add('selected quote must be a server-owned dated snapshot');
   const revision = spec.components?.schemas?.Revision;
   if (revision?.type !== 'integer' || revision?.minimum !== 1) add('revision must be an integer beginning at 1');
+  const cancellation = spec.components?.schemas?.CancelRideInput;
+  const cancellationReasons = cancellation?.properties?.reason?.enum;
+  if (!cancellation?.required?.includes('reason') ||
+      !Array.isArray(cancellationReasons) ||
+      cancellationReasons.length !== CANCELLATION_REASONS.length ||
+      CANCELLATION_REASONS.some(reason => !cancellationReasons.includes(reason))) {
+    add(`CancelRideInput reason must allow exactly ${CANCELLATION_REASONS.join(', ')}`);
+  }
   const rideState = spec.components?.schemas?.RideStateView;
   const safeRideStateFields = new Set(['id', 'status', 'revision', 'viewerRole', 'nextAction', 'updatedAt']);
   if (rideState?.additionalProperties !== false) add('RideStateView must reject unlisted response fields');
@@ -162,4 +171,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = {DEFAULT_SPEC, OPERATIONS, loadContract, validateContract};
+module.exports = {DEFAULT_SPEC, OPERATIONS, CANCELLATION_REASONS, loadContract, validateContract};
