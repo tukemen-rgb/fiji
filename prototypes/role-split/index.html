@@ -1348,30 +1348,35 @@
     return googleIdentityRegistrationSnapshot({googleInputAssisted:input.googleInputAssisted===true});
   }
   function googleMapsConnectionView(input={}){
-    if(input.authFailure===true||input.loadFailed===true)return Object.freeze({state:'failed',label:'略地図・デモ表示（Google Maps 接続失敗）',live:false,action:'retry'});
+    if(input.authFailure===true||input.loadFailed===true)return Object.freeze({state:'failed',label:'略地図・デモ表示（Google Maps 接続失敗）',live:false,action:'reload'});
     if(input.configured===true&&input.apiLoaded===true&&input.mapIdle===true)return Object.freeze({state:'connected',label:'Google Maps 接続済み',live:true,action:null});
     if(input.configured===true)return Object.freeze({state:'connecting',label:'Google Maps 接続確認中',live:false,action:null});
     return Object.freeze({state:'demo',label:'略地図・デモ表示（Google Maps 未接続）',live:false,action:'configure'});
   }
   function createGoogleMapsReadinessController(){
-    let generation=0,configured=false,apiLoaded=false,mapIdle=false,locationReady=false,failed=false;
+    let generation=0,configured=false,apiLoaded=false,mapIdle=false,locationReady=false,failed=false,reloadRequired=false;
     const snapshot=()=>{
       const base=googleMapsConnectionView({configured,apiLoaded,mapIdle,loadFailed:failed});
-      return Object.freeze({...base,generation,locationReady,
+      return Object.freeze({...base,generation,locationReady,reloadRequired,
         label:base.state==='connected'&&locationReady?'Google Maps 接続済み・現在地を表示':base.label});
     };
     const update=(token,change)=>{
       if(token!==generation)return Object.freeze({accepted:false,reason:'stale_generation',state:snapshot()});
+      if(reloadRequired)return Object.freeze({accepted:false,reason:'reload_required',state:snapshot()});
       change();return Object.freeze({accepted:true,reason:'updated',state:snapshot()});
     };
     const begin=(enabled=true)=>{
+      if(reloadRequired)return Object.freeze({accepted:false,reason:'reload_required',token:generation,state:snapshot()});
       generation+=1;configured=enabled===true;apiLoaded=false;mapIdle=false;locationReady=false;failed=false;
-      return Object.freeze({token:generation,state:snapshot()});
+      return Object.freeze({accepted:true,reason:'started',token:generation,state:snapshot()});
     };
     const apiReady=token=>update(token,()=>{if(configured&&!failed)apiLoaded=true;});
     const idle=token=>update(token,()=>{if(configured&&apiLoaded&&!failed)mapIdle=true;});
     const location=token=>update(token,()=>{if(configured&&!failed)locationReady=true;});
-    const fail=token=>update(token,()=>{failed=true;apiLoaded=false;mapIdle=false;locationReady=false;});
+    // Google Maps exposes authentication failure through one page-global callback.
+    // After an injected script fails, a same-page retry cannot attribute a late
+    // callback to the old or new script. Require a reload instead of racing it.
+    const fail=token=>update(token,()=>{failed=true;reloadRequired=true;apiLoaded=false;mapIdle=false;locationReady=false;});
     return Object.freeze({snapshot,begin,apiReady,idle,location,fail});
   }
   function createPickupInputController(initial=''){
@@ -1627,7 +1632,7 @@ const placeSelection = R.createGooglePlaceSelectionController();
 const mapsReadiness = R.createGoogleMapsReadinessController();
 let records = model.state.records;
 const names = {taxi_permit:'Taxi Permit（営業許可）',vehicle_licence:'車両登録・PSV車両資格',driver_licence:'運転免許',psv_driver_permit:'PSV運転手許可',fitness:'車両検査・適合証明',insurance:'営業利用を含む保険',operator_assignment:'名義人の同意・運転権限',airport_authorization:'空港側の営業承認'};
-const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapConnectionToken:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
+const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapConnectionToken:null, mapScript:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
 const pickupInput=R.createPickupInputController(state.pickup);
 const commandUi=R.createCommandUiController();
 let restartStorage=null;try{restartStorage=window.localStorage;}catch{}
@@ -1935,8 +1940,8 @@ $('registration-form').onsubmit = e => {
 function clearLines(){state.mapLines.forEach(l=>l.setMap(null));state.mapLines=[];state.mapMarks.forEach(m=>m.setMap(null));state.mapMarks=[];}
 function mapFail(text){
   placeSelection.cancel();state.routeSeq++;clearLines();
-  state.mapReady=false;state.loadingMap=false;state.map=null;state.routeLib=null;state.mapConnectionToken=null;state.destination=$('destination').value.trim();pickupInput.mapFailure();
-  $('connect-maps').disabled=false;$('maps-message').textContent=text;$('map-caption').textContent='地図未接続 · デモ図';
+  state.mapReady=false;state.loadingMap=false;state.map=null;state.routeLib=null;state.mapConnectionToken=null;state.mapScript?.remove();state.mapScript=null;state.destination=$('destination').value.trim();pickupInput.mapFailure();
+  $('connect-maps').disabled=true;$('maps-message').textContent=text+' 安全な再接続にはページを再読み込みしてください。';$('map-caption').textContent='地図未接続 · デモ図';
   $('map').hidden=true;$('demo-map').hidden=false;$('google-search').replaceChildren();$('google-search').hidden=true;$('offline-search').hidden=false;
   $('live-summary').hidden=true;$('route-status').textContent='地図未接続。目的地は手入力できます。';$('demo-route').hidden=!state.destination;$('demo-end').hidden=!state.destination;
 }
@@ -1945,7 +1950,8 @@ $('connect-maps').onclick = async () => {
   if (!key) return $('maps-message').textContent='制限付きブラウザキーを入力してください。';
   if (!/^https?:$/.test(location.protocol)) return $('maps-message').textContent='このHTMLの直接表示ではなく、HTTPSサイトまたはlocalhost上で接続してください。';
   if (state.loadingMap || state.mapReady) return toast('既に接続中か接続済みです。変更時は再読み込みしてください。');
-  const connection=mapsReadiness.begin(true),callbackName='taxiInitMap'+connection.token;let init,timer;
+  const connection=mapsReadiness.begin(true);if(!connection.accepted)return $('maps-message').textContent='安全な再接続にはページを再読み込みしてください。';
+  const callbackName='taxiInitMap'+connection.token;let init,timer;
   state.mapConnectionToken=connection.token;state.loadingMap=true; $('connect-maps').disabled=true; $('maps-message').textContent='接続確認中…';
   const current=()=>state.mapConnectionToken===connection.token&&mapsReadiness.snapshot().generation===connection.token;
   const fail = ()=>{const failed=mapsReadiness.fail(connection.token);if(!failed.accepted||!current())return;clearTimeout(timer);if(window[callbackName]===init)delete window[callbackName];mapFail('地図を接続できません。API有効化・キーの制限・課金設定・ネットワークを確認してください。');};
@@ -1978,7 +1984,7 @@ $('connect-maps').onclick = async () => {
   };
   window[callbackName]=init;
   const script=document.createElement('script');
-  script.src='https://maps.googleapis.com/maps/api/js?key='+encodeURIComponent(key)+'&loading=async&v=weekly&callback='+encodeURIComponent(callbackName);script.async=true;script.onerror=fail;document.head.appendChild(script);
+  script.src='https://maps.googleapis.com/maps/api/js?key='+encodeURIComponent(key)+'&loading=async&v=weekly&callback='+encodeURIComponent(callbackName);script.async=true;script.onerror=fail;state.mapScript=script;document.head.appendChild(script);
 };
 async function drawRoute(){
   if(!state.mapReady || !state.destination)return;

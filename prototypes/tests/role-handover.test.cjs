@@ -90,7 +90,7 @@ test('Google Maps reports connected only after API load and map idle, then fails
   const connected=R.googleMapsConnectionView({configured:true,apiLoaded:true,mapIdle:true});
   assert.equal(connected.state,'connected');assert.equal(connected.live,true);assert.match(connected.label,/接続済み/);
   for(const failure of [{configured:true,apiLoaded:true,mapIdle:true,authFailure:true},{configured:true,loadFailed:true}]){
-    const view=R.googleMapsConnectionView(failure);assert.equal(view.state,'failed');assert.equal(view.live,false);assert.equal(view.action,'retry');assert.match(view.label,/デモ表示/);
+    const view=R.googleMapsConnectionView(failure);assert.equal(view.state,'failed');assert.equal(view.live,false);assert.equal(view.action,'reload');assert.match(view.label,/デモ表示/);
   }
 });
 test('Google Maps geolocation cannot report connected before the active map reaches idle', () => {
@@ -104,24 +104,21 @@ test('Google Maps geolocation cannot report connected before the active map reac
   const idle=maps.idle(first.token);
   assert.equal(idle.state.live,true);assert.equal(idle.state.label,'Google Maps 接続済み・現在地を表示');
 });
-test('Google Maps retry rejects stale callbacks and auth failure removes connected state', () => {
+test('Google Maps auth failure removes connected state and requires reload', () => {
   const {R}=setup(),maps=R.createGoogleMapsReadinessController();
   const first=maps.begin(true);
   maps.apiReady(first.token);maps.location(first.token);maps.idle(first.token);
   assert.equal(maps.snapshot().state,'connected');
   const failed=maps.fail(first.token);
   assert.equal(failed.state.state,'failed');assert.equal(failed.state.live,false);assert.equal(failed.state.locationReady,false);
-  const retry=maps.begin(true);
+  const retry=maps.begin(true);assert.equal(retry.accepted,false);assert.equal(retry.reason,'reload_required');
   assert.equal(maps.idle(first.token).accepted,false);
   assert.equal(maps.location(first.token).accepted,false);
-  assert.equal(maps.snapshot().generation,retry.token);assert.equal(maps.snapshot().state,'connecting');
-  maps.apiReady(retry.token);maps.idle(retry.token);
-  assert.equal(maps.snapshot().state,'connected');assert.equal(maps.snapshot().locationReady,false);
-  assert.equal(maps.snapshot().label,'Google Maps 接続済み');
+  assert.equal(maps.snapshot().generation,retry.token);assert.equal(maps.snapshot().state,'failed');assert.equal(maps.snapshot().reloadRequired,true);
 });
 test('Google Maps failure returns destination entry to the manual fallback', () => {
   assert.match(source,/function mapFail\(text\)\{\s*placeSelection\.cancel\(\);state\.routeSeq\+\+;clearLines\(\);/);
-  assert.match(source,/state\.mapReady=false;state\.loadingMap=false;state\.map=null;state\.routeLib=null;state\.mapConnectionToken=null;state\.destination=\$\('destination'\)\.value\.trim\(\);pickupInput\.mapFailure\(\);/);
+  assert.match(source,/state\.mapReady=false;state\.loadingMap=false;state\.map=null;state\.routeLib=null;state\.mapConnectionToken=null;state\.mapScript\?\.remove\(\);state\.mapScript=null;state\.destination=\$\('destination'\)\.value\.trim\(\);pickupInput\.mapFailure\(\);/);
   assert.match(source,/\$\('google-search'\)\.replaceChildren\(\);\$\('google-search'\)\.hidden=true;\$\('offline-search'\)\.hidden=false;/);
   assert.match(source,/\$\('live-summary'\)\.hidden=true;\$\('route-status'\)\.textContent='地図未接続。目的地は手入力できます。';/);
 });
@@ -133,18 +130,22 @@ test('Google Maps failure makes a pending place callback stale before fallback i
   assert.equal(selection.fail(pending.token).reason,'stale_place');
 });
 test('live Google Maps connection uses a generation-specific callback and waits for idle', () => {
-  assert.match(source,/const connection=mapsReadiness\.begin\(true\),callbackName='taxiInitMap'\+connection\.token;let init,timer;/);
+  assert.match(source,/const connection=mapsReadiness\.begin\(true\);if\(!connection\.accepted\)return[\s\S]*?const callbackName='taxiInitMap'\+connection\.token;let init,timer;/);
   assert.match(source,/state\.mapConnectionToken=connection\.token;state\.loadingMap=true;[\s\S]*?mapsReadiness\.apiReady\(connection\.token\)/);
   assert.match(source,/google\.maps\.event\.addListenerOnce\(state\.map,'idle',[\s\S]*?mapsReadiness\.idle\(connection\.token\);if\(!current\(\)\|\|!idle\.accepted\|\|idle\.state\.state!=='connected'\)return;/);
   assert.match(source,/callback='\+encodeURIComponent\(callbackName\)/);
   assert.doesNotMatch(source,/callback=taxiInitMap(?:['&])/);
 });
-test('an old Maps callback cannot complete a newer retry generation', () => {
+test('an old Maps callback cannot create a same-page retry generation', () => {
   const {R}=setup(),maps=R.createGoogleMapsReadinessController();
-  const old=maps.begin(true),retry=maps.begin(true);
-  assert.equal(maps.apiReady(old.token).accepted,false);assert.equal(maps.idle(old.token).accepted,false);
-  maps.apiReady(retry.token);assert.notEqual(maps.snapshot().state,'connected');
-  maps.idle(retry.token);assert.equal(maps.snapshot().state,'connected');
+  const old=maps.begin(true);maps.fail(old.token);const retry=maps.begin(true);
+  assert.equal(retry.accepted,false);assert.equal(retry.token,old.token);assert.equal(maps.snapshot().reloadRequired,true);
+  assert.equal(maps.apiReady(old.token).state.state,'failed');assert.equal(maps.idle(old.token).state.state,'failed');
+});
+test('live Maps failure removes the injected script and disables unsafe reconnect', () => {
+  assert.match(source,/state\.mapScript\?\.remove\(\);state\.mapScript=null;[\s\S]*?\$\('connect-maps'\)\.disabled=true;/);
+  assert.match(source,/安全な再接続にはページを再読み込みしてください/);
+  assert.match(source,/script\.onerror=fail;state\.mapScript=script;document\.head\.appendChild\(script\);/);
 });
 test('Google place selection uses a stable address and rejects missing coordinates', () => {
   const {R}=setup();
