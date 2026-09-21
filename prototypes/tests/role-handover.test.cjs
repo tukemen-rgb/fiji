@@ -121,7 +121,7 @@ test('Google Maps retry rejects stale callbacks and auth failure removes connect
 });
 test('Google Maps failure returns destination entry to the manual fallback', () => {
   assert.match(source,/function mapFail\(text\)\{\s*placeSelection\.cancel\(\);state\.routeSeq\+\+;clearLines\(\);/);
-  assert.match(source,/state\.mapReady=false;state\.loadingMap=false;state\.map=null;state\.routeLib=null;state\.destination=\$\('destination'\)\.value\.trim\(\);pickupInput\.mapFailure\(\);/);
+  assert.match(source,/state\.mapReady=false;state\.loadingMap=false;state\.map=null;state\.routeLib=null;state\.mapConnectionToken=null;state\.destination=\$\('destination'\)\.value\.trim\(\);pickupInput\.mapFailure\(\);/);
   assert.match(source,/\$\('google-search'\)\.replaceChildren\(\);\$\('google-search'\)\.hidden=true;\$\('offline-search'\)\.hidden=false;/);
   assert.match(source,/\$\('live-summary'\)\.hidden=true;\$\('route-status'\)\.textContent='地図未接続。目的地は手入力できます。';/);
 });
@@ -131,6 +131,20 @@ test('Google Maps failure makes a pending place callback stale before fallback i
   assert.equal(selection.canApply(pending.token),false);
   assert.equal(selection.apply(pending.token).reason,'stale_place');
   assert.equal(selection.fail(pending.token).reason,'stale_place');
+});
+test('live Google Maps connection uses a generation-specific callback and waits for idle', () => {
+  assert.match(source,/const connection=mapsReadiness\.begin\(true\),callbackName='taxiInitMap'\+connection\.token;let init,timer;/);
+  assert.match(source,/state\.mapConnectionToken=connection\.token;state\.loadingMap=true;[\s\S]*?mapsReadiness\.apiReady\(connection\.token\)/);
+  assert.match(source,/google\.maps\.event\.addListenerOnce\(state\.map,'idle',[\s\S]*?mapsReadiness\.idle\(connection\.token\);if\(!current\(\)\|\|!idle\.accepted\|\|idle\.state\.state!=='connected'\)return;/);
+  assert.match(source,/callback='\+encodeURIComponent\(callbackName\)/);
+  assert.doesNotMatch(source,/callback=taxiInitMap(?:['&])/);
+});
+test('an old Maps callback cannot complete a newer retry generation', () => {
+  const {R}=setup(),maps=R.createGoogleMapsReadinessController();
+  const old=maps.begin(true),retry=maps.begin(true);
+  assert.equal(maps.apiReady(old.token).accepted,false);assert.equal(maps.idle(old.token).accepted,false);
+  maps.apiReady(retry.token);assert.notEqual(maps.snapshot().state,'connected');
+  maps.idle(retry.token);assert.equal(maps.snapshot().state,'connected');
 });
 test('Google place selection uses a stable address and rejects missing coordinates', () => {
   const {R}=setup();

@@ -1624,9 +1624,10 @@ const $ = id => document.getElementById(id);
 const R = window.TaxiRoles;
 const model = R.create();
 const placeSelection = R.createGooglePlaceSelectionController();
+const mapsReadiness = R.createGoogleMapsReadinessController();
 let records = model.state.records;
 const names = {taxi_permit:'Taxi Permit（営業許可）',vehicle_licence:'車両登録・PSV車両資格',driver_licence:'運転免許',psv_driver_permit:'PSV運転手許可',fitness:'車両検査・適合証明',insurance:'営業利用を含む保険',operator_assignment:'名義人の同意・運転権限',airport_authorization:'空港側の営業承認'};
-const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
+const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapConnectionToken:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
 const pickupInput=R.createPickupInputController(state.pickup);
 const commandUi=R.createCommandUiController();
 let restartStorage=null;try{restartStorage=window.localStorage;}catch{}
@@ -1934,7 +1935,7 @@ $('registration-form').onsubmit = e => {
 function clearLines(){state.mapLines.forEach(l=>l.setMap(null));state.mapLines=[];state.mapMarks.forEach(m=>m.setMap(null));state.mapMarks=[];}
 function mapFail(text){
   placeSelection.cancel();state.routeSeq++;clearLines();
-  state.mapReady=false;state.loadingMap=false;state.map=null;state.routeLib=null;state.destination=$('destination').value.trim();pickupInput.mapFailure();
+  state.mapReady=false;state.loadingMap=false;state.map=null;state.routeLib=null;state.mapConnectionToken=null;state.destination=$('destination').value.trim();pickupInput.mapFailure();
   $('connect-maps').disabled=false;$('maps-message').textContent=text;$('map-caption').textContent='地図未接続 · デモ図';
   $('map').hidden=true;$('demo-map').hidden=false;$('google-search').replaceChildren();$('google-search').hidden=true;$('offline-search').hidden=false;
   $('live-summary').hidden=true;$('route-status').textContent='地図未接続。目的地は手入力できます。';$('demo-route').hidden=!state.destination;$('demo-end').hidden=!state.destination;
@@ -1944,18 +1945,22 @@ $('connect-maps').onclick = async () => {
   if (!key) return $('maps-message').textContent='制限付きブラウザキーを入力してください。';
   if (!/^https?:$/.test(location.protocol)) return $('maps-message').textContent='このHTMLの直接表示ではなく、HTTPSサイトまたはlocalhost上で接続してください。';
   if (state.loadingMap || state.mapReady) return toast('既に接続中か接続済みです。変更時は再読み込みしてください。');
-  state.loadingMap=true; $('connect-maps').disabled=true; $('maps-message').textContent='接続中…';
-  const fail = ()=>mapFail('地図を接続できません。API有効化・キーの制限・課金設定・ネットワークを確認してください。');
-  const timer = setTimeout(fail,15000);
-  window.gm_authFailure = ()=>{clearTimeout(timer);fail();};
-  window.taxiInitMap = async () => {
-    clearTimeout(timer);
+  const connection=mapsReadiness.begin(true),callbackName='taxiInitMap'+connection.token;let init,timer;
+  state.mapConnectionToken=connection.token;state.loadingMap=true; $('connect-maps').disabled=true; $('maps-message').textContent='接続確認中…';
+  const current=()=>state.mapConnectionToken===connection.token&&mapsReadiness.snapshot().generation===connection.token;
+  const fail = ()=>{const failed=mapsReadiness.fail(connection.token);if(!failed.accepted||!current())return;clearTimeout(timer);if(window[callbackName]===init)delete window[callbackName];mapFail('地図を接続できません。API有効化・キーの制限・課金設定・ネットワークを確認してください。');};
+  timer = setTimeout(fail,15000);
+  window.gm_authFailure = fail;
+  init = async () => {
     try {
       const {Map} = await google.maps.importLibrary('maps');
       const {PlaceAutocompleteElement} = await google.maps.importLibrary('places');
-      const {Route} = await google.maps.importLibrary('routes'); state.routeLib=Route;
+      const {Route} = await google.maps.importLibrary('routes');
+      const apiReady=mapsReadiness.apiReady(connection.token);if(!current()||!apiReady.accepted||apiReady.state.state==='failed')return;state.routeLib=Route;
       $('map').hidden=false;
       state.map = new Map($('map'), {center:{lat:-17.773,lng:177.428},zoom:14,disableDefaultUI:true,zoomControl:true,gestureHandling:'cooperative',styles:[{stylers:[{saturation:-100}]},{featureType:'poi',stylers:[{visibility:'off'}]},{featureType:'transit',stylers:[{visibility:'off'}]}]});
+      await new Promise((resolve,reject)=>{const idleTimer=setTimeout(()=>reject(Error('map_idle_timeout')),10000);google.maps.event.addListenerOnce(state.map,'idle',()=>{clearTimeout(idleTimer);resolve();});});
+      const idle=mapsReadiness.idle(connection.token);if(!current()||!idle.accepted||idle.state.state!=='connected')return;clearTimeout(timer);
       $('demo-map').hidden=true;$('maps-open').hidden=true;$('map-caption').textContent='Google Maps · 現在地は未取得';
       const ac = new PlaceAutocompleteElement({includedRegionCodes:['fj']});
       ac.addEventListener('gmp-select',async e=>{
@@ -1969,10 +1974,11 @@ $('connect-maps').onclick = async () => {
       $('google-search').replaceChildren(ac);$('google-search').hidden=false;
       $('offline-search').hidden=true;
       state.mapReady=true;state.loadingMap=false;$('maps-key').value='';$('maps-message').textContent='接続しました。配車・車両情報は引き続きデモです。';$('settings-dialog').close();
-    }catch{fail();}
+    }catch{fail();}finally{if(window[callbackName]===init)delete window[callbackName];}
   };
+  window[callbackName]=init;
   const script=document.createElement('script');
-  script.src='https://maps.googleapis.com/maps/api/js?key='+encodeURIComponent(key)+'&loading=async&v=weekly&callback=taxiInitMap';script.async=true;script.onerror=()=>{clearTimeout(timer);fail();};document.head.appendChild(script);
+  script.src='https://maps.googleapis.com/maps/api/js?key='+encodeURIComponent(key)+'&loading=async&v=weekly&callback='+encodeURIComponent(callbackName);script.async=true;script.onerror=fail;document.head.appendChild(script);
 };
 async function drawRoute(){
   if(!state.mapReady || !state.destination)return;
