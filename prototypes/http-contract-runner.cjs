@@ -895,10 +895,20 @@ async function runCancellationReasonContract() {
   const allowed = await Promise.all(CANCELLATION_REASONS.map(async (reason, index) => {
     const mock = await startMockServer();
     try {
-      const result = await cancel(mock, `cancel-reason-allowed-${index}-0001`, {expectedRevision: FIXTURE.revision, reason});
+      const key = `cancel-reason-allowed-${index}-0001`;
+      const command = {expectedRevision: FIXTURE.revision, reason};
+      const result = await cancel(mock, key, command);
       if (result.status !== 200 || result.body?.cancelReason !== reason) throw new Error(`allowed cancellation reason was not preserved: ${reason}`);
       if (mock.state.auditEvents.length !== 1 || mock.state.auditEvents[0].reason !== reason) throw new Error(`allowed cancellation reason was not audited: ${reason}`);
-      return {reason, result, state: structuredClone(mock.state.ride), auditEvents: structuredClone(mock.state.auditEvents)};
+      const replay = await cancel(mock, key, command);
+      if (replay.status !== 200 || JSON.stringify(replay.body) !== JSON.stringify(result.body)) throw new Error(`exact cancellation replay was not stable: ${reason}`);
+      const changedReason = CANCELLATION_REASONS[(index + 1) % CANCELLATION_REASONS.length];
+      const conflict = await cancel(mock, key, {expectedRevision: FIXTURE.revision, reason: changedReason});
+      if (conflict.status !== 409 || conflict.body?.code !== 'idempotency_conflict') throw new Error(`changed cancellation reason reused an idempotency key: ${reason} -> ${changedReason}`);
+      if (mock.state.ride.cancelReason !== reason || mock.state.auditEvents.length !== 1 || mock.state.idempotency.size !== 1) {
+        throw new Error(`cancellation replay changed state, audit, or idempotency records: ${reason}`);
+      }
+      return {reason, changedReason, result, replay, conflict, state: structuredClone(mock.state.ride), auditEvents: structuredClone(mock.state.auditEvents), storedKeys: mock.state.idempotency.size};
     } finally {
       await mock.close();
     }
@@ -1432,7 +1442,7 @@ if (require.main === module) {
     console.log(`Command session OK: expired and stale-session results stopped without auto-retry; same raw key separated ${commandSession.accountAScope !== commandSession.accountBScope ? 'by account' : 'incorrectly'}`);
     console.log(`Command recovery OK: applied state skipped replay; unchanged state replayed once; changed/access-lost/stale sessions stopped (${commandRecovery.replayCalls.length} explicit replay)`);
     console.log(`Current ride discovery OK: ${currentRide.passenger.body.viewerRole}/${currentRide.driver.body.viewerRole} found one active ride; unrelated and terminal viewers received bodyless 204; ambiguity stopped with 409`);
-    console.log(`HTTP cancellation reason OK: ${cancellationReasons.allowed.map(item => item.reason).join('/')}; invalid values changed no state`);
+    console.log(`HTTP cancellation reason OK: ${cancellationReasons.allowed.map(item => item.reason).join('/')}; exact replays stable, changed reasons conflicted, invalid values changed no state`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
