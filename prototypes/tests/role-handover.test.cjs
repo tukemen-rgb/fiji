@@ -3090,6 +3090,9 @@ test('API checker fails closed when safety requirements are removed', () => {
   const cacheableOfferDenial=structuredClone(loadContract());
   delete cacheableOfferDenial.components.responses.PrivateRoleDenied.headers['Cache-Control'];
   assert.ok(validateContract(cacheableOfferDenial).some(message=>message.includes('listRideOffers 403 requires Cache-Control header')));
+  const conditionalOffers=structuredClone(loadContract());
+  conditionalOffers.paths['/v1/ride-requests/{requestId}/offers'].get.responses['304']={description:'Not modified'};
+  assert.ok(validateContract(conditionalOffers).some(message=>message.includes('listRideOffers must return a complete 200 response instead of 304')));
   const noRateLimit=structuredClone(loadContract());
   delete noRateLimit.paths['/v1/rides/{requestId}'].get.responses['429'];
   assert.ok(validateContract(noRateLimit).some(message=>message.includes('getRideState must document 429')));
@@ -3292,6 +3295,16 @@ test('offer list denials are also non-storable and authorization-separated', asy
     assert.equal(item.headers.vary,'Authorization');
     assert.equal(item.headers.etag,null);
   }
+});
+test('conditional offer reads return the complete latest list instead of preserving a stale quote', async () => {
+  const {conditional}=await offerListResults();
+  assert.equal(conditional.result.status,200);
+  assert.deepEqual(conditional.result.headers,{etag:null,cacheControl:'private, no-store',vary:'Authorization'});
+  assert.deepEqual(conditional.result.body,{offers:[],summary:{active:0,expired:1,unavailable:0}});
+  assert.equal(conditional.offer.status,'expired');
+  assert.equal(conditional.offer.statusReason,'time');
+  assert.deepEqual(conditional.auditEvents,[]);
+  assert.equal(conditional.storedKeys,0);
 });
 test('offer list distinguishes expiry from eligibility loss without changing the ride', async () => {
   const {expired,unavailable}=await offerListResults();

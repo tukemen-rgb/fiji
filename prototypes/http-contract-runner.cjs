@@ -917,10 +917,12 @@ async function runOfferValidityContract() {
 async function runOfferListContract() {
   const clockMs = Date.parse('2026-09-17T03:00:00Z');
   const read = async options => {
-    const mock = await startMockServer({clockMs, ...options});
+    const {requestHeaders = {}, ...serverOptions} = options;
+    const mock = await startMockServer({clockMs, ...serverOptions});
     try {
       const result = await requestJson(mock.baseUrl, {
-        method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: FIXTURE.tokens.owner, captureHeaders: true
+        method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: FIXTURE.tokens.owner,
+        headers: requestHeaders, captureHeaders: true
       }, fetch);
       return {
         result,
@@ -933,10 +935,14 @@ async function runOfferListContract() {
       await mock.close();
     }
   };
-  const [active, expired, unavailable] = await Promise.all([
+  const [active, expired, unavailable, conditional] = await Promise.all([
     read({offerExpiresAtMs: clockMs + 1}),
     read({offerExpiresAtMs: clockMs}),
-    read({offerExpiresAtMs: clockMs + 1, offerDriverEligible: false})
+    read({offerExpiresAtMs: clockMs + 1, offerDriverEligible: false}),
+    read({
+      offerExpiresAtMs: clockMs,
+      requestHeaders: {'if-none-match': '"offer-list-before-expiry"', 'if-modified-since': 'Wed, 16 Sep 2026 03:00:00 GMT'}
+    })
   ]);
   const deniedMock = await startMockServer({clockMs, offerExpiresAtMs: clockMs + 1});
   let denied;
@@ -958,18 +964,21 @@ async function runOfferListContract() {
   if (unavailable.result.status !== 200 || unavailable.result.body?.offers?.length !== 0 || unavailable.result.body?.summary?.unavailable !== 1) {
     throw new Error('unavailable offer list did not distinguish eligibility loss');
   }
-  for (const item of [active, expired, unavailable]) {
+  if (conditional.result.status !== 200 || conditional.result.headers?.etag !== null || conditional.result.body?.offers?.length !== 0 || conditional.result.body?.summary?.expired !== 1) {
+    throw new Error('conditional offer read preserved a stale offer instead of returning a complete current list');
+  }
+  for (const item of [active, expired, unavailable, conditional]) {
     if (item.ride.status !== 'collecting' || item.ride.revision !== FIXTURE.revision || item.auditEvents.length || item.storedKeys) {
       throw new Error('reading offer guidance changed ride, audit, or idempotency state');
     }
   }
-  for (const item of [active.result, expired.result, unavailable.result, ...denied]) {
+  for (const item of [active.result, expired.result, unavailable.result, conditional.result, ...denied]) {
     if (item.headers?.cacheControl !== 'private, no-store' || item.headers?.vary !== 'Authorization') {
       throw new Error('offer list response was cacheable or did not vary by authorization');
     }
   }
   if (denied.map(item => item.status).join('/') !== '401/403/404') throw new Error('offer list denial controls changed');
-  return {active, expired, unavailable, denied};
+  return {active, expired, unavailable, conditional, denied};
 }
 
 async function runMockContract() {

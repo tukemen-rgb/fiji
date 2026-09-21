@@ -34,10 +34,11 @@
       "get": {
         "operationId": "listRideOffers",
         "summary": "List currently selectable offers for the owning passenger",
+        "description": "Always returns a complete current representation. It does not issue validators or return 304 because a previously displayed offer can expire or become unavailable.",
         "tags": ["Passenger"],
         "responses": {
           "200": {
-            "description": "Current offers and unavailable-count summary",
+            "description": "Complete current offers and unavailable-count summary; conditional request headers do not produce 304",
             "headers": {
               "Cache-Control": { "$ref": "#/components/headers/PrivateNoStore" },
               "Vary": { "$ref": "#/components/headers/VaryAuthorization" }
