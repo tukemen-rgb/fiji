@@ -119,6 +119,19 @@ test('Google Maps retry rejects stale callbacks and auth failure removes connect
   assert.equal(maps.snapshot().state,'connected');assert.equal(maps.snapshot().locationReady,false);
   assert.equal(maps.snapshot().label,'Google Maps 接続済み');
 });
+test('Google Maps failure returns destination entry to the manual fallback', () => {
+  assert.match(source,/function mapFail\(text\)\{\s*placeSelection\.cancel\(\);state\.routeSeq\+\+;clearLines\(\);/);
+  assert.match(source,/state\.mapReady=false;state\.loadingMap=false;state\.map=null;state\.routeLib=null;state\.destination=\$\('destination'\)\.value\.trim\(\);pickupInput\.mapFailure\(\);/);
+  assert.match(source,/\$\('google-search'\)\.replaceChildren\(\);\$\('google-search'\)\.hidden=true;\$\('offline-search'\)\.hidden=false;/);
+  assert.match(source,/\$\('live-summary'\)\.hidden=true;\$\('route-status'\)\.textContent='地図未接続。目的地は手入力できます。';/);
+});
+test('Google Maps failure makes a pending place callback stale before fallback input resumes', () => {
+  const {R}=setup(),selection=R.createGooglePlaceSelectionController(),pending=selection.begin();
+  selection.cancel();
+  assert.equal(selection.canApply(pending.token),false);
+  assert.equal(selection.apply(pending.token).reason,'stale_place');
+  assert.equal(selection.fail(pending.token).reason,'stale_place');
+});
 test('Google place selection uses a stable address and rejects missing coordinates', () => {
   const {R}=setup();
   const selected=R.googlePlaceDestination({displayName:'Airport',formattedAddress:'Nadi International Airport, Fiji',location:{lat:()=>-17.755,lng:()=>177.443}});

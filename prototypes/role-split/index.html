@@ -1932,7 +1932,13 @@ $('registration-form').onsubmit = e => {
 
 // Optional live map. Browser key stays in memory, not URL or local/session storage.
 function clearLines(){state.mapLines.forEach(l=>l.setMap(null));state.mapLines=[];state.mapMarks.forEach(m=>m.setMap(null));state.mapMarks=[];}
-function mapFail(text){state.mapReady=false;state.loadingMap=false;pickupInput.mapFailure();$('connect-maps').disabled=false;$('maps-message').textContent=text;$('map-caption').textContent='地図未接続 · デモ図';$('map').hidden=true;$('demo-map').hidden=false;}
+function mapFail(text){
+  placeSelection.cancel();state.routeSeq++;clearLines();
+  state.mapReady=false;state.loadingMap=false;state.map=null;state.routeLib=null;state.destination=$('destination').value.trim();pickupInput.mapFailure();
+  $('connect-maps').disabled=false;$('maps-message').textContent=text;$('map-caption').textContent='地図未接続 · デモ図';
+  $('map').hidden=true;$('demo-map').hidden=false;$('google-search').replaceChildren();$('google-search').hidden=true;$('offline-search').hidden=false;
+  $('live-summary').hidden=true;$('route-status').textContent='地図未接続。目的地は手入力できます。';$('demo-route').hidden=!state.destination;$('demo-end').hidden=!state.destination;
+}
 $('connect-maps').onclick = async () => {
   const key = $('maps-key').value.trim();
   if (!key) return $('maps-message').textContent='制限付きブラウザキーを入力してください。';
