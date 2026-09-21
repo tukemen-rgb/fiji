@@ -161,6 +161,7 @@ function offerListView(state) {
     expiresAt: new Date(offer.expiresAtMs).toISOString()
   }] : [];
   return {
+    serverNow: new Date(state.clockMs).toISOString(),
     offers,
     summary: {
       active: offer.status === 'active' ? 1 : 0,
@@ -957,6 +958,11 @@ async function runOfferListContract() {
   }
   if (active.result.status !== 200 || active.result.body?.offers?.length !== 1 || active.result.body?.summary?.active !== 1) {
     throw new Error('active offer list did not return its selectable offer');
+  }
+  for (const item of [active, expired, unavailable, conditional]) {
+    if (item.result.body?.serverNow !== new Date(clockMs).toISOString()) {
+      throw new Error('offer list did not expose the trusted time used for expiry evaluation');
+    }
   }
   if (expired.result.status !== 200 || expired.result.body?.offers?.length !== 0 || expired.result.body?.summary?.expired !== 1) {
     throw new Error('expired offer list did not return expiry guidance state');

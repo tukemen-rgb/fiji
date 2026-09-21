@@ -3093,6 +3093,9 @@ test('API checker fails closed when safety requirements are removed', () => {
   const conditionalOffers=structuredClone(loadContract());
   conditionalOffers.paths['/v1/ride-requests/{requestId}/offers'].get.responses['304']={description:'Not modified'};
   assert.ok(validateContract(conditionalOffers).some(message=>message.includes('listRideOffers must return a complete 200 response instead of 304')));
+  const noOfferServerTime=structuredClone(loadContract());
+  noOfferServerTime.components.schemas.OfferList.required=noOfferServerTime.components.schemas.OfferList.required.filter(field=>field!=='serverNow');
+  assert.ok(validateContract(noOfferServerTime).some(message=>message.includes('OfferList requires a read-only date-time serverNow')));
   const noRateLimit=structuredClone(loadContract());
   delete noRateLimit.paths['/v1/rides/{requestId}'].get.responses['429'];
   assert.ok(validateContract(noRateLimit).some(message=>message.includes('getRideState must document 429')));
@@ -3281,6 +3284,7 @@ test('offer list returns only an active server-timed offer with its expiry', asy
   const {active}=await offerListResults();
   assert.equal(active.result.status,200);
   assert.deepEqual(active.result.headers,{etag:null,cacheControl:'private, no-store',vary:'Authorization'});
+  assert.equal(active.result.body.serverNow,'2026-09-17T03:00:00.000Z');
   assert.deepEqual(active.result.body.summary,{active:1,expired:0,unavailable:0});
   assert.deepEqual(active.result.body.offers,[{
     id:FIXTURE.offerId,requestId:FIXTURE.requestId,fareCents:2300,etaMinutes:7,
@@ -3300,18 +3304,26 @@ test('conditional offer reads return the complete latest list instead of preserv
   const {conditional}=await offerListResults();
   assert.equal(conditional.result.status,200);
   assert.deepEqual(conditional.result.headers,{etag:null,cacheControl:'private, no-store',vary:'Authorization'});
-  assert.deepEqual(conditional.result.body,{offers:[],summary:{active:0,expired:1,unavailable:0}});
+  assert.deepEqual(conditional.result.body,{serverNow:'2026-09-17T03:00:00.000Z',offers:[],summary:{active:0,expired:1,unavailable:0}});
   assert.equal(conditional.offer.status,'expired');
   assert.equal(conditional.offer.statusReason,'time');
   assert.deepEqual(conditional.auditEvents,[]);
   assert.equal(conditional.storedKeys,0);
 });
+test('offer list uses the same trusted server time for active, expired and unavailable guidance', async () => {
+  const {active,expired,unavailable,conditional}=await offerListResults();
+  for(const item of [active,expired,unavailable,conditional]){
+    assert.equal(item.result.body.serverNow,'2026-09-17T03:00:00.000Z');
+  }
+  assert.ok(Date.parse(active.result.body.offers[0].expiresAt)>Date.parse(active.result.body.serverNow));
+  assert.equal(expired.result.body.summary.expired,1);
+});
 test('offer list distinguishes expiry from eligibility loss without changing the ride', async () => {
   const {expired,unavailable}=await offerListResults();
-  assert.deepEqual(expired.result.body,{offers:[],summary:{active:0,expired:1,unavailable:0}});
+  assert.deepEqual(expired.result.body,{serverNow:'2026-09-17T03:00:00.000Z',offers:[],summary:{active:0,expired:1,unavailable:0}});
   assert.equal(expired.offer.status,'expired');
   assert.equal(expired.offer.statusReason,'time');
-  assert.deepEqual(unavailable.result.body,{offers:[],summary:{active:0,expired:0,unavailable:1}});
+  assert.deepEqual(unavailable.result.body,{serverNow:'2026-09-17T03:00:00.000Z',offers:[],summary:{active:0,expired:0,unavailable:1}});
   assert.equal(unavailable.offer.status,'unavailable');
   assert.equal(unavailable.offer.statusReason,'eligibility');
   for(const item of [expired,unavailable]){

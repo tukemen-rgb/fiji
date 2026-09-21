@@ -364,8 +364,9 @@
       "OfferList": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["offers", "summary"],
+        "required": ["serverNow", "offers", "summary"],
         "properties": {
+          "serverNow": { "type": "string", "format": "date-time", "readOnly": true, "description": "Trusted server time used to evaluate offer expiry and client countdowns" },
           "offers": { "type": "array", "items": { "$ref": "#/components/schemas/Offer" } },
           "summary": {
             "type": "object",

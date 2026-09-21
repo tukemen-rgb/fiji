@@ -159,6 +159,11 @@ function validateContract(spec) {
     }
   }
   if (resolveRef(spec, offerRead?.responses?.['200'])?.headers?.ETag) add('listRideOffers must not issue an ETag for non-storable offers');
+  const offerList = spec.components?.schemas?.OfferList;
+  const offerServerNow = offerList?.properties?.serverNow;
+  if (!offerList?.required?.includes('serverNow') || offerServerNow?.type !== 'string' || offerServerNow?.format !== 'date-time' || offerServerNow?.readOnly !== true) {
+    add('OfferList requires a read-only date-time serverNow');
+  }
   if (spec.components?.headers?.PrivateNoCache?.schema?.const !== 'private, no-cache') add('ride state cache control must be private, no-cache');
   if (spec.components?.headers?.PrivateNoStore?.schema?.const !== 'private, no-store') add('offer list cache control must be private, no-store');
   if (spec.components?.headers?.VaryAuthorization?.schema?.const !== 'Authorization') add('ride state response must vary by Authorization');
