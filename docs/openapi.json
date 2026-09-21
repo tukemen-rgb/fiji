@@ -364,9 +364,10 @@
       "OfferList": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["serverNow", "offers", "summary"],
+        "required": ["serverNow", "nextExpiryAt", "offers", "summary"],
         "properties": {
           "serverNow": { "type": "string", "format": "date-time", "readOnly": true, "description": "Trusted server time used to evaluate offer expiry and client countdowns" },
+          "nextExpiryAt": { "type": ["string", "null"], "format": "date-time", "readOnly": true, "description": "Earliest expiry among returned active offers; clients refresh no later than this instant, or null when no active offer remains" },
           "offers": { "type": "array", "items": { "$ref": "#/components/schemas/Offer" } },
           "summary": {
             "type": "object",

@@ -164,6 +164,12 @@ function validateContract(spec) {
   if (!offerList?.required?.includes('serverNow') || offerServerNow?.type !== 'string' || offerServerNow?.format !== 'date-time' || offerServerNow?.readOnly !== true) {
     add('OfferList requires a read-only date-time serverNow');
   }
+  const offerNextExpiryAt = offerList?.properties?.nextExpiryAt;
+  if (!offerList?.required?.includes('nextExpiryAt') ||
+      JSON.stringify(offerNextExpiryAt?.type) !== JSON.stringify(['string', 'null']) ||
+      offerNextExpiryAt?.format !== 'date-time' || offerNextExpiryAt?.readOnly !== true) {
+    add('OfferList requires a nullable read-only date-time nextExpiryAt');
+  }
   if (spec.components?.headers?.PrivateNoCache?.schema?.const !== 'private, no-cache') add('ride state cache control must be private, no-cache');
   if (spec.components?.headers?.PrivateNoStore?.schema?.const !== 'private, no-store') add('offer list cache control must be private, no-store');
   if (spec.components?.headers?.VaryAuthorization?.schema?.const !== 'Authorization') add('ride state response must vary by Authorization');

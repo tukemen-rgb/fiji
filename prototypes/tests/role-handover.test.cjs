@@ -1,3832 +1,6461 @@
-'use strict';
-// Acceptance review of the supplied HTML, not production authorization tests.
-const {test} = require('node:test');
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
-const {OPERATIONS, CANCELLATION_REASONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runOfferListContract, runCancellationReasonContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
-const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
-const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
-let auditContract;
-function auditedHttpResults() { return auditContract ||= runAuditContract(); }
-let rideSafetyContract;
-function rideSafetyResults() { return rideSafetyContract ||= runRideSafetyContract(); }
-let boardingRaceContract;
-function boardingRaceResults() { return boardingRaceContract ||= runBoardingRaceContract(); }
-let currentRideDiscoveryContract;
-function currentRideDiscoveryResults() { return currentRideDiscoveryContract ||= runCurrentRideDiscoveryContract(); }
-let recoveryRetryContract;
-function recoveryRetryResults() { return recoveryRetryContract ||= runRecoveryRetryContract(); }
-let revisionMergeContract;
-function revisionMergeResults() { return revisionMergeContract ||= runRevisionMergeContract(); }
-let notificationHintContract;
-function notificationHintResults() { return notificationHintContract ||= runNotificationHintContract(); }
-let sessionIsolationContract;
-function sessionIsolationResults() { return sessionIsolationContract ||= runSessionIsolationContract(); }
-let commandSessionContract;
-function commandSessionResults() { return commandSessionContract ||= runCommandSessionContract(); }
-let commandRecoveryContract;
-function commandRecoveryResults() { return commandRecoveryContract ||= runCommandRecoveryContract(); }
-let cancellationReasonContract;
-function cancellationReasonResults() { return cancellationReasonContract ||= runCancellationReasonContract(); }
-let offerListContract;
-function offerListResults() { return offerListContract ||= runOfferListContract(); }
-function setup() {
-  const sandbox = vm.createContext({});
-  scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
-  return {m: sandbox.TaxiRoles.create(), V: sandbox.TaxiVerification, R: sandbox.TaxiRoles};
-}
-function passenger(m) {
-  m.chooseRole('passenger');
-  return m.registerPassenger({name:'Review Guest', phone:'+819000000000', language:'ja', payment:'card', pickup:'Demo Hotel', consent:true});
-}
-function application(V) {
-  return {name:'Review Applicant', phone:'+6790000000', plate:'DEMO 005', holder:'Demo Holder', vehicle:'Demo Car', taxiPermit:'DEMO-TAXI', driverLicence:'DEMO-LIC', psvPermit:'DEMO-PSV', base:'Nadi demo', consent:true, documents:Object.fromEntries(V.REQUIRED.map(k => [k,{attachment:'DEMO-'+k+'.pdf', expiresAt:new Date(Date.now()+86400000).toISOString()}]))};
-}
-test('client-decoded Google claims remain input assistance until trusted server verification', () => {
-  const {R,m}=setup();
-  const clientOnly=R.googleIdentityConnectionView({
-    credentialImported:true,googleLinked:true,serverVerified:true,sub:'10769150350006150715113082367',
-    verification:{source:'client',signature:true,audience:true,issuer:true,notExpired:true}
-  });
-  assert.deepEqual({...clientOnly},{state:'input_assist',label:'Googleå…¥åŠ›è£œåŠ©ï¼ˆæœ¬äººç¢ºèªæœªæŽ¥ç¶šï¼‰',canAuthenticate:false,persistSubject:false});
-  m.chooseRole('passenger');
-  const p=m.registerPassenger({name:'Google Input Guest',phone:'+6790000000',language:'ja',payment:'card',pickup:'Demo Hotel',consent:true,googleLinked:true,googleSub:'10769150350006150715113082367'});
-  assert.equal('googleLinked' in p,false);assert.equal('googleSub' in p,false);
-  const verified=R.googleIdentityConnectionView({credentialImported:true,verification:{source:'authenticated_server',signature:true,audience:true,issuer:true,notExpired:true}});
-  assert.deepEqual({...verified},{state:'verified',label:'Googleæœ¬äººç¢ºèªæ¸ˆã¿',canAuthenticate:true,persistSubject:true});
-});
-test('Google input assistance registration snapshot strips unverified link and subject claims', () => {
-  const {R}=setup();
-  const snapshot=R.googleIdentityRegistrationSnapshot({
-    credentialImported:true,googleLinked:true,googleSub:'10769150350006150715113082367',serverVerified:true,
-    verification:{source:'client',signature:true,audience:true,issuer:true,notExpired:true}
-  });
-  assert.deepEqual({...snapshot},{
-    googleInputAssisted:true,googleIdentityState:'unverified',
-    label:'Googleå…¥åŠ›è£œåŠ©æ¸ˆã¿ï¼ˆæœ¬äººç¢ºèªæœªæŽ¥ç¶šï¼‰',canAuthenticate:false,needsServerRefresh:false
-  });
-  assert.equal('googleLinked' in snapshot,false);assert.equal('googleSub' in snapshot,false);assert.equal('subject' in snapshot,false);
-});
-test('Google identity cannot be restored as verified or authenticating from client storage', () => {
-  const {R}=setup();
-  const tampered=JSON.stringify({
-    googleInputAssisted:true,googleIdentityState:'verified',googleLinked:true,
-    googleSub:'10769150350006150715113082367',subject:'10769150350006150715113082367',
-    canAuthenticate:true,verification:{source:'authenticated_server',signature:true,audience:true,issuer:true,notExpired:true}
-  });
-  const restored=R.restoreGoogleIdentityRegistrationSnapshot(tampered);
-  assert.deepEqual({...restored},{
-    googleInputAssisted:true,googleIdentityState:'unverified',
-    label:'Googleå…¥åŠ›è£œåŠ©æ¸ˆã¿ï¼ˆæœ¬äººç¢ºèªæœªæŽ¥ç¶šï¼‰',canAuthenticate:false,needsServerRefresh:false
-  });
-  const corrupt=R.restoreGoogleIdentityRegistrationSnapshot('{bad json');
-  assert.equal(corrupt.googleIdentityState,'unavailable');assert.equal(corrupt.canAuthenticate,false);
-});
-test('Google Maps reports connected only after API load and map idle, then fails closed', () => {
-  const {R}=setup();
-  assert.deepEqual({...R.googleMapsConnectionView({})},{state:'demo',label:'ç•¥åœ°å›³ãƒ»ãƒ‡ãƒ¢è¡¨ç¤ºï¼ˆGoogle Maps æœªæŽ¥ç¶šï¼‰',live:false,action:'configure'});
-  for(const input of [{configured:true},{configured:true,apiLoaded:true},{configured:true,mapIdle:true}]){
-    const view=R.googleMapsConnectionView(input);assert.equal(view.state,'connecting');assert.equal(view.live,false);assert.doesNotMatch(view.label,/æŽ¥ç¶šæ¸ˆã¿/);
-  }
-  const connected=R.googleMapsConnectionView({configured:true,apiLoaded:true,mapIdle:true});
-  assert.equal(connected.state,'connected');assert.equal(connected.live,true);assert.match(connected.label,/æŽ¥ç¶šæ¸ˆã¿/);
-  for(const failure of [{configured:true,apiLoaded:true,mapIdle:true,authFailure:true},{configured:true,loadFailed:true}]){
-    const view=R.googleMapsConnectionView(failure);assert.equal(view.state,'failed');assert.equal(view.live,false);assert.equal(view.action,'reload');assert.match(view.label,/ãƒ‡ãƒ¢è¡¨ç¤º/);
-  }
-});
-test('Google Maps geolocation cannot report connected before the active map reaches idle', () => {
-  const {R}=setup(),maps=R.createGoogleMapsReadinessController();
-  const first=maps.begin(true);
-  assert.equal(first.state.state,'connecting');
-  const located=maps.location(first.token);
-  assert.equal(located.state.locationReady,true);assert.equal(located.state.live,false);assert.doesNotMatch(located.state.label,/æŽ¥ç¶šæ¸ˆã¿/);
-  const loaded=maps.apiReady(first.token);
-  assert.equal(loaded.state.live,false);assert.doesNotMatch(loaded.state.label,/æŽ¥ç¶šæ¸ˆã¿/);
-  const idle=maps.idle(first.token);
-  assert.equal(idle.state.live,true);assert.equal(idle.state.label,'Google Maps æŽ¥ç¶šæ¸ˆã¿ãƒ»ç¾åœ¨åœ°ã‚’è¡¨ç¤º');
-});
-test('Google Maps auth failure removes connected state and requires reload', () => {
-  const {R}=setup(),maps=R.createGoogleMapsReadinessController();
-  const first=maps.begin(true);
-  maps.apiReady(first.token);maps.location(first.token);maps.idle(first.token);
-  assert.equal(maps.snapshot().state,'connected');
-  const failed=maps.fail(first.token);
-  assert.equal(failed.state.state,'failed');assert.equal(failed.state.live,false);assert.equal(failed.state.locationReady,false);
-  const retry=maps.begin(true);assert.equal(retry.accepted,false);assert.equal(retry.reason,'reload_required');
-  assert.equal(maps.idle(first.token).accepted,false);
-  assert.equal(maps.location(first.token).accepted,false);
-  assert.equal(maps.snapshot().generation,retry.token);assert.equal(maps.snapshot().state,'failed');assert.equal(maps.snapshot().reloadRequired,true);
-});
-test('Google Maps failure returns destination entry to the manual fallback', () => {
-  assert.match(source,/function mapFail\(text\)\{\s*placeSelection\.cancel\(\);state\.routeSeq\+\+;clearLines\(\);/);
-  assert.match(source,/state\.mapReady=false;state\.loadingMap=false;state\.map=null;state\.routeLib=null;state\.mapConnectionToken=null;state\.mapScript\?\.remove\(\);state\.mapScript=null;state\.destination=\$\('destination'\)\.value\.trim\(\);pickupInput\.mapFailure\(\);/);
-  assert.match(source,/\$\('google-search'\)\.replaceChildren\(\);\$\('google-search'\)\.hidden=true;\$\('offline-search'\)\.hidden=false;/);
-  assert.match(source,/\$\('live-summary'\)\.hidden=true;\$\('route-status'\)\.textContent='åœ°å›³æœªæŽ¥ç¶šã€‚ç›®çš„åœ°ã¯æ‰‹å…¥åŠ›ã§ãã¾ã™ã€‚';/);
-});
-test('Google Maps failure makes a pending place callback stale before fallback input resumes', () => {
-  const {R}=setup(),selection=R.createGooglePlaceSelectionController(),pending=selection.begin();
-  selection.cancel();
-  assert.equal(selection.canApply(pending.token),false);
-  assert.equal(selection.apply(pending.token).reason,'stale_place');
-  assert.equal(selection.fail(pending.token).reason,'stale_place');
-});
-test('live Google Maps connection uses a generation-specific callback and waits for idle', () => {
-  assert.match(source,/const connection=mapsReadiness\.begin\(true\);if\(!connection\.accepted\)return[\s\S]*?const callbackName='taxiInitMap'\+connection\.token;let init,timer;/);
-  assert.match(source,/state\.mapConnectionToken=connection\.token;state\.loadingMap=true;[\s\S]*?mapsReadiness\.apiReady\(connection\.token\)/);
-  assert.match(source,/google\.maps\.event\.addListenerOnce\(state\.map,'idle',[\s\S]*?mapsReadiness\.idle\(connection\.token\);if\(!current\(\)\|\|!idle\.accepted\|\|idle\.state\.state!=='connected'\)return;/);
-  assert.match(source,/callback='\+encodeURIComponent\(callbackName\)/);
-  assert.doesNotMatch(source,/callback=taxiInitMap(?:['&])/);
-});
-test('an old Maps callback cannot create a same-page retry generation', () => {
-  const {R}=setup(),maps=R.createGoogleMapsReadinessController();
-  const old=maps.begin(true);maps.fail(old.token);const retry=maps.begin(true);
-  assert.equal(retry.accepted,false);assert.equal(retry.token,old.token);assert.equal(maps.snapshot().reloadRequired,true);
-  assert.equal(maps.apiReady(old.token).state.state,'failed');assert.equal(maps.idle(old.token).state.state,'failed');
-});
-test('live Maps failure removes the injected script and disables unsafe reconnect', () => {
-  assert.match(source,/state\.mapScript\?\.remove\(\);state\.mapScript=null;[\s\S]*?\$\('connect-maps'\)\.disabled=true;/);
-  assert.match(source,/å®‰å…¨ãªå†æŽ¥ç¶šã«ã¯ãƒšãƒ¼ã‚¸ã‚’å†èª­ã¿è¾¼ã¿ã—ã¦ãã ã•ã„/);
-  assert.match(source,/script\.onerror=fail;state\.mapScript=script;document\.head\.appendChild\(script\);/);
-});
-test('Google place selection uses a stable address and rejects missing coordinates', () => {
-  const {R}=setup();
-  const selected=R.googlePlaceDestination({displayName:'Airport',formattedAddress:'Nadi International Airport, Fiji',location:{lat:()=>-17.755,lng:()=>177.443}});
-  assert.deepEqual({...selected},{label:'Nadi International Airport, Fiji',route:selected.route});
-  assert.deepEqual({...selected.route},{lat:-17.755,lng:177.443});
-  assert.equal(R.googlePlaceDestination({displayName:'No location'}),null);
-  assert.equal(R.googlePlaceDestination({location:{lat:NaN,lng:177.443}}),null);
-});
-test('Google place selection invalidates old quotes before replacing the route destination', () => {
-  assert.match(source,/if\(!placeSelection\.canApply\(selection\.token\)\)return;const selected=R\.googlePlaceDestination\(p\);if\(!selected\)\{placeSelection\.apply\(selection\.token\);return;\}if\(!invalidateCurrentSearch\(\{destination:selected\.label\}\)\)\{placeSelection\.apply\(selection\.token\);return;\}if\(!placeSelection\.apply\(selection\.token\)\.accepted\)return;\s*state\.destination=selected\.route;\$\('destination'\)\.value=selected\.label;/);
-  const {R,m}=setup();passenger(m);
-  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Nadi Town'}),offer=m.getOffers(ride.id)[0];
-  const selected=R.googlePlaceDestination({displayName:'Airport',formattedAddress:'Nadi International Airport, Fiji',location:{lat:-17.755,lng:177.443}});
-  assert.equal(m.invalidateRideSearch(ride.id,{destination:selected.label}).invalidated,true);
-  assert.equal(ride.status,'cancelled');assert.equal(offer.status,'expired');assert.throws(()=>m.selectOffer(offer.id));
-});
-test('a newer Google place selection rejects the delayed older result', () => {
-  const {R}=setup(),selection=R.createGooglePlaceSelectionController();
-  const old=selection.begin(),current=selection.begin();
-  assert.equal(selection.canApply(old.token),false);assert.equal(selection.apply(old.token).reason,'stale_place');
-  assert.equal(selection.canApply(current.token),true);assert.equal(selection.apply(current.token).accepted,true);
-  assert.deepEqual({...selection.snapshot()},{generation:current.token,pending:false});
-});
-test('manual destination and ride submission cancel a pending Google place result', () => {
-  assert.match(source,/\$\('destination'\)\.addEventListener\('input', \(\) => \{ placeSelection\.cancel\(\);/);
-  assert.match(source,/\$\('find-offers'\)\.onclick = \(\) => \{\s*try \{\s*placeSelection\.cancel\(\);/);
-  assert.match(source,/if\(!placeSelection\.canApply\(selection\.token\)\)return;const selected=R\.googlePlaceDestination\(p\);/);
-  const {R}=setup(),selection=R.createGooglePlaceSelectionController(),pending=selection.begin();
-  selection.cancel();assert.equal(selection.canApply(pending.token),false);assert.equal(selection.apply(pending.token).accepted,false);
-});
-test('a delayed Google place failure stays silent after a newer selection', () => {
-  const {R}=setup(),selection=R.createGooglePlaceSelectionController();
-  const old=selection.begin(),current=selection.begin();
-  assert.equal(selection.fail(old.token).accepted,false);
-  assert.equal(selection.canApply(current.token),true);
-  assert.equal(selection.apply(current.token).accepted,true);
-});
-test('only the current Google place failure closes the pending selection and shows guidance', () => {
-  assert.match(source,/catch\{if\(placeSelection\.fail\(selection\.token\)\.accepted\)toast\('ç›®çš„åœ°ã‚’å–å¾—ã§ãã¾ã›ã‚“ã€‚å†é¸æŠžã—ã¦ãã ã•ã„ã€‚'\);\}/);
-  const {R}=setup(),selection=R.createGooglePlaceSelectionController(),current=selection.begin();
-  const failed=selection.fail(current.token);
-  assert.equal(failed.accepted,true);assert.equal(failed.reason,'place_failed');
-  assert.deepEqual({...selection.snapshot()},{generation:current.token,pending:false});
-  assert.equal(selection.fail(current.token).accepted,false);
-});
-test('manual pickup survives map and geolocation failure and can still create a request', () => {
-  const {R,m}=setup(),pickup=R.createPickupInputController('Ramada Wailoaloa');
-  const locating=pickup.beginLocation();
-  const failed=pickup.locationFailure(locating.token);
-  assert.equal(failed.state.value,'Ramada Wailoaloa');assert.equal(failed.state.source,'manual');assert.equal(failed.state.canRequest,true);assert.match(failed.state.message,/æ‰‹å…¥åŠ›ã—ãŸä¹—è»Šåœ°ç‚¹/);
-  const mapFailed=pickup.mapFailure();
-  assert.equal(mapFailed.value,'Ramada Wailoaloa');assert.equal(mapFailed.canRequest,true);assert.match(mapFailed.message,/æ‰‹å…¥åŠ›ã—ãŸä¹—è»Šåœ°ç‚¹/);
-  passenger(m);
-  const ride=m.requestRide({pickup:mapFailed.value,destination:'Nadi Airport'});
-  assert.equal(ride.pickup,'Ramada Wailoaloa');assert.equal(ride.destination,'Nadi Airport');
-});
-test('late geolocation result cannot overwrite a newer manual pickup', () => {
-  const {R}=setup(),pickup=R.createPickupInputController('Nadi Town');
-  const old=pickup.beginLocation();
-  pickup.setManual('Radisson Blu Denarau');
-  const stale=pickup.locationSuccess(old.token,'ç¾åœ¨åœ°');
-  assert.equal(stale.accepted,false);assert.equal(stale.reason,'stale_location');assert.equal(stale.state.value,'Radisson Blu Denarau');assert.equal(stale.state.source,'manual');
-  assert.equal(pickup.canApplyLocation(old.token).accepted,false);
-  const fresh=pickup.beginLocation();
-  const applied=pickup.locationSuccess(fresh.token,'ç¾åœ¨åœ°');
-  assert.equal(applied.accepted,true);assert.equal(applied.state.value,'ç¾åœ¨åœ°');assert.equal(applied.state.source,'geolocation');
-});
-test('passenger registration synchronizes its default pickup into the first ride request', () => {
-  assert.match(source,/const validated=R\.passengerRegistrationInput\(input\),pickup=validated\.pickup;\s*if\(!invalidateCurrentSearch\(\{pickup,airport:false\}\)\)return;\s*const p=model\.registerPassenger\(validated\);state\.pickup=p\.pickup\|\|'';/);
-  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi, Fiji');
-  m.chooseRole('passenger');
-  const profile=m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Ramada Suites Wailoaloa',consent:true});
-  pickup.setManual(profile.pickup||'Nadi, Fiji');
-  const ride=m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'});
-  assert.equal(ride.pickup,'Ramada Suites Wailoaloa');assert.notEqual(ride.pickup,'Nadi, Fiji');
-});
-test('profile pickup change wins over a location request started before re-registration', () => {
-  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi, Fiji');
-  m.chooseRole('passenger');
-  m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Ramada Suites Wailoaloa',consent:true});
-  const oldLocation=pickup.beginLocation();
-  const updated=m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Radisson Blu Denarau',consent:true});
-  pickup.setManual(updated.pickup||'Nadi, Fiji');
-  const stale=pickup.locationSuccess(oldLocation.token,'ç¾åœ¨åœ°');
-  assert.equal(stale.accepted,false);assert.equal(stale.state.value,'Radisson Blu Denarau');
-  const ride=m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'});
-  assert.equal(ride.pickup,'Radisson Blu Denarau');
-});
-test('profile pickup update invalidates the old search and clears its airport scope', () => {
-  assert.match(source,/const validated=R\.passengerRegistrationInput\(input\),pickup=validated\.pickup;\s*if\(!invalidateCurrentSearch\(\{pickup,airport:false\}\)\)return;\s*const p=model\.registerPassenger\(validated\)/);
-  assert.match(source,/pickupInput\.setManual\(state\.pickup\);state\.airport=false;\$\('airport-pickup'\)\.checked=false;\$\('airport-check'\)\.checked=false;/);
-  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi Airport');
-  m.chooseRole('passenger');m.registerPassenger({name:'Airport Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Nadi Airport',consent:true});
-  const ride=m.requestRide({pickup:'Nadi Airport',destination:'Denarau',airport:true}),offer=m.getOffers(ride.id)[0];
-  const change=m.invalidateRideSearch(ride.id,{pickup:'Radisson Blu Denarau',airport:false});
-  assert.equal(change.invalidated,true);assert.equal(ride.status,'cancelled');assert.throws(()=>m.selectOffer(offer.id));
-  const profile=m.registerPassenger({name:'Airport Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Radisson Blu Denarau',consent:true});pickup.setManual(profile.pickup);
-  assert.equal(pickup.snapshot().value,'Radisson Blu Denarau');assert.equal(R.pickupAirportScope({source:'manual',confirmedAirport:false}),false);
-});
-test('invalid passenger profile input leaves the active request and offers untouched', () => {
-  const {R,m}=setup();passenger(m);
-  const oldPickup=m.state.profile.pickup,ride=m.requestRide({pickup:oldPickup,destination:'Nadi Airport'}),offer=m.getOffers(ride.id)[0];
-  assert.throws(()=>R.passengerRegistrationInput({name:'Review Guest',phone:'+819000000000',email:'invalid-email',language:'ja',payment:'card',pickup:'New Hotel',consent:true}),/ãƒ¡ãƒ¼ãƒ«ã‚¢ãƒ‰ãƒ¬ã‚¹/);
-  assert.equal(ride.status,'collecting');assert.equal(offer.status,'active');assert.equal(m.state.profile.pickup,oldPickup);
-});
-test('validated passenger profile input invalidates old quotes before profile replacement', () => {
-  const {R,m}=setup();passenger(m);
-  const ride=m.requestRide({pickup:m.state.profile.pickup,destination:'Nadi Airport'}),offer=m.getOffers(ride.id)[0];
-  const values=R.passengerRegistrationInput({name:'  Review Guest  ',phone:' +6790000000 ',email:'guest@example.com',language:'en',payment:'cash',pickup:' New Hotel ',consent:true});
-  assert.equal(values.pickup,'New Hotel');assert.equal(values.phone,'+6790000000');
-  assert.equal(m.invalidateRideSearch(ride.id,{pickup:values.pickup,airport:false}).invalidated,true);
-  const updated=m.registerPassenger(values);
-  assert.equal(ride.status,'cancelled');assert.equal(offer.status,'expired');assert.equal(updated.pickup,'New Hotel');
-});
-test('assigned ride blocks profile pickup replacement before the profile is mutated', () => {
-  const {m}=setup();passenger(m);
-  const original=m.state.profile.pickup,ride=m.requestRide({pickup:original,destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];m.selectOffer(offer.id);
-  assert.throws(()=>m.invalidateRideSearch(ride.id,{pickup:'New Hotel',airport:false}),/é¸æŠžæ¸ˆã¿ãƒ»ä¹—è»Šä¸­/);
-  assert.equal(m.state.profile.pickup,original);assert.equal(ride.pickup,original);assert.equal(ride.status,'assigned');
-});
-test('blank registered pickup remains unset and blocks a ride until explicit input', () => {
-  assert.match(source,/\$\('pickup-label'\)\.textContent=state\.pickup\?state\.pickup\+' Â· ãƒ‡ãƒ¢':'ä¹—è»Šåœ°ç‚¹ã‚’è¨­å®š';/);
-  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi, Fiji');
-  m.chooseRole('passenger');
-  const profile=m.registerPassenger({name:'No Pickup Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'   ',consent:true});
-  pickup.setManual(profile.pickup||'');
-  assert.equal(pickup.snapshot().value,'');assert.equal(pickup.snapshot().source,'empty');assert.equal(pickup.snapshot().canRequest,false);
-  assert.throws(()=>m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'}),/ä¹—è»Šåœ°ç‚¹ã¨ç›®çš„åœ°/);
-  assert.equal(m.myRequests().length,0);
-});
-test('clearing profile pickup discards an old value and rejects delayed geolocation', () => {
-  const {R,m}=setup(),pickup=R.createPickupInputController('Ramada Suites Wailoaloa');
-  m.chooseRole('passenger');
-  m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'Ramada Suites Wailoaloa',consent:true});
-  const oldLocation=pickup.beginLocation();
-  const updated=m.registerPassenger({name:'Hotel Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'',consent:true});
-  pickup.setManual(updated.pickup||'');
-  const stale=pickup.locationSuccess(oldLocation.token,'ç¾åœ¨åœ°');
-  assert.equal(stale.accepted,false);assert.equal(stale.state.value,'');assert.equal(stale.state.canRequest,false);
-  assert.throws(()=>m.requestRide({pickup:pickup.snapshot().value,destination:'Nadi Airport'}),/ä¹—è»Šåœ°ç‚¹ã¨ç›®çš„åœ°/);
-  assert.equal(m.myRequests().length,0);
-});
-test('pickup request view distinguishes missing, locating and ready states', () => {
-  const {R}=setup();
-  assert.deepEqual({...R.pickupRequestView({value:'',pending:false})},{ready:false,value:'',action:'edit_pickup',message:'ä¹—è»Šåœ°ç‚¹ã‚’å…¥åŠ›ã—ã¦ãã ã•ã„ã€‚'});
-  assert.deepEqual({...R.pickupRequestView({value:'Ramada Suites Wailoaloa',pending:true})},{ready:false,value:'Ramada Suites Wailoaloa',action:'wait_or_edit',message:'ç¾åœ¨åœ°ã‚’ç¢ºèªä¸­ã§ã™ã€‚å®Œäº†ã‚’å¾…ã¤ã‹ã€ä¹—è»Šåœ°ç‚¹ã‚’æ‰‹å…¥åŠ›ã—ã¦ãã ã•ã„ã€‚'});
-  assert.deepEqual({...R.pickupRequestView({value:'Ramada Suites Wailoaloa',pending:false})},{ready:true,value:'Ramada Suites Wailoaloa',action:null,message:''});
-});
-test('missing pickup opens manual recovery and explicit input enables the request', () => {
-  assert.match(source,/if\(!pickupView\.ready\)\{if\(pickupView\.action==='edit_pickup'\)showPickupFallback\(pickupView\.message\);else toast\(pickupView\.message\);return;\}/);
-  assert.match(source,/if\(!pickupInput\.snapshot\(\)\.canRequest\)openPickupEditor\(\);/);
-  const {R,m}=setup(),pickup=R.createPickupInputController('');
-  m.chooseRole('passenger');m.registerPassenger({name:'No Pickup Guest',phone:'+6790000000',language:'en',payment:'cash',pickup:'',consent:true});
-  assert.equal(R.pickupRequestView(pickup.snapshot()).action,'edit_pickup');
-  pickup.setManual('Ramada Suites Wailoaloa');
-  const ready=R.pickupRequestView(pickup.snapshot());
-  assert.equal(ready.ready,true);
-  const ride=m.requestRide({pickup:ready.value,destination:'Nadi Airport'});
-  assert.equal(ride.pickup,'Ramada Suites Wailoaloa');
-});
-test('airport pickup requires an explicit manual confirmation', () => {
-  const {R}=setup();
-  assert.equal(R.pickupAirportScope({source:'manual',confirmedAirport:true}),true);
-  for(const input of [
-    {source:'manual',confirmedAirport:false},
-    {source:'geolocation',confirmedAirport:true},
-    {source:'empty',confirmedAirport:true},
-    {source:'manual',confirmedAirport:'true'}
-  ])assert.equal(R.pickupAirportScope(input),false);
-});
-test('switching an airport pickup to current location clears airport dispatch scope', () => {
-  assert.match(source,/const airport=R\.pickupAirportScope\(\{source:'geolocation',confirmedAirport:state\.airport\}\);if\(!invalidateCurrentSearch\(\{pickup:'ç¾åœ¨åœ°',airport\}\)\)/);
-  assert.match(source,/state\.airport=airport;\$\('airport-pickup'\)\.checked=false;\$\('airport-check'\)\.checked=false;/);
-  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi Airport');
-  passenger(m);pickup.setManual('Nadi Airport');
-  let airport=R.pickupAirportScope({source:'manual',confirmedAirport:true});
-  const first=m.requestRide({pickup:pickup.snapshot().value,destination:'Denarau',airport});
-  assert.equal(first.airport,true);
-  const locating=pickup.beginLocation(),located=pickup.locationSuccess(locating.token,'ç¾åœ¨åœ°');
-  assert.equal(located.accepted,true);
-  airport=R.pickupAirportScope({source:located.state.source,confirmedAirport:airport});
-  const second=m.requestRide({pickup:located.state.value,destination:'Denarau',airport});
-  assert.equal(second.airport,false);assert.equal(first.status,'cancelled');assert.equal(second.status,'collecting');
-});
-test('pickup editor restores only the active manual pickup and its airport confirmation', () => {
-  const {R}=setup();
-  assert.deepEqual({...R.pickupEditorView({source:'manual',value:'Nadi Airport',airport:true})},{value:'Nadi Airport',airport:true,placeholder:'ä¾‹ï¼šãƒ›ãƒ†ãƒ«åãƒ»æ–½è¨­å'});
-  assert.deepEqual({...R.pickupEditorView({source:'geolocation',value:'ç¾åœ¨åœ°',airport:true})},{value:'',airport:false,placeholder:'ç¾åœ¨åœ°ã‚’ä½¿ç”¨ä¸­ã§ã™ã€‚æ–½è¨­åã¸å¤‰æ›´ã™ã‚‹å ´åˆã¯å…¥åŠ›ã—ã¦ãã ã•ã„ã€‚'});
-  assert.deepEqual({...R.pickupEditorView({source:'empty',value:'Old Hotel',airport:true})},{value:'',airport:false,placeholder:'ä¾‹ï¼šãƒ›ãƒ†ãƒ«åãƒ»æ–½è¨­å'});
-  assert.match(source,/\$\('pickup-open'\)\.onclick = openPickupEditor;/);
-  assert.match(source,/const editor=R\.pickupEditorView\(\{\.\.\.pickupInput\.snapshot\(\),airport:state\.airport\}\);/);
-});
-test('opening the editor after current location cannot revive an old airport pickup', () => {
-  const {R,m}=setup(),pickup=R.createPickupInputController('Nadi Airport');
-  passenger(m);pickup.setManual('Nadi Airport');
-  let airport=R.pickupAirportScope({source:'manual',confirmedAirport:true});
-  const locating=pickup.beginLocation(),located=pickup.locationSuccess(locating.token,'ç¾åœ¨åœ°');
-  airport=R.pickupAirportScope({source:located.state.source,confirmedAirport:airport});
-  const editor=R.pickupEditorView({...located.state,airport});
-  assert.equal(editor.value,'');assert.equal(editor.airport,false);
-  assert.throws(()=>m.requestRide({pickup:editor.value,destination:'Denarau',airport:editor.airport}),/ä¹—è»Šåœ°ç‚¹ã¨ç›®çš„åœ°/);
-  pickup.setManual('Radisson Blu Denarau');
-  const ride=m.requestRide({pickup:pickup.snapshot().value,destination:'Denarau',airport:editor.airport});
-  assert.equal(ride.pickup,'Radisson Blu Denarau');assert.equal(ride.airport,false);
-});
-function selected() {
-  const s=setup(), {m}=s;
-  passenger(m);
-  const ride=m.requestRide({pickup:'Demo Hotel', destination:'Demo Beach'});
-  m.useReviewedFixture(); m.setOnline(true);
-  const offer=m.submitOffer(ride.id,{fare:'23.50',eta:'7'});
-  m.chooseRole('passenger'); m.selectOffer(offer.id);
-  return {...s,ride,offer};
-}
-// Run the actual registration DOM handlers with deterministic form controls.
-// This checks submit routing, not native browser keyboard/constraint behavior.
-function registrationWizard() {
-  const {m,V}=setup();m.chooseRole('driver');
-  const nodes={},fields={},reports=[],pages=[],messages=[];
-  const stepFields=[['name','phone','driverLicence','psvPermit'],['plate','vehicle','taxiPermit','holder','base'],[]];
-  const $=id=>nodes[id] ||= {hidden:false};
-  stepFields.forEach((keys,step)=>{
-    const html=source.split(`<div id="reg-step-${step}"`)[1].split('</div>')[0];
-    keys.forEach(key=>{
-      assert.match(html,new RegExp(`name="${key}"[^>]*required`));
-      fields[key]={value:'',checkValidity(){return !!this.value.trim();},reportValidity(){
-        assert.equal($('reg-step-'+step).hidden,false,'invalid field must be visible');
-        reports.push(key);return this.checkValidity();
-      }};
-    });
-    $('reg-step-'+step).querySelectorAll=()=>keys.map(key=>fields[key]);
-  });
-  fields.consent={checked:false};
-  $('register-airport').checked=false;
-  $('registration-form').elements=fields;
-  $('progress').children=stepFields.map(()=>({classList:{toggle(){}}}));
-  const state={regStep:0,documents:{}};
-  let attempts=0;
-  const sandbox=vm.createContext({$,state,V,names:{},esc:String,
-    document:{querySelectorAll:()=>[],querySelector:()=>null},
-    model:{state:m.state,registerDriver(input){attempts++;return m.registerDriver(input);}},
-    records:m.state.records,show:page=>pages.push(page),toast:message=>messages.push(message),
-    FormData:class {constructor(form){this.form=form;}entries(){return Object.entries(this.form.elements).filter(([k])=>k!=='consent').map(([k,field])=>[k,field.value]);}}
-  });
-  vm.runInContext(source.slice(source.indexOf('function currentTypes()'),source.indexOf('// Optional live map.')),sandbox);
-  sandbox.setStep(0);
-  return {m,V,$,fields,state,reports,pages,messages,attempts:()=>attempts,
-    issues:now=>JSON.parse(JSON.stringify(sandbox.registrationDocumentIssues(now))),
-    updateFeedback:key=>sandbox.updateDocumentFeedback(key),
-    submit(){let prevented=false;$('registration-form').onsubmit({currentTarget:$('registration-form'),preventDefault(){prevented=true;}});assert.equal(prevented,true);}};
-}
-test('registration wizard submit advances each step before creating a pending driver', () => {
-  const w=registrationWizard();w.$('fill-sample').onclick();
-  for(const step of [1,2]){
-    w.submit();assert.equal(w.state.regStep,step);assert.equal(w.attempts(),0);
-    assert.equal(w.m.state.profiles.driver,null);assert.deepEqual(w.pages,[]);
-  }
-  assert.equal(w.$('reg-submit').hidden,false);
-  w.submit();assert.equal(w.attempts(),1);assert.deepEqual(w.pages,['driver-home']);
-  assert.equal(w.m.state.profile.status,'submitted');assert.equal(w.m.gate().eligible,false);
-  assert.throws(()=>w.m.setOnline(true));assert.equal(w.m.driverRequests().length,0);
-  assert.throws(()=>w.m.submitOffer('sample-city',{fare:'20',eta:'5'}));
-});
-test('registration wizard next and submit both stop on missing current-step fields', () => {
-  for(const action of ['next','submit']){
-    const w=registrationWizard();w.$('fill-sample').onclick();
-    w.fields.phone.value='';
-    const advance=()=>action==='next'?w.$('reg-next').onclick():w.submit();
-    advance();assert.equal(w.state.regStep,0);assert.equal(w.reports.at(-1),'phone');
-    w.fields.phone.value='+6790000000';advance();assert.equal(w.state.regStep,1);
-    w.fields.plate.value='';advance();assert.equal(w.state.regStep,1);
-    assert.equal(w.reports.at(-1),'plate');assert.equal(w.attempts(),0);assert.deepEqual(w.pages,[]);
-  }
-});
-test('registration wizard final submit reveals invalid earlier fields without losing input', () => {
-  for(const [key,step] of [['name',0],['vehicle',1]]){
-    const w=registrationWizard();w.$('fill-sample').onclick();
-    w.$('reg-next').onclick();w.$('reg-next').onclick();
-    const documents=JSON.stringify(w.state.documents),phone=w.fields.phone.value;
-    w.fields[key].value='';w.submit();
-    assert.equal(w.state.regStep,step);assert.equal(w.$('reg-step-'+step).hidden,false);
-    assert.equal(w.reports.at(-1),key);assert.equal(w.attempts(),0);assert.deepEqual(w.pages,[]);
-    assert.equal(w.fields.phone.value,phone);assert.equal(JSON.stringify(w.state.documents),documents);
-  }
-});
-test('registration wizard keeps final document and consent rejection on the review step', () => {
-  for(const invalid of ['documents','consent']){
-    const w=registrationWizard();w.$('fill-sample').onclick();
-    w.$('reg-next').onclick();w.$('reg-next').onclick();
-    if(invalid==='documents')w.state.documents={};else w.fields.consent.checked=false;
-    w.submit();assert.equal(w.attempts(),invalid==='documents'?0:1);assert.equal(w.state.regStep,2);
-    assert.equal(w.$('registration-error').hidden,false);assert.deepEqual(w.pages,[]);
-    assert.equal(w.m.state.profiles.driver,null);
-  }
-});
-test('registration wizard names missing, invalid and expired document evidence per item', () => {
-  const w=registrationWizard(),now=Date.parse('2030-01-10T00:00:00Z');
-  w.$('register-airport').checked=true;
-  w.state.documents=Object.fromEntries([...w.V.REQUIRED,'airport_authorization'].map(k=>[k,{attachment:'DEMO-'+k+'.pdf',expiresAt:'2031-01-10T00:00:00+12:00'}]));
-  w.state.documents.taxi_permit.attachment='';
-  w.state.documents.vehicle_licence.expiresAt='not-a-date';
-  w.state.documents.driver_licence.expiresAt='2029-01-10T00:00:00+12:00';
-  w.state.documents.psv_driver_permit.expiresAt='';
-  const issues=w.issues(now);
-  assert.deepEqual(issues.taxi_permit,['ãƒ‡ãƒ¢æ›¸é¡žã‚’æ·»ä»˜ã—ã¦ãã ã•ã„ã€‚']);
-  assert.deepEqual(issues.vehicle_licence,['æœ‰åŠ¹æœŸé™ã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚']);
-  assert.deepEqual(issues.driver_licence,['æœ‰åŠ¹æœŸé™ãŒåˆ‡ã‚Œã¦ã„ã¾ã™ã€‚å°†æ¥ã®æ—¥ä»˜ã‚’å…¥åŠ›ã—ã¦ãã ã•ã„ã€‚']);
-  assert.deepEqual(issues.psv_driver_permit,['æœ‰åŠ¹æœŸé™ã‚’å…¥åŠ›ã—ã¦ãã ã•ã„ã€‚']);
-  assert.deepEqual(issues.fitness,[]);assert.deepEqual(issues.airport_authorization,[]);
-});
-test('registration wizard shows document-level alerts and accepts a corrected retry', () => {
-  const w=registrationWizard();w.$('fill-sample').onclick();
-  w.$('reg-next').onclick();w.$('reg-next').onclick();
-  delete w.state.documents.taxi_permit.attachment;
-  w.state.documents.vehicle_licence.expiresAt='2020-01-01T00:00:00+12:00';
-  w.submit();
-  assert.equal(w.attempts(),0);assert.equal(w.$('registration-error').hidden,false);
-  assert.match(w.$('registration-error').textContent,/2ä»¶ã®æ›¸é¡ž/);
-  assert.match(w.$('doc-fields').innerHTML,/id="doc-error-taxi_permit"[^>]*data-doc-error role="alert"/);
-  assert.match(w.$('doc-fields').innerHTML,/ãƒ‡ãƒ¢æ›¸é¡žã‚’æ·»ä»˜ã—ã¦ãã ã•ã„/);
-  assert.match(w.$('doc-fields').innerHTML,/æœ‰åŠ¹æœŸé™ãŒåˆ‡ã‚Œã¦ã„ã¾ã™/);
-  w.state.documents.taxi_permit.attachment='DEMO-taxi_permit.pdf';w.updateFeedback('taxi_permit');
-  assert.match(w.$('registration-error').textContent,/1ä»¶ã®æ›¸é¡ž/);
-  w.state.documents.vehicle_licence.expiresAt=new Date(Date.now()+86400000).toISOString();w.updateFeedback('vehicle_licence');
-  assert.equal(w.$('registration-error').hidden,true);
-  w.$('fill-sample').onclick();w.submit();
-  assert.equal(w.attempts(),1);assert.deepEqual(w.pages,['driver-home']);
-  assert.equal(w.m.state.profile.status,'submitted');assert.equal(w.m.gate().eligible,false);
-});
-test('role routing keeps passenger and driver controls separate', () => {
-  const {R}=setup();
-  assert.equal(R.route(null,null,'driver-home'),'role');
-  assert.equal(R.route('passenger',null,'home'),'passenger-register');
-  assert.equal(R.route('driver',null,'driver-home'),'register');
-  assert.equal(R.route('passenger',{},'driver-home'),'home');
-  assert.equal(R.route('driver',{},'offers'),'driver-home');
-});
-test('command feedback uses separate passenger and driver wording', () => {
-  const {R}=setup();
-  const passenger=R.commandFeedback('passenger','pending');
-  const driver=R.commandFeedback('driver','pending');
-  assert.match(passenger.title,/ä¾é ¼/);
-  assert.match(driver.title,/é‹è¡Œ/);
-  assert.notEqual(passenger.title,driver.title);
-  assert.equal(passenger.disableCommands,true);
-  assert.equal(driver.disableCommands,true);
-});
-test('a pending command rejects duplicate button activation', () => {
-  const {R}=setup(),ui=R.createCommandUiController('passenger');
-  const first=ui.begin('passenger'),duplicate=ui.begin('passenger');
-  assert.equal(first.accepted,true);
-  assert.equal(duplicate.accepted,false);
-  assert.equal(duplicate.state.outcome,'pending');
-  assert.equal(duplicate.state.disableCommands,true);
-});
-test('confirmed command feedback unlocks state-changing controls', () => {
-  const {R}=setup(),ui=R.createCommandUiController('driver');
-  ui.begin('driver');const confirmed=ui.finish('confirmed');
-  assert.equal(confirmed.role,'driver');
-  assert.equal(confirmed.outcome,'confirmed');
-  assert.equal(confirmed.disableCommands,false);
-  assert.equal(confirmed.action,null);
-});
-test('an unresolved command stays locked until explicit latest-state acknowledgement', () => {
-  const {R}=setup(),ui=R.createCommandUiController('passenger');
-  ui.begin('passenger');const unresolved=ui.finish('unresolved');
-  assert.equal(unresolved.disableCommands,true);
-  assert.equal(unresolved.action,'refresh');
-  assert.equal(ui.begin('passenger').accepted,false);
-  assert.equal(ui.clear().outcome,'idle');
-  assert.equal(ui.begin('passenger').accepted,true);
-});
-test('session expiry presents reauthentication instead of another command attempt', () => {
-  const {R}=setup(),ui=R.createCommandUiController('driver');
-  ui.begin('driver');const expired=ui.finish('reauth');
-  assert.equal(expired.disableCommands,true);
-  assert.equal(expired.action,'reauth');
-  assert.match(expired.title,/å†ãƒ­ã‚°ã‚¤ãƒ³/);
-  assert.equal(ui.begin('driver').accepted,false);
-});
-test('role switching clears old command feedback before showing the other role', () => {
-  const {R}=setup(),ui=R.createCommandUiController('passenger');
-  ui.begin('passenger');ui.finish('unresolved');
-  const switched=ui.setRole('driver');
-  assert.equal(switched.role,'driver');
-  assert.equal(switched.outcome,'idle');
-  assert.equal(switched.disableCommands,false);
-});
-function memoryStorage(seed={}) {
-  const values=new Map(Object.entries(seed));
-  return {getItem:key=>values.has(key)?values.get(key):null,setItem:(key,value)=>values.set(key,String(value)),removeItem:key=>values.delete(key),value:key=>values.get(key)};
-}
-test('restart guard persists only a minimal allowlisted marker', () => {
-  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
-  assert.equal(guard.mark('passenger','pending'),true);
-  const marker=JSON.parse(storage.value(guard.key));
-  assert.deepEqual(Object.keys(marker).sort(),['outcome','role','savedAt','version']);
-  assert.deepEqual(marker,{version:1,role:'passenger',outcome:'pending',savedAt:1000});
-  for(const forbidden of ['command','action','rideId','accountId','token','idempotencyKey'])assert.equal(forbidden in marker,false);
-});
-test('restart guard converts an interrupted command into locked reconciliation without replay', () => {
-  const {R}=setup(),storage=memoryStorage(),writer=R.createCommandRestartGuard(storage,{now:()=>1000});
-  writer.mark('driver','pending');
-  const restored=R.createCommandRestartGuard(storage,{now:()=>1500}).restore();
-  assert.equal(restored.role,'driver');
-  assert.equal(restored.outcome,'unresolved');
-  assert.equal(restored.resumedFrom,'pending');
-  assert.equal(restored.autoResend,false);
-  assert.equal(restored.feedback.disableCommands,true);
-  assert.match(restored.feedback.title,/ç¢ºèªã§ãã¾ã›ã‚“/);
-});
-test('restart guard discards an expired marker', () => {
-  const {R}=setup(),storage=memoryStorage(),writer=R.createCommandRestartGuard(storage,{now:()=>1000,maxAgeMs:500});
-  writer.mark('passenger','unresolved');
-  const restored=R.createCommandRestartGuard(storage,{now:()=>1501,maxAgeMs:500}).restore();
-  assert.equal(restored,null);
-  assert.equal(storage.value(writer.key),undefined);
-});
-test('restart guard rejects malformed or extended markers instead of trusting them', () => {
-  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
-  storage.setItem(guard.key,JSON.stringify({version:1,role:'passenger',outcome:'pending',savedAt:900,rideId:'private-ride'}));
-  assert.equal(guard.restore(),null);
-  assert.equal(storage.value(guard.key),undefined);
-  storage.setItem(guard.key,'not-json');
-  assert.equal(guard.restore(),null);
-});
-test('restart guard keeps passenger and driver recovery wording separate', () => {
-  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
-  guard.mark('driver','conflict');
-  const restored=guard.restore();
-  assert.equal(restored.role,'driver');
-  assert.match(restored.feedback.message,/æœ€æ–°çŠ¶æ…‹/);
-  assert.notEqual(restored.feedback.role,'passenger');
-});
-test('restart guard clears markers and fails safely when storage is unavailable', () => {
-  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
-  guard.mark('passenger','pending');
-  assert.equal(guard.clear(),true);
-  assert.equal(guard.restore(),null);
-  const broken={getItem(){throw Error('blocked');},setItem(){throw Error('blocked');},removeItem(){throw Error('blocked');}};
-  const unavailable=R.createCommandRestartGuard(broken,{now:()=>1000});
-  assert.equal(unavailable.mark('passenger','pending'),false);
-  assert.equal(unavailable.restore(),null);
-});
-function currentRideView(role,overrides={}) {
-  return {id:FIXTURE.requestId,status:role==='driver'?'assigned':'collecting',revision:2,viewerRole:role,nextAction:role==='driver'?'start_pickup':'compare_offers',updatedAt:'2026-09-17T03:00:00.000Z',...overrides};
-}
-function startupRecovery(R,role,readCurrentRide,principal={accountRef:`demo-${role}-account`,viewerRole:role}) {
-  const storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});
-  guard.mark(role,'pending');
-  return {storage,guard,controller:R.createStartupRecoveryController({guard,role,principal,readCurrentRide})};
-}
-test('startup network failure retains the marker without replaying a command', async () => {
-  const {R}=setup();let reads=0;
-  const {guard,controller}=startupRecovery(R,'passenger',async()=>{reads+=1;throw Error('offline');});
-  const result=await controller.reconcile();
-  assert.equal(result.requested,true);
-  assert.equal(reads,1);
-  assert.equal(result.state.outcome,'unresolved');
-  assert.equal(result.state.markerRetained,true);
-  assert.equal(result.state.canRetry,true);
-  assert.equal(result.state.autoCommandReplay,false);
-  assert.equal(guard.restore().role,'passenger');
-});
-test('connectivity recovery permits one explicit state reread and then clears the marker', async () => {
-  const {R}=setup();let reads=0;
-  const {guard,controller}=startupRecovery(R,'driver',async()=>{reads+=1;if(reads===1)throw Error('offline');return {status:200,body:currentRideView('driver')};});
-  await controller.reconcile();
-  const recovered=await controller.reconcile('connectivity');
-  assert.equal(recovered.requested,true);
-  assert.equal(recovered.state.outcome,'confirmed');
-  assert.equal(recovered.state.markerRetained,false);
-  assert.equal(reads,2);
-  assert.equal(guard.restore(),null);
-  assert.equal((await controller.reconcile('connectivity')).requested,false);
-});
-test('authentication recovery waits for explicit reauthentication and rereads once', async () => {
-  const {R}=setup();let reads=0;
-  const {guard,controller}=startupRecovery(R,'passenger',async()=>++reads===1?{status:401}:{status:200,body:currentRideView('passenger')});
-  const expired=await controller.reconcile();
-  assert.equal(expired.state.outcome,'reauth');
-  assert.equal(expired.state.markerRetained,true);
-  assert.equal((await controller.reconcile('connectivity')).requested,false);
-  assert.equal(reads,1);
-  const recovered=await controller.reconcile('reauth');
-  assert.equal(recovered.state.outcome,'confirmed');
-  assert.equal(reads,2);
-  assert.equal(guard.restore(),null);
-});
-test('startup recovery clears a concealed not-found result without retry', async () => {
-  const {R}=setup();let reads=0;
-  const {guard,controller}=startupRecovery(R,'driver',async()=>{reads+=1;return {status:404};});
-  const result=await controller.reconcile();
-  assert.equal(result.state.outcome,'rejected');
-  assert.equal(result.state.markerRetained,false);
-  assert.equal(result.state.canRetry,false);
-  assert.equal(guard.restore(),null);
-  assert.equal((await controller.reconcile('connectivity')).requested,false);
-  assert.equal(reads,1);
-});
-test('startup recovery does not treat a bodyless 304 as restored state', async () => {
-  const {R}=setup();
-  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:304}));
-  const result=await controller.reconcile();
-  assert.equal(result.state.outcome,'unresolved');
-  assert.equal(result.state.markerRetained,true);
-  assert.equal(result.state.canRetry,true);
-  assert.equal(guard.restore().role,'passenger');
-});
-test('startup recovery discards a marker for another role before any read', async () => {
-  const {R}=setup(),storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});let reads=0;
-  guard.mark('passenger','pending');
-  const controller=R.createStartupRecoveryController({guard,role:'driver',principal:{accountRef:'demo-driver-account',viewerRole:'driver'},readCurrentRide:async()=>{reads+=1;return {status:200,body:currentRideView('driver')};}});
-  const result=await controller.reconcile();
-  assert.equal(result.requested,false);
-  assert.equal(result.state.markerRetained,false);
-  assert.equal(reads,0);
-  assert.equal(guard.restore(),null);
-});
-test('startup recovery rejects duplicate reads while one is in flight', async () => {
-  const {R}=setup();let release,reads=0;
-  const {controller}=startupRecovery(R,'passenger',()=>{reads+=1;return new Promise(resolve=>{release=resolve;});});
-  const first=controller.reconcile();
-  const duplicate=await controller.reconcile();
-  assert.equal(duplicate.requested,false);
-  assert.equal(duplicate.reason,'in_flight');
-  assert.equal(reads,1);
-  release({status:200,body:currentRideView('passenger')});
-  assert.equal((await first).state.outcome,'confirmed');
-});
-test('startup discovery restores a passenger ride to the passenger history without a caller-supplied ride id', async () => {
-  const {R}=setup(),requests=[];
-  const {guard,controller}=startupRecovery(R,'passenger',async request=>{requests.push(request);return {status:200,body:currentRideView('passenger')};});
-  const result=await controller.reconcile();
-  assert.equal(requests.length,1);
-  assert.equal(requests[0].method,'GET');
-  assert.equal(requests[0].path,'/v1/rides/current');
-  assert.equal(requests[0].reason,'startup');
-  assert.equal(requests[0].signal.aborted,false);
-  assert.equal(result.state.outcome,'confirmed');
-  assert.equal(result.view.kind,'ride');
-  assert.equal(result.view.page,'passenger-history');
-  assert.deepEqual(Object.keys(result.view.ride),['id','status','revision','viewerRole','nextAction','updatedAt']);
-  assert.equal(result.view.ride.viewerRole,'passenger');
-  assert.equal(guard.restore(),null);
-  assert.equal(Object.hasOwn(requests[0],'rideId'),false);
-  assert.equal(Object.hasOwn(requests[0],'role'),false);
-  assert.equal(Object.hasOwn(requests[0],'accountRef'),false);
-});
-test('startup discovery restores an assigned driver ride to the driver trips screen', async () => {
-  const {R}=setup();
-  const {guard,controller}=startupRecovery(R,'driver',async()=>({status:200,body:currentRideView('driver',{status:'arriving',nextAction:'start_trip'})}));
-  const result=await controller.reconcile();
-  assert.equal(result.state.outcome,'confirmed');
-  assert.equal(result.view.kind,'ride');
-  assert.equal(result.view.page,'driver-trips');
-  assert.equal(result.view.ride.viewerRole,'driver');
-  assert.equal(result.view.ride.status,'arriving');
-  assert.equal(guard.restore(),null);
-});
-test('startup discovery clears the recovery lock and returns each role to its own home when no ride exists', async () => {
-  const {R}=setup();
-  for(const [role,page] of [['passenger','home'],['driver','driver-home']]){
-    const {guard,controller}=startupRecovery(R,role,async()=>({status:204}));
-    const result=await controller.reconcile();
-    assert.equal(result.state.outcome,'empty');
-    assert.equal(result.state.markerRetained,false);
-    assert.equal(result.view.kind,'empty');
-    assert.equal(result.view.page,page);
-    assert.equal(result.view.ride,null);
-    assert.equal(guard.restore(),null);
-  }
-});
-test('startup discovery keeps commands locked when current-ride lookup is ambiguous', async () => {
-  const {R}=setup(),body={code:'ambiguous_current_ride',message:'Current ride is ambiguous',requestId:'trace-only'};
-  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:409,body}));
-  const result=await controller.reconcile();
-  assert.equal(result.state.outcome,'conflict');
-  assert.equal(result.state.markerRetained,true);
-  assert.equal(result.state.canRetry,false);
-  assert.equal(result.view.kind,'blocked');
-  assert.equal(result.view.page,null);
-  assert.equal(result.view.ride,null);
-  assert.equal(result.view.reason,'ambiguous_current_ride');
-  assert.equal(guard.restore().resumedFrom,'conflict');
-  assert.equal((await controller.reconcile()).requested,false);
-  assert.equal(JSON.stringify(result).includes(FIXTURE.requestId),false);
-});
-test('startup discovery rejects extended current-ride bodies instead of exposing private fields', async () => {
-  const {R}=setup(),extended={...currentRideView('passenger'),assignedDriverId:'private-driver'};
-  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:200,body:extended}));
-  const result=await controller.reconcile();
-  assert.equal(result.state.outcome,'conflict');
-  assert.equal(result.state.markerRetained,true);
-  assert.equal(result.view.kind,'blocked');
-  assert.equal(result.view.page,null);
-  assert.equal(result.view.ride,null);
-  assert.equal(result.view.reason,'invalid_current_ride');
-  assert.equal(JSON.stringify(result).includes('private-driver'),false);
-  assert.equal(guard.restore().resumedFrom,'conflict');
-});
-test('startup discovery rejects a valid shape for the other role without navigating or exposing the ride', async () => {
-  const {R}=setup();
-  const {guard,controller}=startupRecovery(R,'passenger',async()=>({status:200,body:currentRideView('driver')}));
-  const result=await controller.reconcile();
-  assert.equal(result.state.outcome,'conflict');
-  assert.equal(result.view.kind,'blocked');
-  assert.equal(result.view.page,null);
-  assert.equal(result.view.ride,null);
-  assert.equal(guard.restore().role,'passenger');
-});
-test('logout aborts startup discovery and a delayed success cannot restore the passenger screen', async () => {
-  const {R}=setup();let release,request;
-  const {guard,controller}=startupRecovery(R,'passenger',value=>{request=value;return new Promise(resolve=>{release=resolve;});});
-  const pending=controller.reconcile();
-  const loggedOut=controller.replacePrincipal(null);
-  assert.equal(request.signal.aborted,true);
-  assert.equal(loggedOut.sessionActive,false);
-  assert.equal(loggedOut.markerRetained,false);
-  assert.equal(loggedOut.outcome,'session_changed');
-  assert.equal(guard.restore(),null);
-  release({status:200,body:currentRideView('passenger')});
-  const delayed=await pending;
-  assert.equal(delayed.reason,'stale_session');
-  assert.equal(delayed.view,null);
-  assert.equal(delayed.state.outcome,'session_changed');
-});
-test('role switching rejects a delayed passenger discovery even when the response is otherwise valid', async () => {
-  const {R}=setup();let release;
-  const {controller}=startupRecovery(R,'passenger',()=>new Promise(resolve=>{release=resolve;}));
-  const pending=controller.reconcile();
-  const switched=controller.replacePrincipal({accountRef:'demo-driver-account',viewerRole:'driver'});
-  assert.equal(switched.role,'passenger');
-  assert.equal(switched.sessionActive,false);
-  assert.equal(switched.sessionGeneration,2);
-  release({status:200,body:currentRideView('passenger')});
-  const delayed=await pending;
-  assert.equal(delayed.reason,'stale_session');
-  assert.equal(delayed.view,null);
-  assert.equal(delayed.state.markerRetained,false);
-});
-test('account switching rejects a delayed discovery for the same role without exposing account references', async () => {
-  const {R}=setup();let release,request;
-  const {controller}=startupRecovery(R,'passenger',value=>{request=value;return new Promise(resolve=>{release=resolve;});},{accountRef:'passenger-a',viewerRole:'passenger'});
-  const pending=controller.reconcile();
-  const switched=controller.replacePrincipal({accountRef:'passenger-b',viewerRole:'passenger'});
-  assert.equal(switched.sessionActive,true);
-  assert.equal(switched.sessionGeneration,2);
-  assert.equal(JSON.stringify(switched).includes('passenger-a'),false);
-  assert.equal(JSON.stringify(switched).includes('passenger-b'),false);
-  assert.equal(Object.hasOwn(request,'accountRef'),false);
-  release({status:200,body:currentRideView('passenger')});
-  const delayed=await pending;
-  assert.equal(delayed.reason,'stale_session');
-  assert.equal(delayed.view,null);
-  assert.equal(JSON.stringify(delayed).includes('passenger-a'),false);
-});
-test('a delayed no-current-ride response cannot navigate the new session home', async () => {
-  const {R}=setup();let release;
-  const {controller}=startupRecovery(R,'driver',()=>new Promise(resolve=>{release=resolve;}));
-  const pending=controller.reconcile();
-  controller.replacePrincipal({accountRef:'other-driver-account',viewerRole:'driver'});
-  release({status:204});
-  const delayed=await pending;
-  assert.equal(delayed.reason,'stale_session');
-  assert.equal(delayed.view,null);
-  assert.equal(delayed.state.outcome,'session_changed');
-});
-test('an old network failure cannot recreate a restart marker after the session changes', async () => {
-  const {R}=setup();let reject;
-  const {guard,controller}=startupRecovery(R,'passenger',()=>new Promise((resolve,rejectRead)=>{reject=rejectRead;}));
-  const pending=controller.reconcile();
-  controller.replacePrincipal(null);
-  reject(Error('offline after logout'));
-  const delayed=await pending;
-  assert.equal(delayed.reason,'stale_session');
-  assert.equal(delayed.state.markerRetained,false);
-  assert.equal(guard.restore(),null);
-  assert.equal((await controller.reconcile()).requested,false);
-});
-test('a new account starts one fresh discovery after aborting the old account read', async () => {
-  const {R}=setup(),pending=[];
-  const {guard,controller}=startupRecovery(R,'passenger',request=>new Promise(resolve=>pending.push({request,resolve})),{accountRef:'passenger-a',viewerRole:'passenger'});
-  const oldRead=controller.reconcile();
-  const initialized=controller.beginSessionRecovery({accountRef:'passenger-b',viewerRole:'passenger'});
-  assert.equal(initialized.started,true);
-  assert.equal(initialized.reason,'initialized');
-  assert.equal(initialized.state.sessionGeneration,2);
-  assert.equal(initialized.state.sessionRecoveryInitialized,true);
-  assert.equal(initialized.state.markerRetained,true);
-  assert.equal(pending[0].request.signal.aborted,true);
-  const newRead=controller.reconcile();
-  assert.equal(pending.length,2);
-  assert.equal(pending[1].request.signal.aborted,false);
-  pending[0].resolve({status:200,body:currentRideView('passenger')});
-  const stale=await oldRead;
-  assert.equal(stale.reason,'stale_session');
-  assert.equal(stale.view,null);
-  const duplicate=await controller.reconcile();
-  assert.equal(duplicate.requested,false);
-  assert.equal(duplicate.reason,'in_flight');
-  assert.equal(pending.length,2);
-  pending[1].resolve({status:200,body:currentRideView('passenger')});
-  const recovered=await newRead;
-  assert.equal(recovered.state.outcome,'confirmed');
-  assert.equal(recovered.view.page,'passenger-history');
-  assert.equal(guard.restore(),null);
-});
-test('the same session cannot initialize startup discovery twice', async () => {
-  const {R}=setup();let reads=0;
-  const {controller}=startupRecovery(R,'driver',async()=>{reads+=1;return {status:204};});
-  await controller.reconcile();
-  const duplicate=controller.beginSessionRecovery({accountRef:'demo-driver-account',viewerRole:'driver'});
-  assert.equal(duplicate.started,false);
-  assert.equal(duplicate.reason,'already_initialized');
-  assert.equal((await controller.reconcile()).requested,false);
-  assert.equal(reads,1);
-});
-test('a role-specific controller refuses to initialize recovery for the other role', async () => {
-  const {R}=setup();let reads=0;
-  const {guard,controller}=startupRecovery(R,'passenger',async()=>{reads+=1;return {status:204};});
-  controller.replacePrincipal(null);
-  const mismatched=controller.beginSessionRecovery({accountRef:'driver-account',viewerRole:'driver'});
-  assert.equal(mismatched.started,false);
-  assert.equal(mismatched.reason,'role_mismatch');
-  assert.equal(mismatched.state.sessionActive,false);
-  assert.equal(mismatched.state.markerRetained,false);
-  assert.equal(guard.restore(),null);
-  assert.equal((await controller.reconcile()).requested,false);
-  assert.equal(reads,0);
-});
-test('fresh session recovery writes a new minimal marker without principal data', () => {
-  const {R}=setup(),storage=memoryStorage();let now=1000;
-  const guard=R.createCommandRestartGuard(storage,{now:()=>now});
-  guard.mark('passenger','pending');
-  const controller=R.createStartupRecoveryController({guard,role:'passenger',principal:{accountRef:'passenger-a',viewerRole:'passenger'},readCurrentRide:async()=>({status:204})});
-  controller.replacePrincipal(null);now=2000;
-  const initialized=controller.beginSessionRecovery({accountRef:'passenger-b',viewerRole:'passenger'});
-  const fresh=JSON.parse(storage.value(guard.key));
-  assert.equal(initialized.started,true);
-  assert.deepEqual(fresh,{version:1,role:'passenger',outcome:'unresolved',savedAt:2000});
-  assert.equal(JSON.stringify(fresh).includes('passenger-a'),false);
-  assert.equal(JSON.stringify(fresh).includes('passenger-b'),false);
-});
-test('a newly initialized driver session returns only to the driver home when no ride exists', async () => {
-  const {R}=setup();let requests=0;
-  const {guard,controller}=startupRecovery(R,'driver',async request=>{requests+=1;assert.equal(Object.hasOwn(request,'accountRef'),false);return {status:204};});
-  controller.replacePrincipal(null);
-  const initialized=controller.beginSessionRecovery({accountRef:'new-driver',viewerRole:'driver'});
-  const result=await controller.reconcile();
-  assert.equal(initialized.started,true);
-  assert.equal(result.state.outcome,'empty');
-  assert.equal(result.view.page,'driver-home');
-  assert.equal(result.view.ride,null);
-  assert.equal(requests,1);
-  assert.equal(guard.restore(),null);
-});
-function recoveryUi(R,role='passenger',generation=1) {
-  const pages=[],commandUi=R.createCommandUiController(role);
-  commandUi.finish('unresolved');
-  return {pages,commandUi,adapter:R.createStartupRecoveryUiAdapter({role,sessionGeneration:generation,navigate:page=>pages.push(page),commandUi})};
-}
-function recoveryResult(role,outcome,view,overrides={}) {
-  return {requested:true,state:{role,outcome,attempts:1,sessionGeneration:1,...overrides},view};
-}
-test('passenger startup recovery navigates and unlocks exactly once', () => {
-  const {R}=setup(),{pages,commandUi,adapter}=recoveryUi(R);
-  const view={kind:'ride',page:'passenger-history',ride:currentRideView('passenger'),reason:'current_ride'};
-  const first=adapter.apply(recoveryResult('passenger','confirmed',view));
-  const duplicate=adapter.apply(recoveryResult('passenger','confirmed',view));
-  assert.equal(first.applied,true);assert.equal(first.reason,'ride_restored');
-  assert.deepEqual(pages,['passenger-history']);
-  assert.equal(commandUi.snapshot().disableCommands,false);
-  assert.equal(duplicate.applied,false);assert.equal(duplicate.reason,'already_settled');
-});
-test('driver empty recovery returns only to driver home', () => {
-  const {R}=setup(),{pages,adapter}=recoveryUi(R,'driver');
-  const result=adapter.apply(recoveryResult('driver','empty',{kind:'empty',page:'driver-home',ride:null,reason:'no_current_ride'}));
-  assert.equal(result.applied,true);assert.equal(result.reason,'home_restored');
-  assert.deepEqual(pages,['driver-home']);assert.equal(result.state.command.role,'driver');
-});
-test('stale session recovery cannot navigate or unlock the current session', () => {
-  const {R}=setup(),{pages,commandUi,adapter}=recoveryUi(R,'passenger',2);
-  const stale=recoveryResult('passenger','confirmed',{kind:'ride',page:'passenger-history',ride:currentRideView('passenger')},{sessionGeneration:1});
-  assert.equal(adapter.apply(stale).applied,false);
-  assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().disableCommands,true);
-});
-test('a new UI session ignores an old completion and accepts its own result once', () => {
-  const {R}=setup(),{pages,adapter}=recoveryUi(R,'driver');
-  assert.equal(adapter.beginSession(2).started,true);
-  const old=recoveryResult('driver','empty',{kind:'empty',page:'driver-home',ride:null},{sessionGeneration:1});
-  assert.equal(adapter.apply(old).applied,false);
-  const fresh=recoveryResult('driver','empty',{kind:'empty',page:'driver-home',ride:null},{sessionGeneration:2});
-  assert.equal(adapter.apply(fresh).applied,true);assert.deepEqual(pages,['driver-home']);
-  assert.equal(adapter.beginSession(2).started,false);
-});
-test('reauthentication and unresolved results update the role lock without navigation', () => {
-  const {R}=setup(),{pages,commandUi,adapter}=recoveryUi(R,'driver');
-  const reauth=adapter.apply(recoveryResult('driver','reauth',null));
-  assert.equal(reauth.applied,true);assert.equal(commandUi.snapshot().action,'reauth');
-  const unresolved=adapter.apply(recoveryResult('driver','unresolved',null,{attempts:2}));
-  assert.equal(unresolved.applied,true);assert.equal(commandUi.snapshot().action,'refresh');
-  assert.deepEqual(pages,[]);
-});
-test('cross-role or unexpected recovery views fail closed', () => {
-  const {R}=setup(),{pages,commandUi,adapter}=recoveryUi(R,'passenger');
-  const wrongRole=recoveryResult('driver','confirmed',{kind:'ride',page:'driver-trips',ride:currentRideView('driver')});
-  assert.equal(adapter.apply(wrongRole).applied,false);
-  const wrongPage=recoveryResult('passenger','confirmed',{kind:'ride',page:'driver-trips',ride:currentRideView('passenger')});
-  const blocked=adapter.apply(wrongPage);
-  assert.equal(blocked.applied,true);assert.equal(blocked.reason,'invalid_view');
-  assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().outcome,'conflict');assert.equal(commandUi.snapshot().disableCommands,true);
-});
-function recoveryFlow(R,role,readCurrentRide,principal={accountRef:`demo-${role}-account`,viewerRole:role},options={}) {
-  const storage=memoryStorage(),guard=R.createCommandRestartGuard(storage,{now:()=>1000});guard.mark(role,'pending');
-  const controller=R.createStartupRecoveryController({guard,role,principal,readCurrentRide});
-  const pages=[],commandUi=R.createCommandUiController(role);commandUi.finish('unresolved');
-  const uiAdapter=R.createStartupRecoveryUiAdapter({role,sessionGeneration:controller.snapshot().sessionGeneration,navigate:page=>pages.push(page),commandUi});
-  const flow=R.createStartupRecoveryFlow({role,controller,uiAdapter,...options});
-  return {storage,guard,controller,pages,commandUi,uiAdapter,flow};
-}
-test('startup screen flow applies passenger recovery to navigation and lock once', async () => {
-  const {R}=setup(),{flow,pages,commandUi}=recoveryFlow(R,'passenger',async()=>({status:200,body:currentRideView('passenger')}));
-  const recovered=await flow.recoverOnStartup();
-  assert.equal(recovered.processed,true);assert.equal(recovered.reason,'ride_restored');
-  assert.deepEqual(pages,['passenger-history']);assert.equal(commandUi.snapshot().disableCommands,false);
-  const duplicate=await flow.recoverOnStartup();
-  assert.equal(duplicate.processed,false);assert.equal(duplicate.result.reason,'no_recovery');assert.deepEqual(pages,['passenger-history']);
-});
-test('connectivity recovery action rereads once and then unlocks the correct role', async () => {
-  const {R}=setup();let reads=0;
-  const {flow,pages,commandUi}=recoveryFlow(R,'driver',async()=>{reads+=1;if(reads===1)throw Error('offline');return {status:200,body:currentRideView('driver')};});
-  const offline=await flow.recoverOnStartup();
-  assert.equal(offline.processed,true);assert.equal(commandUi.snapshot().action,'refresh');assert.deepEqual(pages,[]);
-  const restored=await flow.resume('connectivity');
-  assert.equal(restored.processed,true);assert.deepEqual(pages,['driver-trips']);assert.equal(commandUi.snapshot().disableCommands,false);assert.equal(reads,2);
-  assert.equal((await flow.resume('connectivity')).processed,false);assert.equal(reads,2);
-});
-test('reauthentication action keeps commands locked until the authorized reread succeeds', async () => {
-  const {R}=setup();let reads=0;
-  const {flow,pages,commandUi}=recoveryFlow(R,'passenger',async()=>{reads+=1;return reads===1?{status:401}:{status:204};});
-  await flow.recoverOnStartup();assert.equal(commandUi.snapshot().action,'reauth');assert.deepEqual(pages,[]);
-  const restored=await flow.resume('reauth');
-  assert.equal(restored.processed,true);assert.deepEqual(pages,['home']);assert.equal(commandUi.snapshot().disableCommands,false);
-});
-test('a new authenticated session is initialized and applied through one flow', async () => {
-  const {R}=setup();let reads=0;
-  const {flow,controller,pages}=recoveryFlow(R,'driver',async()=>{reads+=1;return {status:204};},{accountRef:'driver-a',viewerRole:'driver'});
-  controller.replacePrincipal(null);
-  const started=await flow.beginSession({accountRef:'driver-b',viewerRole:'driver'});
-  assert.equal(started.processed,true);assert.equal(started.reason,'home_restored');assert.deepEqual(pages,['driver-home']);assert.equal(reads,1);
-  const duplicate=await flow.beginSession({accountRef:'driver-b',viewerRole:'driver'});
-  assert.equal(duplicate.processed,false);assert.equal(duplicate.reason,'already_initialized');assert.equal(reads,1);
-});
-test('disposing a role flow aborts its read and rejects the delayed completion', async () => {
-  const {R}=setup();let resolve;
-  const {flow,pages,commandUi}=recoveryFlow(R,'passenger',()=>new Promise(done=>{resolve=done;}));
-  const pending=flow.recoverOnStartup();
-  const disposed=flow.dispose();assert.equal(disposed.disposed,true);
-  resolve({status:200,body:currentRideView('passenger')});
-  const stale=await pending;
-  assert.equal(stale.processed,false);assert.equal(stale.reason,'flow_stale');assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().disableCommands,true);
-  assert.equal((await flow.resume('connectivity')).reason,'flow_disposed');
-});
-test('role mismatch and invalid recovery actions send no discovery request', async () => {
-  const {R}=setup();let reads=0;
-  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;return {status:204};});
-  const wrong=await flow.beginSession({accountRef:'driver-account',viewerRole:'driver'});
-  assert.equal(wrong.processed,false);assert.equal(wrong.reason,'role_mismatch');
-  const invalid=await flow.resume('automatic');
-  assert.equal(invalid.processed,false);assert.equal(invalid.reason,'invalid_resume_reason');assert.equal(reads,0);assert.deepEqual(pages,[]);
-});
-test('a hidden startup screen sends no read until it becomes visible', async () => {
-  const {R}=setup();let reads=0;
-  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;return {status:204};},undefined,{initiallyVisible:false});
-  const hidden=await flow.recoverOnStartup();
-  assert.equal(hidden.reason,'screen_hidden');assert.equal(reads,0);assert.deepEqual(pages,[]);
-  const visible=await flow.setVisible(true);
-  assert.equal(visible.processed,true);assert.equal(visible.reason,'home_restored');assert.equal(reads,1);assert.deepEqual(pages,['home']);
-});
-test('a result completed while hidden is deferred and applied once on return', async () => {
-  const {R}=setup();let resolve;
-  const {flow,pages,commandUi}=recoveryFlow(R,'driver',()=>new Promise(done=>{resolve=done;}));
-  const pending=flow.recoverOnStartup();await flow.setVisible(false);
-  resolve({status:200,body:currentRideView('driver')});
-  const deferred=await pending;
-  assert.equal(deferred.reason,'hidden_result_deferred');assert.deepEqual(pages,[]);assert.equal(commandUi.snapshot().disableCommands,true);
-  const restored=await flow.setVisible(true);
-  assert.equal(restored.processed,true);assert.deepEqual(pages,['driver-trips']);assert.equal(commandUi.snapshot().disableCommands,false);
-  assert.equal((await flow.setVisible(true)).reason,'visibility_unchanged');assert.deepEqual(pages,['driver-trips']);
-});
-test('a hidden connectivity action does not consume the one allowed reread', async () => {
-  const {R}=setup();let reads=0;
-  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;if(reads===1)throw Error('offline');return {status:204};});
-  await flow.recoverOnStartup();await flow.setVisible(false);
-  assert.equal((await flow.resume('connectivity')).reason,'screen_hidden');assert.equal(reads,1);
-  assert.equal((await flow.setVisible(true)).reason,'visible_noop');assert.equal(reads,1);
-  const restored=await flow.resume('connectivity');
-  assert.equal(restored.processed,true);assert.equal(reads,2);assert.deepEqual(pages,['home']);
-});
-test('rapid hide and show during one read does not start another read', async () => {
-  const {R}=setup();let resolve,reads=0;
-  const {flow,pages}=recoveryFlow(R,'driver',()=>{reads+=1;return new Promise(done=>{resolve=done;});});
-  const pending=flow.recoverOnStartup();await flow.setVisible(false);await flow.setVisible(true);
-  assert.equal(reads,1);assert.equal(flow.snapshot().controller.busy,true);
-  resolve({status:204});const restored=await pending;
-  assert.equal(restored.processed,true);assert.equal(reads,1);assert.deepEqual(pages,['driver-home']);
-});
-test('a session initialized while hidden performs one discovery when shown', async () => {
-  const {R}=setup();let reads=0;
-  const {flow,controller,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;return {status:204};},{accountRef:'passenger-a',viewerRole:'passenger'},{initiallyVisible:false});
-  controller.replacePrincipal(null);
-  const hidden=await flow.beginSession({accountRef:'passenger-b',viewerRole:'passenger'});
-  assert.equal(hidden.reason,'screen_hidden');assert.equal(reads,0);
-  const visible=await flow.setVisible(true);
-  assert.equal(visible.processed,true);assert.equal(reads,1);assert.deepEqual(pages,['home']);
-});
-test('disposing a hidden flow discards its deferred result permanently', async () => {
-  const {R}=setup();let resolve;
-  const {flow,pages}=recoveryFlow(R,'passenger',()=>new Promise(done=>{resolve=done;}));
-  const pending=flow.recoverOnStartup();await flow.setVisible(false);resolve({status:204});
-  assert.equal((await pending).reason,'hidden_result_deferred');assert.equal(flow.snapshot().deferredResult,true);
-  flow.dispose();assert.equal(flow.snapshot().deferredResult,false);
-  assert.equal((await flow.setVisible(true)).reason,'flow_disposed');assert.deepEqual(pages,[]);
-});
-function recoveryEventTarget() {
-  const listeners=new Map(),adds=new Map();
-  return {
-    addEventListener(type,handler){if(!listeners.has(type))listeners.set(type,new Set());listeners.get(type).add(handler);adds.set(type,(adds.get(type)||0)+1);},
-    removeEventListener(type,handler){listeners.get(type)?.delete(handler);},
-    dispatch(type,event={}){for(const handler of [...(listeners.get(type)||[])])handler({type,...event});},
-    listenerCount(type){return listeners.get(type)?.size||0;},
-    addCount(type){return adds.get(type)||0;}
-  };
-}
-function feedbackDomElements() {
-  const target=recoveryEventTarget(),element=()=>({hidden:false,disabled:false,textContent:'',className:'',attributes:{},setAttribute(name,value){this.attributes[name]=String(value);}}),action=Object.assign(element(),target);
-  return {box:element(),title:element(),message:element(),action,commandButtons:[element(),element()]};
-}
-test('startup recovery event bridge attaches each lifecycle listener once', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
-  const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));
-  const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});
-  assert.equal(bridge.start().started,true);assert.equal(bridge.start().reason,'already_attached');await bridge.idle();
-  for(const type of ['visibilitychange','pageshow','online']){assert.equal(target.listenerCount(type),1);assert.equal(target.addCount(type),1);}
-  assert.deepEqual(Object.keys(bridge.snapshot()).sort(),['attached','busy','detached','handledEvents','lastEvent']);
-});
-test('visibilitychange and pageshow restore a hidden startup screen with one read', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'hidden'};let reads=0;
-  const {flow,pages}=recoveryFlow(R,'driver',async()=>{reads+=1;return {status:204};},undefined,{initiallyVisible:false});
-  const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
-  target.dispatch('pageshow');await bridge.idle();assert.equal(reads,0);
-  documentState.visibilityState='visible';target.dispatch('visibilitychange');target.dispatch('pageshow');await bridge.idle();
-  assert.equal(reads,1);assert.deepEqual(pages,['driver-home']);assert.equal(flow.snapshot().visible,true);
-});
-test('duplicate online events coalesce into the single permitted connectivity reread', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};let reads=0,release;
-  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});});
-  await flow.recoverOnStartup();const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
-  target.dispatch('online');target.dispatch('online');await Promise.resolve();await Promise.resolve();
-  assert.equal(reads,2);target.dispatch('online');assert.equal(reads,2);
-  release({status:204});await bridge.idle();assert.equal(reads,2);assert.deepEqual(pages,['home']);
-});
-test('online does not substitute for the explicit reauthentication recovery action', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};let reads=0;
-  const {flow,pages}=recoveryFlow(R,'driver',async()=>{reads+=1;return {status:401};});
-  await flow.recoverOnStartup();const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
-  target.dispatch('online');await bridge.idle();assert.equal(reads,1);assert.deepEqual(pages,[]);assert.equal(flow.snapshot().controller.outcome,'reauth');
-});
-test('hiding during an online reread defers its result until pageshow without another read', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};let reads=0,release;
-  const {flow,pages}=recoveryFlow(R,'driver',async()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});});
-  await flow.recoverOnStartup();const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
-  target.dispatch('online');await Promise.resolve();await Promise.resolve();assert.equal(reads,2);
-  documentState.visibilityState='hidden';target.dispatch('visibilitychange');assert.equal(flow.snapshot().visible,false);
-  release({status:200,body:currentRideView('driver')});await bridge.idle();assert.deepEqual(pages,[]);assert.equal(flow.snapshot().deferredResult,true);
-  documentState.visibilityState='visible';target.dispatch('pageshow');await bridge.idle();assert.equal(reads,2);assert.deepEqual(pages,['driver-trips']);
-});
-test('detaching the event bridge removes listeners and prevents late or future navigation', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};let reads=0,release;
-  const {flow,pages}=recoveryFlow(R,'passenger',async()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});});
-  await flow.recoverOnStartup();const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState});bridge.start();await bridge.idle();
-  target.dispatch('online');await Promise.resolve();await Promise.resolve();assert.equal(reads,2);
-  assert.equal(bridge.detach().detached,true);for(const type of ['visibilitychange','pageshow','online'])assert.equal(target.listenerCount(type),0);
-  release({status:204});await bridge.idle();target.dispatch('online');target.dispatch('pageshow');await bridge.idle();
-  assert.equal(reads,2);assert.deepEqual(pages,[]);assert.equal(flow.snapshot().disposed,true);assert.equal(bridge.start().reason,'bridge_detached');
-});
-function roleLifecycleFixture(R,{target=recoveryEventTarget(),documentState={visibilityState:'visible'},readCurrentRide}={}) {
-  const bundles=[],bridges=[];
-  const lifecycle=R.createRoleRecoveryLifecycle({
-    createRoleFlow({role,generation}){
-      const bundle=recoveryFlow(R,role,request=>readCurrentRide({role,generation,request}),{accountRef:`${role}-${generation}`,viewerRole:role},{initiallyVisible:documentState.visibilityState!=='hidden'});
-      bundles.push({...bundle,role,generation});return bundle.flow;
-    },
-    createEventBridge({flow,role,generation,requestRecovery}){
-      const bridge=R.createStartupRecoveryEventBridge({flow,eventTarget:target,documentState,requestRecovery});bridges.push({bridge,role,generation});return bridge;
-    }
-  });
-  return {lifecycle,target,documentState,bundles,bridges};
-}
-function roleFeedbackLifecycleFixture(R,{notificationRead=async()=>({status:304}),onReauthenticate=()=>({requested:true}),notificationSubscribe=null}={}) {
-  const startupTarget=recoveryEventTarget(),notificationTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},feedbacks=[],notificationBridges=[],events=[];let lifecycle;
-  lifecycle=R.createRoleRecoveryLifecycle({
-    createRoleFlow({role,generation}){return recoveryFlow(R,role,async()=>({status:204}),{accountRef:`${role}-${generation}`,viewerRole:role}).flow;},
-    createEventBridge({flow,requestRecovery}){return R.createStartupRecoveryEventBridge({flow,eventTarget:startupTarget,documentState,requestRecovery});},
-    createFeedbackBridge({role,generation}){
-      const current=currentRideView(role,{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle,role,currentRide:current,recover:hint=>notificationRead({role,generation,hint})}),commandUi=R.createCommandUiController(role),flow=R.createNotificationFeedbackFlow({role,recovery,commandUi,onReauthenticate:context=>onReauthenticate({...context,generation})}),target=recoveryEventTarget(),renders=[];
-      const inner=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});
-      const bridge={snapshot:()=>inner.snapshot(),attach(){events.push(`attach:${role}:${generation}`);return inner.attach();},activate:()=>inner.activate(),handleNotification:hint=>inner.handleNotification(hint),detach(){events.push(`detach:${role}:${generation}`);return inner.detach();},idle:()=>inner.idle()};
-      feedbacks.push({role,generation,current,recovery,commandUi,flow,target,renders,bridge,inner});return bridge;
-    },
-    createNotificationBridge({role,generation,sessionBinding,onHint}){
-      const inner=notificationSubscribe?R.createAsyncNotificationSubscriptionBridge({subscribe:({signal,onHint:deliver})=>notificationSubscribe({role,generation,sessionBinding,signal,onHint:deliver}),onHint}):R.createNotificationHintEventBridge({eventTarget:notificationTarget,onHint});
-      notificationBridges.push({role,generation,sessionBinding,inner});return inner;
-    }
-  });
-  return {lifecycle,feedbacks,notificationBridges,events,startupTarget,notificationTarget};
-}
-function roleSubscriptionLifecycleFixture(R,{verifyLatest=async()=>({verified:true}),onReauthenticate=async()=>({requested:true})}={}) {
-  const startupTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},subscriptions=[];let lifecycle;
-  lifecycle=R.createRoleRecoveryLifecycle({
-    createRoleFlow({role,generation}){return recoveryFlow(R,role,async()=>({status:204}),{accountRef:`${role}-${generation}`,viewerRole:role}).flow;},
-    createEventBridge({flow,requestRecovery}){return R.createStartupRecoveryEventBridge({flow,eventTarget:startupTarget,documentState,requestRecovery});},
-    createSubscriptionBridge({role,generation,sessionBinding}){
-      const record={role,generation,sessionBinding,connects:0,unsubscribes:0,disconnect:null,renders:[]};
-      const bridge=R.createRecoverableNotificationSubscriptionBridge({
-        role,
-        subscribe:async input=>{record.connects+=1;record.disconnect=input.onDisconnect;return()=>{record.unsubscribes+=1;};},
-        onHint:async()=>({processed:true}),
-        verifyLatest:()=>verifyLatest({role,generation,sessionBinding,record}),
-        onReauthenticate:()=>onReauthenticate({role,generation,sessionBinding,record}),
-        render:value=>record.renders.push(value)
-      });
-      record.bridge=bridge;subscriptions.push(record);return bridge;
-    }
-  });
-  return {lifecycle,subscriptions,startupTarget};
-}
-function roleSubscriptionFeedbackLifecycleFixture(R,{subscribe,verifyLatest=async()=>({verified:true}),onReauthenticate=async()=>({requested:true})}={}) {
-  const startupTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},subscriptions=[];let lifecycle;
-  lifecycle=R.createRoleRecoveryLifecycle({
-    createRoleFlow({role,generation}){return recoveryFlow(R,role,async()=>({status:204}),{accountRef:`${role}-${generation}`,viewerRole:role}).flow;},
-    createEventBridge({flow,requestRecovery}){return R.createStartupRecoveryEventBridge({flow,eventTarget:startupTarget,documentState,requestRecovery});},
-    createSubscriptionBridge({role,generation,sessionBinding}){
-      const target=recoveryEventTarget(),commandUi=R.createCommandUiController(role),record={role,generation,sessionBinding,target,commandUi,renders:[],connects:0,unsubscribes:0,disconnect:null};
-      const bridge=R.createNotificationSubscriptionFeedbackBridge({
-        role,generation,lifecycle,commandUi,eventTarget:target,
-        subscribe:async input=>{record.connects+=1;record.disconnect=input.onDisconnect;if(subscribe)return subscribe({...input,role,generation,sessionBinding,record});return()=>{record.unsubscribes+=1;};},
-        onHint:async()=>({processed:true}),verifyLatest:()=>verifyLatest({role,generation,sessionBinding,record}),onReauthenticate:()=>onReauthenticate({role,generation,sessionBinding,record}),render:view=>record.renders.push(view)
-      });
-      record.bridge=bridge;subscriptions.push(record);return bridge;
-    }
-  });
-  return {lifecycle,subscriptions,startupTarget};
-}
-function roleSubscriptionDomLifecycleFixture(R,{subscribe,verifyLatest=async()=>({verified:true}),onReauthenticate=async()=>({requested:true})}={}) {
-  const startupTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},subscriptions=[];let lifecycle;
-  lifecycle=R.createRoleRecoveryLifecycle({
-    createRoleFlow({role,generation}){return recoveryFlow(R,role,async()=>({status:204}),{accountRef:`${role}-${generation}`,viewerRole:role}).flow;},
-    createEventBridge({flow,requestRecovery}){return R.createStartupRecoveryEventBridge({flow,eventTarget:startupTarget,documentState,requestRecovery});},
-    createSubscriptionBridge({role,generation,sessionBinding}){
-      const elements=feedbackDomElements(),record={role,generation,sessionBinding,elements,connects:0,disconnect:null,renders:[]};
-      const bridge=R.createNotificationSubscriptionDomBridge({role,generation,lifecycle,elements,
-        subscribe:async input=>{record.connects+=1;record.disconnect=input.onDisconnect;if(subscribe)return subscribe({...input,role,generation,sessionBinding,record});return()=>{};},
-        onHint:async()=>({processed:true}),verifyLatest:()=>verifyLatest({role,generation,sessionBinding,record}),onReauthenticate:()=>onReauthenticate({role,generation,sessionBinding,record}),render:view=>record.renders.push(view)
-      });
-      record.bridge=bridge;subscriptions.push(record);return bridge;
-    }
-  });
-  return {lifecycle,subscriptions,startupTarget};
-}
-function allowedRoleServices(overrides={}) {
-  return {
-    configured:true,
-    sessionForRole:overrides.sessionForRole||(()=>({accountRef:'demo-account',viewerRole:'passenger'})),
-    readCurrentRide:overrides.readCurrentRide||(async()=>({status:204})),
-    subscribeNotifications:overrides.subscribeNotifications||(async()=>()=>{}),
-    verifyLatest:overrides.verifyLatest||(async()=>({verified:true})),
-    handleNotificationHint:overrides.handleNotificationHint||(async()=>({processed:true})),
-    reauthenticate:overrides.reauthenticate||(async()=>({requested:true}))
-  };
-}
-test('role screen entry creates one flow and bridge without duplicate startup reads', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}});
-  const entered=await fixture.lifecycle.enter('passenger');assert.equal(entered.entered,true);assert.equal(reads,1);
-  const duplicate=await fixture.lifecycle.enter('passenger');assert.equal(duplicate.reason,'already_entered');assert.equal(reads,1);
-  assert.equal(fixture.bundles.length,1);assert.equal(fixture.bridges.length,1);
-  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),1);
-});
-test('switching role screens disposes the old entry before accepting the new role', async () => {
-  const {R}=setup();let releasePassenger;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:({role})=>role==='passenger'?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({status:204})});
-  const passenger=fixture.lifecycle.enter('passenger');await Promise.resolve();await Promise.resolve();
-  const driver=await fixture.lifecycle.enter('driver');assert.equal(driver.entered,true);
-  releasePassenger({status:200,body:currentRideView('passenger')});const old=await passenger;
-  assert.equal(old.reason,'stale_entry');assert.equal(fixture.bundles[0].flow.snapshot().disposed,true);assert.deepEqual(fixture.bundles[0].pages,[]);
-  assert.deepEqual(fixture.bundles[1].pages,['driver-home']);assert.equal(fixture.lifecycle.snapshot().activeRole,'driver');
-  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),1);
-});
-test('leaving a role screen removes every listener and ignores later events', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}});
-  await fixture.lifecycle.enter('driver');const left=fixture.lifecycle.leave();assert.equal(left.left,true);assert.equal(left.role,'driver');
-  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),0);
-  fixture.target.dispatch('online');fixture.target.dispatch('pageshow');await fixture.lifecycle.idle();assert.equal(reads,1);
-  assert.deepEqual(Object.keys(fixture.lifecycle.snapshot()).sort(),['activeRole','busy','entered','generation','lastAction']);
-});
-test('re-entering the same role after leaving creates a fresh isolated generation', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}});
-  await fixture.lifecycle.enter('passenger');const first=fixture.bundles[0];fixture.lifecycle.leave();
-  const secondEntry=await fixture.lifecycle.enter('passenger');const second=fixture.bundles[1];
-  assert.equal(secondEntry.entered,true);assert.equal(reads,2);assert.notEqual(first.flow,second.flow);assert.equal(first.flow.snapshot().disposed,true);
-  assert.equal(first.generation+1,second.generation);assert.equal(fixture.target.listenerCount('online'),1);
-});
-test('entering a hidden role screen waits for pageshow before its first discovery', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{documentState:{visibilityState:'hidden'},readCurrentRide:async()=>{reads+=1;return {status:204};}});
-  const entered=await fixture.lifecycle.enter('driver');assert.equal(entered.startup.reason,'screen_hidden');assert.equal(reads,0);
-  fixture.documentState.visibilityState='visible';fixture.target.dispatch('pageshow');await fixture.lifecycle.idle();
-  assert.equal(reads,1);assert.deepEqual(fixture.bundles[0].pages,['driver-home']);
-});
-test('a delayed online result from a departed entry cannot affect a re-entered role', async () => {
-  const {R}=setup();let phase=0,releaseOld;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:({generation})=>{
-    if(generation===1){phase+=1;if(phase===1)throw Error('offline');return new Promise(resolve=>{releaseOld=resolve;});}
-    return Promise.resolve({status:204});
-  }});
-  await fixture.lifecycle.enter('passenger');fixture.target.dispatch('online');await Promise.resolve();await Promise.resolve();
-  fixture.lifecycle.leave();const reentered=await fixture.lifecycle.enter('passenger');assert.equal(reentered.entered,true);
-  releaseOld({status:200,body:currentRideView('passenger')});await fixture.bridges[0].bridge.idle();
-  assert.deepEqual(fixture.bundles[0].pages,[]);assert.deepEqual(fixture.bundles[1].pages,['home']);assert.equal(fixture.lifecycle.snapshot().generation,2);
-});
-test('passenger bottom navigation and registration keep one recovery generation', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  assert.equal((await boundary.navigate('home','passenger')).reason,'role_entered');
-  for(const page of ['offers','verify','passenger-history','passenger-account','passenger-register'])assert.equal((await boundary.navigate(page,'passenger')).reason,'within_role');
-  assert.equal(reads,1);assert.equal(fixture.bundles.length,1);assert.equal(fixture.lifecycle.snapshot().generation,1);assert.equal(boundary.snapshot().page,'passenger-register');
-});
-test('driver bottom navigation and pending registration keep one recovery generation', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('driver-home','driver');
-  for(const page of ['driver-requests','driver-trips','driver-account','register','driver-home'])await boundary.navigate(page,'driver');
-  assert.equal(reads,1);assert.equal(fixture.bundles.length,1);assert.equal(fixture.lifecycle.snapshot().generation,1);assert.equal(boundary.snapshot().page,'driver-home');
-});
-test('returning to the role chooser detaches recovery and blocks a delayed page restoration', async () => {
-  const {R}=setup();let release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>new Promise(resolve=>{release=resolve;})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  const entering=boundary.navigate('home','passenger');await Promise.resolve();await Promise.resolve();
-  const chooser=await boundary.navigate('role');assert.equal(chooser.reason,'role_chooser');assert.equal(boundary.snapshot().page,'role');
-  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),0);
-  release({status:200,body:currentRideView('passenger')});assert.equal((await entering).reason,'stale_navigation');assert.equal(boundary.snapshot().page,'role');assert.deepEqual(fixture.bundles[0].pages,[]);
-});
-test('routing from passenger to driver creates a new generation after detaching passenger', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('home','passenger');const passenger=fixture.bundles[0];
-  const driver=await boundary.navigate('driver-home','driver');assert.equal(driver.reason,'role_entered');
-  assert.equal(reads,2);assert.equal(passenger.flow.snapshot().disposed,true);assert.equal(fixture.lifecycle.snapshot().generation,2);assert.equal(boundary.snapshot().page,'driver-home');
-  for(const type of ['visibilitychange','pageshow','online'])assert.equal(fixture.target.listenerCount(type),1);
-});
-test('rapid same-role route changes during startup keep the last page without another read', async () => {
-  const {R}=setup();let reads=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  const home=boundary.navigate('home','passenger');await Promise.resolve();await Promise.resolve();
-  const history=await boundary.navigate('passenger-history','passenger');assert.equal(history.reason,'within_role');assert.equal(boundary.snapshot().page,'passenger-history');assert.equal(reads,1);
-  release({status:204});assert.equal((await home).reason,'stale_navigation');assert.equal(boundary.snapshot().page,'passenger-history');assert.equal(reads,1);
-});
-test('unknown pages and cross-role route hints fail without changing the active role', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('home','passenger');const generation=fixture.lifecycle.snapshot().generation;
-  assert.equal((await boundary.navigate('admin','passenger')).reason,'unknown_page');
-  assert.equal((await boundary.navigate('driver-trips','passenger')).reason,'role_mismatch');
-  assert.equal(reads,1);assert.equal(fixture.lifecycle.snapshot().activeRole,'passenger');assert.equal(fixture.lifecycle.snapshot().generation,generation);assert.equal(boundary.snapshot().page,'home');
-});
-test('latest-state action is limited to one request in the active passenger generation', async () => {
-  const {R}=setup();let reads=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('home','passenger');const generation=fixture.lifecycle.snapshot().generation;
-  const first=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();assert.equal(reads,2);
-  const duplicate=await boundary.recover('refresh');assert.equal(duplicate.recovered,false);assert.equal(duplicate.reason,'recovery_in_progress');assert.equal(reads,2);
-  release({status:204});const recovered=await first;
-  assert.equal(recovered.recovered,true);assert.equal(recovered.reason,'recovered');assert.equal(fixture.lifecycle.snapshot().generation,generation);assert.deepEqual(fixture.bundles[0].pages,['home']);
-});
-test('reauthentication action rereads once inside the active driver generation', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return reads===1?{status:401}:{status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('driver-home','driver');const generation=fixture.lifecycle.snapshot().generation;
-  const recovered=await boundary.recover('reauth');
-  assert.equal(recovered.recovered,true);assert.equal(reads,2);assert.equal(fixture.lifecycle.snapshot().generation,generation);assert.deepEqual(fixture.bundles[0].pages,['driver-home']);
-});
-test('recovery actions without an active role or with an unknown action send no read', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return {status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  assert.equal((await boundary.recover('refresh')).reason,'no_active_role');
-  assert.equal((await boundary.recover('retry-everything')).reason,'invalid_recovery_action');
-  assert.equal(reads,0);assert.equal(fixture.lifecycle.snapshot().generation,0);assert.equal(boundary.snapshot().page,'role');
-});
-test('leaving for role selection makes an in-flight latest-state result stale', async () => {
-  const {R}=setup();let reads=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('home','passenger');const recovery=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();
-  await boundary.navigate('role');release({status:204});const stale=await recovery;
-  assert.equal(stale.recovered,false);assert.equal(stale.reason,'stale_recovery');assert.equal(boundary.snapshot().page,'role');assert.equal(fixture.lifecycle.snapshot().activeRole,null);assert.deepEqual(fixture.bundles[0].pages,[]);
-});
-test('role switch permits a fresh action while the departed role action is still pending', async () => {
-  const {R}=setup();const reads={passenger:0,driver:0};let releasePassenger;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:({role})=>{
-    reads[role]+=1;
-    if(role==='passenger'&&reads.passenger===1)throw Error('offline');
-    if(role==='passenger')return new Promise(resolve=>{releasePassenger=resolve;});
-    if(reads.driver===1)throw Error('offline');
-    return Promise.resolve({status:204});
-  }}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('home','passenger');const oldAction=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();
-  await boundary.navigate('driver-home','driver');const fresh=await boundary.recover('refresh');
-  assert.equal(fresh.recovered,true);assert.deepEqual(reads,{passenger:2,driver:2});assert.deepEqual(fixture.bundles[1].pages,['driver-home']);
-  releasePassenger({status:204});const stale=await oldAction;
-  assert.equal(stale.reason,'stale_recovery');assert.equal(boundary.snapshot().page,'driver-home');assert.equal(fixture.lifecycle.snapshot().activeRole,'driver');assert.deepEqual(fixture.bundles[0].pages,[]);
-});
-test('lifecycle rejects a stale role or generation before starting recovery', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;throw Error('offline');}});
-  await fixture.lifecycle.enter('passenger');const generation=fixture.lifecycle.snapshot().generation;
-  assert.equal((await fixture.lifecycle.requestRecovery({role:'driver',generation,reason:'connectivity'})).reason,'stale_role_generation');
-  assert.equal((await fixture.lifecycle.requestRecovery({role:'passenger',generation:generation-1,reason:'connectivity'})).reason,'stale_role_generation');
-  assert.equal((await fixture.lifecycle.requestRecovery({role:'passenger',generation,reason:'force'})).reason,'invalid_recovery_reason');
-  assert.equal(reads,1);
-});
-test('manual latest-state recovery wins over a simultaneous online event with one read', async () => {
-  const {R}=setup();let reads=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('home','passenger');const manual=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();
-  fixture.target.dispatch('online');await fixture.bridges[0].bridge.idle();assert.equal(reads,2);
-  release({status:204});const recovered=await manual;
-  assert.equal(recovered.recovered,true);assert.equal(reads,2);assert.deepEqual(fixture.bundles[0].pages,['home']);
-});
-test('online recovery wins over a simultaneous manual tap with one read', async () => {
-  const {R}=setup();let reads=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('home','passenger');fixture.target.dispatch('online');await Promise.resolve();await Promise.resolve();assert.equal(reads,2);
-  const manual=await boundary.recover('refresh');assert.equal(manual.recovered,false);assert.equal(manual.reason,'recovery_in_progress');assert.equal(reads,2);
-  release({status:204});await fixture.bridges[0].bridge.idle();assert.equal(reads,2);assert.deepEqual(fixture.bundles[0].pages,['home']);
-});
-test('hiding during unified online recovery defers one result and blocks a manual duplicate', async () => {
-  const {R}=setup();let reads=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{release=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('driver-home','driver');fixture.target.dispatch('online');await Promise.resolve();await Promise.resolve();
-  fixture.documentState.visibilityState='hidden';fixture.target.dispatch('visibilitychange');
-  assert.equal((await boundary.recover('refresh')).reason,'recovery_in_progress');assert.equal(reads,2);
-  release({status:204});await fixture.bridges[0].bridge.idle();assert.deepEqual(fixture.bundles[0].pages,[]);assert.equal(fixture.bundles[0].flow.snapshot().deferredResult,true);
-  fixture.documentState.visibilityState='visible';fixture.target.dispatch('pageshow');await fixture.bridges[0].bridge.idle();assert.equal(reads,2);assert.deepEqual(fixture.bundles[0].pages,['driver-home']);
-});
-test('online never consumes the explicit reauthentication action', async () => {
-  const {R}=setup();let reads=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{reads+=1;return reads===1?{status:401}:{status:204};}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('driver-home','driver');fixture.target.dispatch('online');await fixture.bridges[0].bridge.idle();assert.equal(reads,1);
-  const reauthenticated=await boundary.recover('reauth');assert.equal(reauthenticated.recovered,true);assert.equal(reads,2);assert.deepEqual(fixture.bundles[0].pages,['driver-home']);
-});
-test('switching roles during online recovery allows one independent action in the new role', async () => {
-  const {R}=setup();const reads={passenger:0,driver:0};let releasePassenger;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:({role})=>{
-    reads[role]+=1;
-    if(role==='passenger'&&reads.passenger===1)throw Error('offline');
-    if(role==='passenger')return new Promise(resolve=>{releasePassenger=resolve;});
-    if(reads.driver===1)throw Error('offline');
-    return Promise.resolve({status:204});
-  }}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('home','passenger');fixture.target.dispatch('online');await Promise.resolve();await Promise.resolve();
-  await boundary.navigate('driver-home','driver');const fresh=await boundary.recover('refresh');
-  assert.equal(fresh.recovered,true);assert.deepEqual(reads,{passenger:2,driver:2});assert.deepEqual(fixture.bundles[1].pages,['driver-home']);
-  releasePassenger({status:204});await fixture.bridges[0].bridge.idle();assert.deepEqual(fixture.bundles[0].pages,[]);assert.equal(boundary.snapshot().page,'driver-home');
-});
-test('a minimal notification hint applies only an authorized role-scoped recovery', async () => {
-  const {R}=setup();let calls=0,received;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
-  await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned',nextAction:'track_driver'});
-  const notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async hint=>{calls+=1;received=hint;return {status:200,body:currentRideView('passenger',{revision:9,status:'on_trip',nextAction:'show_on_trip'})};}});
-  const result=await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});
-  assert.equal(result.processed,true);assert.equal(result.reason,'notification_recovered');assert.equal(calls,1);assert.equal(received.type,'ride.changed');assert.equal(received.rideId,current.id);assert.equal(received.revision,9);
-  const snapshot=notifications.snapshot();
-  assert.equal(snapshot.role,'passenger');assert.equal(snapshot.hasRide,true);assert.equal(snapshot.revision,9);assert.equal(snapshot.status,'on_trip');assert.equal(snapshot.busy,false);assert.equal(snapshot.lastReason,'notification_recovered');
-});
-test('private, foreign and stale notification hints stop before authorized recovery', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned',nextAction:'start_pickup'});
-  const notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return {status:500};}});
-  assert.equal((await notifications.handle({type:'ride.changed',rideId:current.id,revision:9,plate:'DEMO 001'})).reason,'invalid_hint');
-  assert.equal((await notifications.handle({type:'ride.changed',rideId:'foreign',revision:9})).reason,'foreign_hint');
-  assert.equal((await notifications.handle({type:'ride.changed',rideId:current.id,revision:8})).reason,'stale_or_duplicate_hint');
-  assert.equal(calls,0);assert.equal(notifications.snapshot().revision,8);
-});
-test('notification-first recovery rejects a simultaneous manual refresh without another read', async () => {
-  const {R}=setup();let notificationCalls=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'});
-  const notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:()=>{notificationCalls+=1;return new Promise(resolve=>{release=resolve;});}});
-  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();
-  const manual=await boundary.recover('refresh');assert.equal(manual.reason,'recovery_in_progress');assert.equal(notificationCalls,1);
-  release({status:200,body:currentRideView('passenger',{revision:9,status:'on_trip'})});assert.equal((await pending).processed,true);assert.equal(notificationCalls,1);
-});
-test('manual-first recovery rejects a notification without calling its reader', async () => {
-  const {R}=setup();let reads=0,releaseManual,notificationCalls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{reads+=1;if(reads===1)throw Error('offline');return new Promise(resolve=>{releaseManual=resolve;});}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{notificationCalls+=1;return {status:500};}});
-  const manual=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();
-  const notification=await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});assert.equal(notification.reason,'recovery_in_progress');assert.equal(notificationCalls,0);assert.equal(reads,2);
-  releaseManual({status:204});assert.equal((await manual).recovered,true);
-});
-test('notification-first recovery coalesces a simultaneous online event', async () => {
-  const {R}=setup();let startupReads=0,notificationCalls=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>{startupReads+=1;throw Error('offline');}}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:()=>{notificationCalls+=1;return new Promise(resolve=>{release=resolve;});}});
-  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();fixture.target.dispatch('online');await fixture.bridges[0].bridge.idle();
-  assert.equal(startupReads,1);assert.equal(notificationCalls,1);
-  release({status:200,body:currentRideView('passenger',{revision:9,status:'on_trip'})});assert.equal((await pending).processed,true);assert.equal(startupReads,1);
-});
-test('a notification result arriving after a role switch cannot update the old role state', async () => {
-  const {R}=setup();let release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:()=>new Promise(resolve=>{release=resolve;})});
-  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();await boundary.navigate('driver-home','driver');
-  release({status:200,body:currentRideView('passenger',{revision:9,status:'on_trip'})});const stale=await pending;
-  assert.equal(stale.processed,false);assert.equal(stale.reason,'stale_recovery');assert.equal(notifications.snapshot().revision,8);assert.equal(boundary.snapshot().activeRole,'driver');assert.equal(boundary.snapshot().page,'driver-home');
-});
-test('newer hints during a notification read keep only the maximum revision and add one follow-up', async () => {
-  const {R}=setup(),calls=[],releases=[];
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:hint=>{calls.push(hint);return new Promise(resolve=>releases.push(resolve));}});
-  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();
-  assert.equal((await notifications.handle({type:'ride.changed',rideId:current.id,revision:10})).reason,'notification_coalesced');
-  assert.equal((await notifications.handle({type:'ride.access_changed',rideId:current.id,revision:12})).reason,'notification_coalesced');
-  assert.equal((await notifications.handle({type:'ride.changed',rideId:current.id,revision:11})).reason,'stale_or_duplicate_hint');
-  assert.equal(notifications.snapshot().pendingRevision,12);assert.equal(calls.length,1);
-  releases[0]({status:200,body:currentRideView('passenger',{revision:9,status:'arriving'})});
-  await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(calls.length,2);assert.equal(calls[1].type,'ride.changed');assert.equal(calls[1].rideId,current.id);assert.equal(calls[1].revision,12);
-  releases[1]({status:200,body:currentRideView('passenger',{revision:12,status:'on_trip'})});
-  const recovered=await pending;
-  assert.equal(recovered.processed,true);assert.equal(recovered.followup,true);assert.equal(calls.length,2);assert.equal(notifications.snapshot().revision,12);assert.equal(notifications.snapshot().pendingRevision,null);
-});
-test('a first notification read that already reaches the queued maximum sends no follow-up', async () => {
-  const {R}=setup();let calls=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:()=>{calls+=1;return new Promise(resolve=>{release=resolve;});}});
-  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:12});release({status:200,body:currentRideView('passenger',{revision:12,status:'on_trip'})});
-  const recovered=await pending;
-  assert.equal(recovered.processed,true);assert.equal(recovered.followup,false);assert.equal(calls,1);assert.equal(notifications.snapshot().revision,12);assert.equal(notifications.snapshot().pendingRevision,null);
-});
-test('a newer hint during the single follow-up is retained without starting a third read', async () => {
-  const {R}=setup(),releases=[];let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:()=>{calls+=1;return new Promise(resolve=>releases.push(resolve));}});
-  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:12});releases[0]({status:200,body:currentRideView('passenger',{revision:9,status:'arriving'})});
-  await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(calls,2);assert.equal((await notifications.handle({type:'ride.changed',rideId:current.id,revision:13})).reason,'notification_coalesced');
-  releases[1]({status:200,body:currentRideView('passenger',{revision:12,status:'on_trip'})});
-  const recovered=await pending;
-  assert.equal(recovered.reason,'explicit_refresh_required');assert.equal(recovered.followup,true);assert.equal(calls,2);assert.equal(notifications.snapshot().revision,12);assert.equal(notifications.snapshot().pendingRevision,13);
-});
-test('invalid and foreign hints are not queued behind a notification read', async () => {
-  const {R}=setup();let calls=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:()=>{calls+=1;return new Promise(resolve=>{release=resolve;});}});
-  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();
-  assert.equal((await notifications.handle({type:'ride.changed',rideId:current.id,revision:10,fare:20})).reason,'invalid_hint');
-  assert.equal((await notifications.handle({type:'ride.changed',rideId:'another-ride',revision:11})).reason,'foreign_hint');
-  assert.equal(notifications.snapshot().pendingRevision,null);assert.equal(calls,1);
-  release({status:200,body:currentRideView('driver',{revision:9,status:'arriving'})});await pending;assert.equal(calls,1);
-});
-test('role switching discards a queued maximum revision without a follow-up read', async () => {
-  const {R}=setup();let calls=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:()=>{calls+=1;return new Promise(resolve=>{release=resolve;});}});
-  const pending=notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await Promise.resolve();await Promise.resolve();
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:12});await boundary.navigate('driver-home','driver');
-  release({status:200,body:currentRideView('passenger',{revision:9,status:'arriving'})});const stale=await pending;
-  assert.equal(stale.reason,'stale_recovery');assert.equal(calls,1);assert.equal(notifications.snapshot().revision,8);assert.equal(notifications.snapshot().pendingRevision,null);
-});
-test('passenger UI locks after the bounded follow-up misses the notified revision', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return {status:304};}});
-  const result=await notifications.handle({type:'ride.changed',rideId:current.id,revision:9}),state=notifications.snapshot();
-  assert.equal(result.reason,'explicit_refresh_required');assert.equal(calls,2);assert.equal(state.needsRefresh,true);assert.equal(state.commandsLocked,true);assert.equal(state.action,'refresh');assert.match(state.feedback.title,/ä¾é ¼/);assert.match(state.feedback.message,/æœ€æ–°çŠ¶æ…‹ã‚’ç¢ºèªã™ã‚‹/);
-});
-test('driver UI uses operation wording when notification recovery remains behind', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return {status:200,body:currentRideView('driver',{revision:8,status:'assigned'})};}});
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:10});const state=notifications.snapshot();
-  assert.equal(calls,2);assert.equal(state.commandsLocked,true);assert.equal(state.action,'refresh');assert.match(state.feedback.title,/é‹è¡Œ/);assert.equal(state.pendingRevision,10);
-});
-test('explicit latest-state refresh catches the retained maximum and unlocks commands', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async hint=>{calls+=1;return calls<3?{status:304}:{status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})};}});
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});
-  assert.equal((await notifications.handle({type:'ride.changed',rideId:current.id,revision:12})).reason,'explicit_refresh_required');assert.equal(calls,2);assert.equal(notifications.snapshot().pendingRevision,12);
-  const refreshed=await notifications.refresh(),state=notifications.snapshot();
-  assert.equal(refreshed.processed,true);assert.equal(refreshed.manual,true);assert.equal(calls,3);assert.equal(state.revision,12);assert.equal(state.pendingRevision,null);assert.equal(state.needsRefresh,false);assert.equal(state.commandsLocked,false);assert.equal(state.action,null);
-});
-test('an explicit refresh that is still behind stays locked without an automatic loop', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return {status:304};}});
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:11});const refreshed=await notifications.refresh(),state=notifications.snapshot();
-  assert.equal(refreshed.reason,'explicit_refresh_required');assert.equal(calls,3);assert.equal(state.commandsLocked,true);assert.equal(state.pendingRevision,11);assert.equal(state.action,'refresh');
-});
-test('role exit clears a locked notification target and rejects its explicit refresh', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return {status:304};}});
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});assert.equal(notifications.snapshot().commandsLocked,true);
-  await boundary.navigate('driver-home','driver');const rejected=await notifications.refresh(),state=notifications.snapshot();
-  assert.equal(rejected.reason,'inactive_role');assert.equal(calls,2);assert.equal(state.pendingRevision,null);assert.equal(state.needsRefresh,false);assert.equal(state.commandsLocked,false);
-});
-test('a network failure during explicit refresh keeps the passenger request safely locked', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;if(calls===3)throw Error('offline');return {status:304};}});
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});const failed=await notifications.refresh(),state=notifications.snapshot();
-  assert.equal(failed.reason,'connectivity_required');assert.equal(calls,3);assert.equal(state.guidance,'connectivity');assert.equal(state.commandsLocked,true);assert.equal(state.action,'refresh');assert.equal(state.pendingRevision,9);assert.match(state.feedback.title,/ä¾é ¼/);assert.match(state.feedback.message,/é€šä¿¡/);
-});
-test('a 503 explicit refresh keeps the driver operation locked without retrying', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:503}:{status:304};}});
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:10});const failed=await notifications.refresh(),state=notifications.snapshot();
-  assert.equal(failed.reason,'connectivity_required');assert.equal(calls,3);assert.equal(state.commandsLocked,true);assert.equal(state.pendingRevision,10);assert.match(state.feedback.title,/é‹è¡Œ/);
-});
-test('401 and 403 explicit refreshes clear cached state and require reauthentication', async () => {
-  for(const status of [401,403]){
-    const {R}=setup();let calls=0;
-    const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-    const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status}:{status:304};}});
-    await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});const failed=await notifications.refresh(),state=notifications.snapshot();
-    assert.equal(failed.reason,'reauthentication_required');assert.equal(calls,3);assert.equal(state.hasRide,false);assert.equal(state.guidance,'reauth');assert.equal(state.commandsLocked,true);assert.equal(state.action,'reauth');assert.equal(state.pendingRevision,null);assert.match(state.feedback.message,/ä¾é ¼/);
-  }
-});
-test('a 404 explicit refresh clears the stale ride and returns to an unlocked empty state', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:404}:{status:304};}});
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});const empty=await notifications.refresh(),state=notifications.snapshot();
-  assert.equal(empty.reason,'ride_not_found');assert.equal(calls,3);assert.equal(state.hasRide,false);assert.equal(state.guidance,'empty');assert.equal(state.commandsLocked,false);assert.equal(state.action,null);assert.equal(state.pendingRevision,null);assert.match(state.feedback.title,/é‹è¡Œ/);
-});
-test('new hints after a connectivity failure update only the retained maximum', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),notifications=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:503}:{status:304};}});
-  await notifications.handle({type:'ride.changed',rideId:current.id,revision:9});await notifications.refresh();
-  const queued=await notifications.handle({type:'ride.changed',rideId:current.id,revision:12}),state=notifications.snapshot();
-  assert.equal(queued.reason,'explicit_refresh_required');assert.equal(calls,3);assert.equal(state.pendingRevision,12);assert.equal(state.guidance,'connectivity');assert.equal(state.commandsLocked,true);
-});
-test('notification recovery feedback is applied to the existing passenger command banner', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return {status:304};}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
-  const result=await flow.handle({type:'ride.changed',rideId:current.id,revision:9}),view=commandUi.snapshot();
-  assert.equal(result.processed,true);assert.equal(calls,2);assert.equal(view.outcome,'unresolved');assert.equal(view.action,'refresh');assert.equal(view.disableCommands,true);assert.match(view.title,/ä¾é ¼/);assert.match(view.message,/æœ€æ–°çŠ¶æ…‹ã‚’ç¢ºèªã™ã‚‹/);
-});
-test('notification feedback allows one explicit refresh and rejects a double tap', async () => {
-  const {R}=setup();let calls=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async hint=>{calls+=1;if(calls<3)return {status:304};return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});});}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
-  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const first=flow.trigger('refresh');await Promise.resolve();
-  const duplicate=await flow.trigger('refresh');assert.equal(duplicate.reason,'action_in_progress');assert.equal(calls,3);assert.equal(commandUi.snapshot().disableCommands,true);
-  release();const completed=await first;assert.equal(completed.processed,true);assert.equal(commandUi.snapshot().disableCommands,false);assert.equal(commandUi.snapshot().action,null);assert.equal(calls,3);
-});
-test('a role switch prevents delayed notification feedback from overwriting the new role', async () => {
-  const {R}=setup();let calls=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async hint=>{calls+=1;if(calls<3)return {status:304};return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});});}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
-  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const pending=flow.trigger('refresh');await Promise.resolve();commandUi.setRole('driver');release();const stale=await pending,view=commandUi.snapshot();
-  assert.equal(stale.reason,'stale_role_generation');assert.equal(view.role,'driver');assert.equal(view.outcome,'idle');assert.equal(view.disableCommands,false);
-});
-test('reauthentication feedback invokes the role action once and blocks duplicate activation', async () => {
-  const {R}=setup();let calls=0,reauthCalls=0,release;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:401}:{status:304};}}),commandUi=R.createCommandUiController('driver'),flow=R.createNotificationFeedbackFlow({role:'driver',recovery,commandUi,onReauthenticate:()=>{reauthCalls+=1;return new Promise(resolve=>{release=resolve;});}});
-  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});await flow.trigger('refresh');assert.equal(commandUi.snapshot().action,'reauth');assert.match(commandUi.snapshot().message,/é‹è¡Œ/);
-  const first=flow.trigger('reauth');await Promise.resolve();const duplicate=await flow.trigger('reauth');assert.equal(duplicate.reason,'action_in_progress');assert.equal(reauthCalls,1);release({requested:true});await first;assert.equal(reauthCalls,1);assert.equal(commandUi.snapshot().action,'reauth');
-});
-test('a not-found explicit refresh updates the shared driver banner to an unlocked empty state', async () => {
-  const {R}=setup();let calls=0;
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:404}:{status:304};}}),commandUi=R.createCommandUiController('driver'),flow=R.createNotificationFeedbackFlow({role:'driver',recovery,commandUi});
-  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const empty=await flow.trigger('refresh'),view=commandUi.snapshot();
-  assert.equal(empty.processed,true);assert.equal(calls,3);assert.equal(view.outcome,'confirmed');assert.equal(view.disableCommands,false);assert.equal(view.action,null);assert.match(view.title,/é‹è¡Œ/);assert.match(view.message,/é‹è»¢æ‰‹ãƒ›ãƒ¼ãƒ /);
-});
-test('notification feedback button bridge attaches one click listener and removes it on role exit', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),renders=[];
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>({status:304})}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi}),bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});
-  assert.equal(bridge.attach().started,true);assert.equal(bridge.attach().reason,'already_attached');assert.equal(target.listenerCount('click'),1);assert.equal(target.addCount('click'),1);assert.equal(renders.length,1);
-  bridge.detach();assert.equal(target.listenerCount('click'),0);assert.equal(bridge.snapshot().detached,true);target.dispatch('click');assert.equal(renders.length,1);
-});
-test('a double click on the notification refresh button starts one read only', async () => {
-  const {R}=setup();let calls=0,release;const target=recoveryEventTarget(),renders=[];
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async hint=>{calls+=1;if(calls<3)return {status:304};return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});});}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
-  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});bridge.attach();
-  const first=bridge.activate();await Promise.resolve();const duplicate=await bridge.activate();assert.equal(duplicate.reason,'action_in_progress');assert.equal(calls,3);release();const completed=await first;
-  assert.equal(completed.processed,true);assert.equal(calls,3);assert.equal(commandUi.snapshot().disableCommands,false);assert.ok(renders.some(view=>view.outcome==='pending'));assert.equal(renders.at(-1).action,null);
-});
-test('detaching the notification button during a read drops its delayed render', async () => {
-  const {R}=setup();let calls=0,release;const target=recoveryEventTarget(),renders=[];
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async hint=>{calls+=1;if(calls<3)return {status:304};return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('driver',{revision:hint.revision,status:'arriving'})});});}}),commandUi=R.createCommandUiController('driver'),flow=R.createNotificationFeedbackFlow({role:'driver',recovery,commandUi});
-  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:view=>renders.push(view)});bridge.attach();const pending=bridge.activate();await Promise.resolve();const before=renders.length;bridge.detach();release();const stale=await pending;
-  assert.equal(stale.reason,'bridge_stale');assert.equal(renders.length,before);assert.equal(target.listenerCount('click'),0);assert.equal(calls,3);
-});
-test('an old notification button cannot act after the command UI switches role', async () => {
-  const {R}=setup();let calls=0;const target=recoveryEventTarget();
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('home','passenger');
-  const current=currentRideView('passenger',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'passenger',currentRide:current,recover:async()=>{calls+=1;return {status:304};}}),commandUi=R.createCommandUiController('passenger'),flow=R.createNotificationFeedbackFlow({role:'passenger',recovery,commandUi});
-  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});const bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:()=>{}});bridge.attach();commandUi.setRole('driver');const rejected=await bridge.activate();
-  assert.equal(rejected.reason,'action_not_available');assert.equal(calls,2);assert.equal(commandUi.snapshot().role,'driver');assert.equal(commandUi.snapshot().outcome,'idle');
-});
-test('the reauthentication button event is single-flight and remains locked until a new session', async () => {
-  const {R}=setup();let calls=0,reauthCalls=0,release;const target=recoveryEventTarget();
-  const fixture=roleLifecycleFixture(R,{readCurrentRide:async()=>({status:204})}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});await boundary.navigate('driver-home','driver');
-  const current=currentRideView('driver',{revision:8,status:'assigned'}),recovery=R.createRoleNotificationRecovery({lifecycle:fixture.lifecycle,role:'driver',currentRide:current,recover:async()=>{calls+=1;return calls===3?{status:403}:{status:304};}}),commandUi=R.createCommandUiController('driver'),flow=R.createNotificationFeedbackFlow({role:'driver',recovery,commandUi,onReauthenticate:()=>{reauthCalls+=1;return new Promise(resolve=>{release=resolve;});}});
-  await flow.handle({type:'ride.changed',rideId:current.id,revision:9});await flow.trigger('refresh');const bridge=R.createNotificationFeedbackEventBridge({flow,eventTarget:target,render:()=>{}});bridge.attach();const first=bridge.activate();await Promise.resolve();const duplicate=await bridge.activate();
-  assert.equal(duplicate.reason,'action_in_progress');assert.equal(reauthCalls,1);release({requested:true});await first;assert.equal(reauthCalls,1);assert.equal(commandUi.snapshot().action,'reauth');assert.equal(commandUi.snapshot().disableCommands,true);
-});
-test('role entry owns one notification feedback bridge without duplicate attachment', async () => {
-  const {R}=setup(),fixture=roleFeedbackLifecycleFixture(R);
-  assert.equal((await fixture.lifecycle.enter('passenger')).entered,true);assert.equal((await fixture.lifecycle.enter('passenger')).reason,'already_entered');
-  assert.equal(fixture.feedbacks.length,1);assert.deepEqual(fixture.events,['attach:passenger:1']);assert.equal(fixture.feedbacks[0].target.listenerCount('click'),1);assert.equal(fixture.feedbacks[0].target.addCount('click'),1);
-});
-test('leaving a role detaches its notification button before later clicks can act', async () => {
-  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
-  await fixture.lifecycle.enter('passenger');const first=fixture.feedbacks[0];await first.flow.handle({type:'ride.changed',rideId:first.current.id,revision:9});assert.equal(first.commandUi.snapshot().action,'refresh');const before=reads;
-  fixture.lifecycle.leave();assert.equal(first.target.listenerCount('click'),0);first.target.dispatch('click');await first.bridge.idle();
-  assert.equal(reads,before);assert.equal(first.inner.snapshot().detached,true);assert.equal((await first.inner.activate()).reason,'bridge_inactive');
-});
-test('role switching detaches the old notification bridge before attaching the new one', async () => {
-  const {R}=setup(),fixture=roleFeedbackLifecycleFixture(R);
-  await fixture.lifecycle.enter('passenger');await fixture.lifecycle.enter('driver');
-  assert.deepEqual(fixture.events,['attach:passenger:1','detach:passenger:1','attach:driver:2']);assert.equal(fixture.feedbacks[0].target.listenerCount('click'),0);assert.equal(fixture.feedbacks[1].target.listenerCount('click'),1);assert.equal(fixture.lifecycle.snapshot().activeRole,'driver');
-});
-test('re-entering the same role creates a fresh notification button generation', async () => {
-  const {R}=setup(),fixture=roleFeedbackLifecycleFixture(R);
-  await fixture.lifecycle.enter('driver');const first=fixture.feedbacks[0];fixture.lifecycle.leave();await fixture.lifecycle.enter('driver');const second=fixture.feedbacks[1];
-  assert.notEqual(first.inner,second.inner);assert.equal(first.generation+1,second.generation);assert.equal(first.target.listenerCount('click'),0);assert.equal(second.target.listenerCount('click'),1);assert.equal((await first.inner.activate()).reason,'bridge_inactive');
-});
-test('a delayed old notification action cannot render into a switched role generation', async () => {
-  const {R}=setup();let oldCalls=0,release;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:({role,hint})=>{
-    if(role!=='passenger')return Promise.resolve({status:304});oldCalls+=1;if(oldCalls<3)return Promise.resolve({status:304});return new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});});
-  }});
-  await fixture.lifecycle.enter('passenger');const old=fixture.feedbacks[0];await old.flow.handle({type:'ride.changed',rideId:old.current.id,revision:9});const pending=old.inner.activate();await Promise.resolve();const oldRenderCount=old.renders.length;
-  await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[1];release();const result=await pending;await old.inner.idle();
-  assert.equal(result.reason,'bridge_stale');assert.equal(old.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().role,'driver');assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(current.target.listenerCount('click'),1);
-});
-test('the active role generation accepts a notification hint through its owned bridge', async () => {
-  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async({role,hint})=>{reads+=1;return {status:200,body:currentRideView(role,{revision:hint.revision,status:'assigned'})};}});
-  await fixture.lifecycle.enter('passenger');const generation=fixture.lifecycle.snapshot().generation,current=fixture.feedbacks[0].current;
-  const result=await fixture.lifecycle.handleNotification({role:'passenger',generation,hint:{type:'ride.changed',rideId:current.id,revision:9}});
-  assert.equal(result.processed,true);assert.equal(reads,1);assert.equal(fixture.feedbacks[0].recovery.snapshot().revision,9);assert.equal(fixture.feedbacks[0].commandUi.snapshot().role,'passenger');
-});
-test('cross-role and stale-generation notification hints stop before feedback or reads', async () => {
-  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
-  await fixture.lifecycle.enter('passenger');const generation=fixture.lifecycle.snapshot().generation,current=fixture.feedbacks[0].current,hint={type:'ride.changed',rideId:current.id,revision:9};
-  assert.equal((await fixture.lifecycle.handleNotification({role:'driver',generation,hint})).reason,'stale_role_generation');assert.equal((await fixture.lifecycle.handleNotification({role:'passenger',generation:generation+1,hint})).reason,'stale_role_generation');assert.equal(reads,0);assert.equal(fixture.feedbacks[0].inner.snapshot().handledEvents,0);
-});
-test('notification hints after role exit stop before the detached bridge', async () => {
-  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
-  await fixture.lifecycle.enter('driver');const generation=fixture.lifecycle.snapshot().generation,current=fixture.feedbacks[0].current;fixture.lifecycle.leave();
-  const result=await fixture.lifecycle.handleNotification({role:'driver',generation,hint:{type:'ride.changed',rideId:current.id,revision:9}});
-  assert.equal(result.reason,'not_entered');assert.equal(reads,0);assert.equal(fixture.feedbacks[0].inner.snapshot().handledEvents,0);
-});
-test('same-role re-entry accepts only the fresh notification generation', async () => {
-  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async({role,hint})=>{reads+=1;return {status:200,body:currentRideView(role,{revision:hint.revision,status:'assigned'})};}});
-  await fixture.lifecycle.enter('passenger');const old=fixture.feedbacks[0];fixture.lifecycle.leave();await fixture.lifecycle.enter('passenger');const fresh=fixture.feedbacks[1],hint={type:'ride.changed',rideId:fresh.current.id,revision:9};
-  assert.equal((await fixture.lifecycle.handleNotification({role:'passenger',generation:old.generation,hint})).reason,'stale_role_generation');assert.equal(reads,0);
-  assert.equal((await fixture.lifecycle.handleNotification({role:'passenger',generation:fresh.generation,hint})).processed,true);assert.equal(reads,1);assert.equal(old.inner.snapshot().handledEvents,0);assert.equal(fresh.inner.snapshot().handledEvents,1);
-});
-test('a delayed notification hint from a departed role cannot render into the new role', async () => {
-  const {R}=setup();let release;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:({role,hint})=>role==='passenger'?new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});}):Promise.resolve({status:304})});
-  await fixture.lifecycle.enter('passenger');const old=fixture.feedbacks[0],pending=fixture.lifecycle.handleNotification({role:'passenger',generation:old.generation,hint:{type:'ride.changed',rideId:old.current.id,revision:9}});await Promise.resolve();await Promise.resolve();const oldRenderCount=old.renders.length;
-  await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[1];release();const result=await pending;await old.inner.idle();
-  assert.equal(result.reason,'stale_notification');assert.equal(old.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().role,'driver');assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(current.inner.snapshot().handledEvents,0);
-});
-test('role entry binds one notification listener without caller role or generation', async () => {
-  const {R}=setup();let seen;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async input=>{seen=input;return {status:304};}});
-  await fixture.lifecycle.enter('passenger');assert.equal((await fixture.lifecycle.enter('passenger')).reason,'already_entered');const current=fixture.feedbacks[0].current;
-  fixture.notificationTarget.dispatch('notification',{role:'driver',generation:999,detail:{type:'ride.changed',rideId:current.id,revision:9}});await fixture.notificationBridges[0].inner.idle();
-  assert.equal(fixture.notificationTarget.listenerCount('notification'),1);assert.equal(fixture.notificationTarget.addCount('notification'),1);assert.equal(seen.role,'passenger');assert.equal(seen.generation,1);assert.equal(seen.hint.revision,9);
-});
-test('role exit removes the bound notification listener before future events', async () => {
-  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
-  await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[0].current;fixture.lifecycle.leave();fixture.notificationTarget.dispatch('notification',{detail:{type:'ride.changed',rideId:current.id,revision:9}});await fixture.notificationBridges[0].inner.idle();
-  assert.equal(fixture.notificationTarget.listenerCount('notification'),0);assert.equal(reads,0);assert.equal(fixture.notificationBridges[0].inner.snapshot().detached,true);
-});
-test('role switch replaces the bound notification listener with the current generation', async () => {
-  const {R}=setup(),seen=[];const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async input=>{seen.push(input);return {status:304};}});
-  await fixture.lifecycle.enter('passenger');const old=fixture.notificationBridges[0];await fixture.lifecycle.enter('driver');const fresh=fixture.notificationBridges[1],current=fixture.feedbacks[1].current;
-  fixture.notificationTarget.dispatch('notification',{detail:{type:'ride.changed',rideId:current.id,revision:9}});await fresh.inner.idle();
-  assert.equal(fixture.notificationTarget.listenerCount('notification'),1);assert.equal(fixture.notificationTarget.addCount('notification'),2);assert.equal(old.inner.snapshot().handledEvents,0);assert.equal(fresh.inner.snapshot().handledEvents,1);assert.deepEqual(seen.map(value=>[value.role,value.generation]),[['driver',2],['driver',2]]);
-});
-test('same-role re-entry does not reuse an old notification listener', async () => {
-  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
-  await fixture.lifecycle.enter('passenger');const old=fixture.notificationBridges[0];fixture.lifecycle.leave();await fixture.lifecycle.enter('passenger');const fresh=fixture.notificationBridges[1],current=fixture.feedbacks[1].current;
-  fixture.notificationTarget.dispatch('notification',{detail:{type:'ride.changed',rideId:current.id,revision:9}});await fresh.inner.idle();
-  assert.notEqual(old.inner,fresh.inner);assert.equal(old.inner.snapshot().detached,true);assert.equal(old.inner.snapshot().handledEvents,0);assert.equal(fresh.inner.snapshot().handledEvents,1);assert.equal(reads,2);
-});
-test('a delayed notification event cannot update after its listener generation is replaced', async () => {
-  const {R}=setup();let release;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:({role,hint})=>role==='passenger'?new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView('passenger',{revision:hint.revision,status:'on_trip'})});}):Promise.resolve({status:304})});
-  await fixture.lifecycle.enter('passenger');const oldNotification=fixture.notificationBridges[0],oldFeedback=fixture.feedbacks[0],hint={type:'ride.changed',rideId:oldFeedback.current.id,revision:9},pending=oldNotification.inner.receive(hint);await Promise.resolve();await Promise.resolve();const oldRenderCount=oldFeedback.renders.length;
-  await fixture.lifecycle.enter('driver');const current=fixture.feedbacks[1];release();const result=await pending;await oldNotification.inner.idle();await oldFeedback.inner.idle();
-  assert.equal(result.reason,'bridge_stale');assert.equal(oldFeedback.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().role,'driver');assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(fixture.notificationTarget.listenerCount('notification'),1);
-});
-test('an authenticated session binding stays private and duplicate entry does not resubscribe', async () => {
-  const {R}=setup(),sessionBinding=Object.freeze({accountRef:'private-passenger-a'}),fixture=roleFeedbackLifecycleFixture(R);
-  await fixture.lifecycle.enter('passenger',{sessionBinding});const duplicate=await fixture.lifecycle.enter('passenger',{sessionBinding});
-  assert.equal(duplicate.reason,'already_entered');assert.equal(fixture.notificationBridges.length,1);assert.equal(fixture.notificationBridges[0].sessionBinding,sessionBinding);assert.equal(fixture.notificationTarget.addCount('notification'),1);
-  assert.deepEqual(Object.keys(fixture.lifecycle.snapshot()).sort(),['activeRole','busy','entered','generation','lastAction']);assert.deepEqual(Object.keys(fixture.notificationBridges[0].inner.snapshot()).sort(),['attached','busy','detached','handledEvents','lastEvent']);
-});
-test('same-role account switch replaces the notification subscription generation', async () => {
-  const {R}=setup(),firstSession={},secondSession={},fixture=roleFeedbackLifecycleFixture(R);
-  await fixture.lifecycle.enter('driver',{sessionBinding:firstSession});const old=fixture.notificationBridges[0];await fixture.lifecycle.enter('driver',{sessionBinding:secondSession});const fresh=fixture.notificationBridges[1];
-  assert.equal(old.inner.snapshot().detached,true);assert.equal(fresh.sessionBinding,secondSession);assert.equal(old.generation+1,fresh.generation);assert.equal(fixture.notificationTarget.listenerCount('notification'),1);assert.equal(fixture.notificationTarget.addCount('notification'),2);
-});
-test('an old account subscription cannot process another hint after same-role switch', async () => {
-  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
-  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});const old=fixture.notificationBridges[0],hint={type:'ride.changed',rideId:fixture.feedbacks[0].current.id,revision:9};await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});
-  assert.equal((await old.inner.receive(hint)).reason,'bridge_inactive');assert.equal(reads,0);assert.equal(old.inner.snapshot().handledEvents,0);assert.equal(fixture.lifecycle.snapshot().generation,2);
-});
-test('logout removes the session notification subscription before later events', async () => {
-  const {R}=setup();let reads=0;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};}});
-  await fixture.lifecycle.enter('driver',{sessionBinding:{account:'driver-a'}});const current=fixture.feedbacks[0].current;fixture.lifecycle.leave();fixture.notificationTarget.dispatch('notification',{detail:{type:'ride.changed',rideId:current.id,revision:9}});await fixture.notificationBridges[0].inner.idle();
-  assert.equal(fixture.notificationTarget.listenerCount('notification'),0);assert.equal(reads,0);assert.equal(fixture.lifecycle.snapshot().activeRole,null);assert.equal(fixture.notificationBridges[0].inner.snapshot().detached,true);
-});
-test('a delayed old-account notification result cannot update the replacement session', async () => {
-  const {R}=setup();let release;const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:({generation,role,hint})=>generation===1?new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView(role,{revision:hint.revision,status:'on_trip'})});}):Promise.resolve({status:304})});
-  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});const oldNotification=fixture.notificationBridges[0],oldFeedback=fixture.feedbacks[0],pending=oldNotification.inner.receive({type:'ride.changed',rideId:oldFeedback.current.id,revision:9});await Promise.resolve();await Promise.resolve();const oldRenderCount=oldFeedback.renders.length;
-  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});const current=fixture.feedbacks[1];release();const result=await pending;await oldNotification.inner.idle();await oldFeedback.inner.idle();
-  assert.equal(result.reason,'bridge_stale');assert.equal(oldFeedback.renders.length,oldRenderCount);assert.equal(current.commandUi.snapshot().outcome,'idle');assert.equal(current.inner.snapshot().handledEvents,0);assert.equal(fixture.notificationTarget.listenerCount('notification'),1);
-});
-test('async notification subscription starts once and connects without exposing session data', async () => {
-  const {R}=setup(),sessionBinding={accountRef:'private-passenger-a'};let subscriptions=0,connect,signal;
-  const fixture=roleFeedbackLifecycleFixture(R,{notificationSubscribe:input=>{subscriptions+=1;signal=input.signal;return new Promise(resolve=>{connect=()=>resolve(()=>{});});}});
-  await fixture.lifecycle.enter('passenger',{sessionBinding});const duplicate=await fixture.lifecycle.enter('passenger',{sessionBinding}),bridge=fixture.notificationBridges[0].inner;
-  assert.equal(duplicate.reason,'already_entered');assert.equal(subscriptions,1);assert.equal(signal.aborted,false);assert.equal(bridge.snapshot().connected,false);
-  connect();await bridge.idle();assert.equal(bridge.snapshot().connected,true);assert.deepEqual(Object.keys(bridge.snapshot()).sort(),['attached','busy','connected','detached','handledEvents','lastEvent']);
-  for(const secret of ['sessionBinding','accountRef','signal','endpoint','token'])assert.equal(Object.prototype.hasOwnProperty.call(bridge.snapshot(),secret),false);
-});
-test('logout aborts a connecting notification subscription and cleans up a late success', async () => {
-  const {R}=setup();let resolveConnection,signal,deliver,unsubscribes=0,reads=0;
-  const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async()=>{reads+=1;return {status:304};},notificationSubscribe:input=>{signal=input.signal;deliver=input.onHint;return new Promise(resolve=>{resolveConnection=resolve;});}});
-  await fixture.lifecycle.enter('driver',{sessionBinding:{account:'driver-a'}});const bridge=fixture.notificationBridges[0].inner,current=fixture.feedbacks[0].current;fixture.lifecycle.leave();
-  assert.equal(signal.aborted,true);assert.equal(bridge.snapshot().detached,true);resolveConnection(()=>{unsubscribes+=1;});await bridge.idle();
-  assert.equal(unsubscribes,1);assert.equal(bridge.snapshot().connected,false);assert.equal(bridge.snapshot().lastEvent,'detached');assert.equal((await deliver({type:'ride.changed',rideId:current.id,revision:9})).reason,'subscription_inactive');assert.equal(reads,0);
-});
-test('same-role account switch aborts the old async subscription before starting the new one', async () => {
-  const {R}=setup(),records=[];
-  const fixture=roleFeedbackLifecycleFixture(R,{notificationSubscribe:input=>new Promise(resolve=>records.push({...input,resolve,unsubscribes:0}))});
-  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});const old=fixture.notificationBridges[0].inner;await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});const fresh=fixture.notificationBridges[1].inner;
-  assert.equal(records.length,2);assert.equal(records[0].signal.aborted,true);assert.equal(records[1].signal.aborted,false);
-  records[0].resolve(()=>{records[0].unsubscribes+=1;});await old.idle();records[1].resolve(()=>{records[1].unsubscribes+=1;});await fresh.idle();
-  assert.equal(records[0].unsubscribes,1);assert.equal(records[1].unsubscribes,0);assert.equal(old.snapshot().connected,false);assert.equal(fresh.snapshot().connected,true);assert.equal(fixture.lifecycle.snapshot().generation,2);
-});
-test('late callback from an old async subscription cannot trigger an authorized read', async () => {
-  const {R}=setup(),records=[];let reads=0;
-  const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:async({role,hint})=>{reads+=1;return {status:200,body:currentRideView(role,{revision:hint.revision,status:'assigned'})};},notificationSubscribe:input=>new Promise(resolve=>records.push({...input,resolve}))});
-  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});const old=fixture.notificationBridges[0].inner,rideId=fixture.feedbacks[0].current.id;await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});const fresh=fixture.notificationBridges[1].inner;
-  records[0].resolve(()=>{});records[1].resolve(()=>{});await Promise.all([old.idle(),fresh.idle()]);
-  assert.equal((await records[0].onHint({type:'ride.changed',rideId,revision:9})).reason,'subscription_inactive');assert.equal(reads,0);
-  const current=await records[1].onHint({type:'ride.changed',rideId,revision:9});await fresh.idle();assert.equal(current.processed,true);assert.equal(reads,1);assert.equal(fixture.lifecycle.snapshot().generation,2);
-});
-test('notification read started by an async subscription becomes stale on account switch', async () => {
-  const {R}=setup(),records=[];let release;
-  const fixture=roleFeedbackLifecycleFixture(R,{notificationRead:({generation,role,hint})=>generation===1?new Promise(resolve=>{release=()=>resolve({status:200,body:currentRideView(role,{revision:hint.revision,status:'on_trip'})});}):Promise.resolve({status:304}),notificationSubscribe:input=>new Promise(resolve=>records.push({...input,resolve,unsubscribes:0}))});
-  await fixture.lifecycle.enter('driver',{sessionBinding:{account:1}});const old=fixture.notificationBridges[0].inner,oldFeedback=fixture.feedbacks[0],rideId=oldFeedback.current.id;records[0].resolve(()=>{records[0].unsubscribes+=1;});await old.idle();
-  const pending=records[0].onHint({type:'ride.changed',rideId,revision:9});await Promise.resolve();await Promise.resolve();const renderCount=oldFeedback.renders.length;
-  await fixture.lifecycle.enter('driver',{sessionBinding:{account:2}});const fresh=fixture.notificationBridges[1].inner;records[1].resolve(()=>{records[1].unsubscribes+=1;});await fresh.idle();release();const result=await pending;await old.idle();await oldFeedback.inner.idle();
-  assert.equal(result.reason,'bridge_stale');assert.equal(records[0].unsubscribes,1);assert.equal(oldFeedback.renders.length,renderCount);assert.equal(fresh.snapshot().connected,true);assert.equal(fixture.feedbacks[1].commandUi.snapshot().outcome,'idle');
-});
-test('initial subscription failure locks passenger commands and offers one explicit reconnect', async () => {
-  const {R}=setup(),renders=[];let subscriptions=0;
-  const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'passenger',subscribe:async()=>{subscriptions+=1;throw Error('offline');},onHint:async()=>({processed:true}),verifyLatest:async()=>({verified:true}),render:value=>renders.push(value)});
-  bridge.attach();await bridge.idle();const state=bridge.snapshot();
-  assert.equal(subscriptions,1);assert.equal(state.guidance,'connectivity');assert.equal(state.commandsLocked,true);assert.equal(state.action,'reconnect');assert.match(state.feedback.title,/ä¾é ¼/);assert.equal(renders.at(-1).action,'reconnect');
-  await Promise.resolve();await bridge.idle();assert.equal(subscriptions,1);
-});
-test('connected driver subscription disconnects into a role-specific lock without automatic retry', async () => {
-  const {R}=setup();let subscriptions=0,disconnect,deliver,unsubscribes=0,reads=0;
-  const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'driver',subscribe:async input=>{subscriptions+=1;disconnect=input.onDisconnect;deliver=input.onHint;return()=>{unsubscribes+=1;};},onHint:async()=>{reads+=1;return {processed:true};},verifyLatest:async()=>({verified:true})});
-  bridge.attach();await bridge.idle();assert.equal(bridge.snapshot().commandsLocked,false);disconnect();const state=bridge.snapshot();
-  assert.equal(subscriptions,1);assert.equal(unsubscribes,1);assert.equal(state.guidance,'connectivity');assert.equal(state.commandsLocked,true);assert.equal(state.action,'reconnect');assert.match(state.feedback.title,/é‹è¡Œ/);
-  assert.equal((await deliver({type:'ride.changed',rideId:'private',revision:9})).reason,'subscription_inactive');assert.equal(reads,0);await bridge.idle();assert.equal(subscriptions,1);
-});
-test('one explicit reconnect verifies the latest authorized state before unlocking', async () => {
-  const {R}=setup();let subscriptions=0,disconnect,verifyResolve,verifications=0;
-  const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'passenger',subscribe:async input=>{subscriptions+=1;disconnect=input.onDisconnect;return()=>{};},onHint:async()=>({processed:true}),verifyLatest:()=>{verifications+=1;return new Promise(resolve=>{verifyResolve=resolve;});}});
-  bridge.attach();await bridge.idle();disconnect();const reconnecting=bridge.reconnect(),duplicate=await bridge.reconnect();await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(duplicate.reason,'action_in_progress');assert.equal(subscriptions,2);assert.equal(verifications,1);assert.equal(bridge.snapshot().guidance,'verifying');assert.equal(bridge.snapshot().commandsLocked,true);
-  verifyResolve({verified:true});const result=await reconnecting;assert.equal(result.reconnected,true);assert.equal(bridge.snapshot().guidance,'connected');assert.equal(bridge.snapshot().commandsLocked,false);assert.equal(bridge.snapshot().reconnects,1);
-});
-test('network, status 0, 429 and 5xx after reconnect offer one explicit latest-state refresh', async () => {
-  const {R}=setup(),failures=[()=>{throw Error('offline');},()=>({status:0}),()=>({status:429}),()=>({status:503})];
-  for(const failure of failures){
-    let disconnect,verifications=0;const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'passenger',subscribe:async input=>{disconnect=input.onDisconnect;return()=>{};},onHint:async()=>({processed:true}),verifyLatest:async()=>{verifications+=1;return verifications===1?failure():{verified:true};}});
-    bridge.attach();await bridge.idle();disconnect();const reconnect=await bridge.reconnect(),state=bridge.snapshot();
-    assert.equal(reconnect.reason,'connectivity_required');assert.equal(state.connected,true);assert.equal(state.guidance,'verification_connectivity');assert.equal(state.commandsLocked,true);assert.equal(state.action,'refresh');assert.match(state.feedback.title,/ä¾é ¼/);assert.equal(verifications,1);
-    const refreshing=bridge.refresh(),duplicate=await bridge.refresh();assert.equal(duplicate.reason,'action_in_progress');const refreshed=await refreshing;
-    assert.equal(refreshed.reason,'verification_refreshed');assert.equal(bridge.snapshot().commandsLocked,false);assert.equal(bridge.snapshot().guidance,'connected');assert.equal(verifications,2);assert.equal((await bridge.refresh()).reason,'refresh_unavailable');
-  }
-});
-test('401 and 403 after reconnect require role-specific reauthentication without retry', async () => {
-  const {R}=setup();
-  for(const [role,status,subject] of [['passenger',401,'ä¾é ¼'],['driver',403,'é‹è¡Œ']]){
-    let disconnect,verifications=0;const bridge=R.createRecoverableNotificationSubscriptionBridge({role,subscribe:async input=>{disconnect=input.onDisconnect;return()=>{};},onHint:async()=>({processed:true}),verifyLatest:async()=>{verifications+=1;return {status};}});
-    bridge.attach();await bridge.idle();disconnect();const result=await bridge.reconnect(),state=bridge.snapshot();
-    assert.equal(result.reason,'reauthentication_required');assert.equal(state.guidance,'reauth');assert.equal(state.commandsLocked,true);assert.equal(state.action,'reauth');assert.match(state.feedback.message,new RegExp(subject));assert.equal(verifications,1);await bridge.idle();assert.equal(verifications,1);assert.equal((await bridge.refresh()).reason,'refresh_unavailable');
-  }
-});
-test('404 after reconnect clears the role lock into a safe empty state', async () => {
-  const {R}=setup();let disconnect;
-  const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'driver',subscribe:async input=>{disconnect=input.onDisconnect;return()=>{};},onHint:async()=>({processed:true}),verifyLatest:async()=>({status:404})});
-  bridge.attach();await bridge.idle();disconnect();const result=await bridge.reconnect(),state=bridge.snapshot();
-  assert.equal(result.reason,'ride_not_found');assert.equal(state.connected,true);assert.equal(state.guidance,'empty');assert.equal(state.commandsLocked,false);assert.equal(state.action,null);assert.match(state.feedback.title,/é‹è¡Œ/);assert.equal(state.feedback.disableCommands,false);
-});
-test('unexpected reconnect verification stays locked without leaking its response', async () => {
-  const {R}=setup();let disconnect;
-  const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'passenger',subscribe:async input=>{disconnect=input.onDisconnect;return()=>{};},onHint:async()=>({processed:true}),verifyLatest:async()=>({status:200,body:{token:'private',rideId:'private'}})});
-  bridge.attach();await bridge.idle();disconnect();const result=await bridge.reconnect(),state=bridge.snapshot();
-  assert.equal(result.reason,'verification_failed');assert.equal(state.guidance,'retry_failed');assert.equal(state.commandsLocked,true);assert.equal(state.action,null);for(const secret of ['body','token','rideId','response'])assert.equal(JSON.stringify(state).includes(secret),false);
-});
-test('failed explicit reconnect stops without an automatic connection loop', async () => {
-  const {R}=setup();let subscriptions=0;
-  const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'driver',subscribe:async()=>{subscriptions+=1;throw Error('offline');},onHint:async()=>({processed:true}),verifyLatest:async()=>({verified:true})});
-  bridge.attach();await bridge.idle();const failed=await bridge.reconnect();await bridge.idle();
-  assert.equal(failed.reason,'reconnect_failed');assert.equal(subscriptions,2);assert.equal(bridge.snapshot().guidance,'retry_failed');assert.equal(bridge.snapshot().commandsLocked,true);assert.equal(bridge.snapshot().action,null);
-  assert.equal((await bridge.reconnect()).reason,'reconnect_unavailable');await Promise.resolve();assert.equal(subscriptions,2);
-});
-test('logout during reconnect cleans up a late connection without verifying or exposing private fields', async () => {
-  const {R}=setup(),records=[];let verifications=0;
-  const bridge=R.createRecoverableNotificationSubscriptionBridge({role:'passenger',subscribe:input=>new Promise(resolve=>records.push({...input,resolve,unsubscribes:0})),onHint:async()=>({processed:true}),verifyLatest:async()=>{verifications+=1;return {verified:true};}});
-  bridge.attach();records[0].resolve(()=>{records[0].unsubscribes+=1;});await bridge.idle();records[0].onDisconnect();const reconnecting=bridge.reconnect();assert.equal(records[1].signal.aborted,false);bridge.detach();assert.equal(records[1].signal.aborted,true);
-  records[1].resolve(()=>{records[1].unsubscribes+=1;});const result=await reconnecting;await bridge.idle();const state=bridge.snapshot();
-  assert.equal(result.reason,'subscription_stale');assert.equal(records[1].unsubscribes,1);assert.equal(verifications,0);assert.equal(state.detached,true);assert.equal(state.action,null);assert.equal(state.commandsLocked,false);
-  assert.deepEqual(Object.keys(state).sort(),['action','attached','busy','commandsLocked','connected','detached','feedback','guidance','lastEvent','reconnects']);for(const secret of ['sessionBinding','accountRef','signal','endpoint','token','hint','response'])assert.equal(Object.prototype.hasOwnProperty.call(state,secret),false);
-});
-test('role lifecycle owns one notification subscription bridge per active generation', async () => {
-  const {R}=setup(),fixture=roleSubscriptionLifecycleFixture(R);
-  const entered=await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});await fixture.lifecycle.idle();
-  assert.equal(entered.entered,true);assert.equal(fixture.subscriptions.length,1);assert.equal(fixture.subscriptions[0].connects,1);assert.equal(fixture.subscriptions[0].bridge.snapshot().connected,true);
-  assert.equal((await fixture.lifecycle.enter('passenger',{sessionBinding:fixture.subscriptions[0].sessionBinding})).reason,'already_entered');assert.equal(fixture.subscriptions.length,1);
-  assert.deepEqual(Object.keys(fixture.lifecycle.snapshot()).sort(),['activeRole','busy','entered','generation','lastAction']);
-});
-test('current role generation alone can reconnect and explicitly refresh verification', async () => {
-  const {R}=setup();let verifications=0;
-  const fixture=roleSubscriptionLifecycleFixture(R,{verifyLatest:async()=>{verifications+=1;return verifications===1?{status:503}:{verified:true};}});
-  await fixture.lifecycle.enter('passenger');await fixture.lifecycle.idle();const generation=fixture.lifecycle.snapshot().generation,record=fixture.subscriptions[0];record.disconnect();
-  const reconnecting=fixture.lifecycle.handleSubscriptionAction({role:'passenger',generation,action:'reconnect'}),duplicate=await fixture.lifecycle.handleSubscriptionAction({role:'passenger',generation,action:'reconnect'});assert.equal(duplicate.reason,'recovery_in_progress');
-  const reconnect=await reconnecting;assert.equal(reconnect.reason,'connectivity_required');assert.equal(record.connects,2);assert.equal(record.bridge.snapshot().action,'refresh');
-  assert.equal((await fixture.lifecycle.handleSubscriptionAction({role:'driver',generation,action:'refresh'})).reason,'stale_role_generation');
-  const refreshing=fixture.lifecycle.handleSubscriptionAction({role:'passenger',generation,action:'refresh'}),doubleRefresh=await fixture.lifecycle.handleSubscriptionAction({role:'passenger',generation,action:'refresh'});assert.equal(doubleRefresh.reason,'recovery_in_progress');
-  const refreshed=await refreshing;assert.equal(refreshed.reason,'verification_refreshed');assert.equal(record.bridge.snapshot().commandsLocked,false);assert.equal(verifications,2);
-});
-test('role switch invalidates an in-flight reauthentication action and keeps the new role isolated', async () => {
-  const {R}=setup();let release,reauthCalls=0;
-  const fixture=roleSubscriptionLifecycleFixture(R,{verifyLatest:async()=>({status:401}),onReauthenticate:()=>{reauthCalls+=1;return new Promise(resolve=>{release=resolve;});}});
-  await fixture.lifecycle.enter('driver',{sessionBinding:{account:'driver-a'}});await fixture.lifecycle.idle();const oldGeneration=fixture.lifecycle.snapshot().generation,old=fixture.subscriptions[0];old.disconnect();
-  const reconnect=await fixture.lifecycle.handleSubscriptionAction({role:'driver',generation:oldGeneration,action:'reconnect'});assert.equal(reconnect.reason,'reauthentication_required');
-  const pending=fixture.lifecycle.handleSubscriptionAction({role:'driver',generation:oldGeneration,action:'reauth'});await Promise.resolve();assert.equal(reauthCalls,1);assert.equal((await fixture.lifecycle.handleSubscriptionAction({role:'driver',generation:oldGeneration,action:'reauth'})).reason,'recovery_in_progress');
-  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:'passenger-b'}});const fresh=fixture.subscriptions[1];await fresh.bridge.idle();assert.equal(old.bridge.snapshot().detached,true);assert.equal(fresh.bridge.snapshot().guidance,'connected');
-  release({requested:true});const result=await pending;assert.equal(result.reason,'stale_subscription_action');assert.equal(fresh.bridge.snapshot().commandsLocked,false);assert.equal(reauthCalls,1);
-  assert.equal((await fixture.lifecycle.handleSubscriptionAction({role:'driver',generation:oldGeneration,action:'reauth'})).reason,'stale_role_generation');
-});
-test('404 verification clears only the active role generation into its empty state', async () => {
-  const {R}=setup(),fixture=roleSubscriptionLifecycleFixture(R,{verifyLatest:async()=>({status:404})});
-  await fixture.lifecycle.enter('driver');await fixture.lifecycle.idle();const generation=fixture.lifecycle.snapshot().generation,record=fixture.subscriptions[0];record.disconnect();
-  const result=await fixture.lifecycle.handleSubscriptionAction({role:'driver',generation,action:'reconnect'}),state=record.bridge.snapshot();
-  assert.equal(result.reason,'ride_not_found');assert.equal(state.guidance,'empty');assert.equal(state.commandsLocked,false);assert.equal(state.action,null);assert.match(state.feedback.title,/é‹è¡Œ/);
-  assert.equal((await fixture.lifecycle.handleSubscriptionAction({role:'driver',generation,action:'reconnect'})).reason,'action_not_available');
-});
-test('subscription failure renders one reconnect action on the active role button', async () => {
-  const {R}=setup(),fixture=roleSubscriptionFeedbackLifecycleFixture(R,{subscribe:async()=>{throw Error('offline');}});
-  await fixture.lifecycle.enter('passenger');await fixture.lifecycle.idle();const record=fixture.subscriptions[0],view=record.commandUi.snapshot();
-  assert.equal(record.target.listenerCount('click'),1);assert.equal(record.target.addCount('click'),1);assert.equal(view.outcome,'unresolved');assert.equal(view.action,'reconnect');assert.equal(view.disableCommands,true);assert.match(view.title,/ä¾é ¼/);assert.equal(record.renders.at(-1).action,'reconnect');
-  assert.deepEqual(Object.keys(record.bridge.snapshot()).sort(),['action','attached','busy','commandsLocked','detached','handledEvents','lastEvent']);for(const secret of ['sessionBinding','account','signal','endpoint','token','response'])assert.equal(Object.prototype.hasOwnProperty.call(record.bridge.snapshot(),secret),false);
-  assert.equal((await fixture.lifecycle.enter('passenger')).reason,'already_entered');assert.equal(fixture.subscriptions.length,1);assert.equal(record.connects,1);
-});
-test('shared feedback button reconnects then refreshes once without duplicate work', async () => {
-  const {R}=setup();let connects=0,verifications=0,release;
-  const fixture=roleSubscriptionFeedbackLifecycleFixture(R,{subscribe:async()=>{connects+=1;if(connects===1)throw Error('offline');return()=>{};},verifyLatest:()=>{verifications+=1;if(verifications===1)return {status:503};return new Promise(resolve=>{release=resolve;});}});
-  await fixture.lifecycle.enter('passenger');await fixture.lifecycle.idle();const record=fixture.subscriptions[0];
-  const reconnected=await record.bridge.activate();assert.equal(reconnected.reason,'connectivity_required');assert.equal(record.commandUi.snapshot().action,'refresh');assert.equal(connects,2);assert.equal(verifications,1);
-  const refreshing=record.bridge.activate();await Promise.resolve();const duplicate=await record.bridge.activate();assert.equal(duplicate.reason,'action_in_progress');assert.equal(verifications,2);assert.equal(record.commandUi.snapshot().disableCommands,true);
-  release({verified:true});const refreshed=await refreshing;assert.equal(refreshed.reason,'verification_refreshed');assert.equal(record.commandUi.snapshot().action,null);assert.equal(record.commandUi.snapshot().disableCommands,false);assert.equal(verifications,2);
-});
-test('reauthentication button stays single-flight and becomes stale after a role switch', async () => {
-  const {R}=setup();let release,reauthCalls=0;
-  const fixture=roleSubscriptionFeedbackLifecycleFixture(R,{verifyLatest:async()=>({status:401}),onReauthenticate:()=>{reauthCalls+=1;return new Promise(resolve=>{release=resolve;});}});
-  await fixture.lifecycle.enter('driver');await fixture.lifecycle.idle();const old=fixture.subscriptions[0];old.disconnect();await old.bridge.activate();assert.equal(old.commandUi.snapshot().action,'reauth');
-  const pending=old.bridge.activate();await Promise.resolve();const duplicate=await old.bridge.activate();assert.equal(duplicate.reason,'action_in_progress');assert.equal(reauthCalls,1);
-  await fixture.lifecycle.enter('passenger');await fixture.subscriptions[1].bridge.idle();const fresh=fixture.subscriptions[1],freshRenders=fresh.renders.length;assert.equal(old.target.listenerCount('click'),0);assert.equal(fresh.target.listenerCount('click'),1);
-  release({requested:true});const stale=await pending;assert.equal(stale.reason,'bridge_stale');assert.equal(fresh.renders.length,freshRenders);assert.equal(fresh.commandUi.snapshot().outcome,'idle');assert.equal(reauthCalls,1);
-});
-test('same-role re-entry removes the old subscription button before another click', async () => {
-  const {R}=setup();let connects=0;
-  const fixture=roleSubscriptionFeedbackLifecycleFixture(R,{subscribe:async()=>{connects+=1;throw Error('offline');}});
-  await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});await fixture.lifecycle.idle();const old=fixture.subscriptions[0];fixture.lifecycle.leave();await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});await fixture.lifecycle.idle();const fresh=fixture.subscriptions[1];
-  assert.equal(old.target.listenerCount('click'),0);old.target.dispatch('click');assert.equal((await old.bridge.activate()).reason,'bridge_inactive');assert.equal(fresh.target.listenerCount('click'),1);assert.equal(fresh.commandUi.snapshot().action,'reconnect');assert.equal(connects,2);
-});
-test('404 reconnect verification renders the active driver empty state without an action', async () => {
-  const {R}=setup(),fixture=roleSubscriptionFeedbackLifecycleFixture(R,{verifyLatest:async()=>({status:404})});
-  await fixture.lifecycle.enter('driver');await fixture.lifecycle.idle();const record=fixture.subscriptions[0];record.disconnect();const result=await record.bridge.activate(),view=record.commandUi.snapshot();
-  assert.equal(result.reason,'ride_not_found');assert.equal(view.outcome,'confirmed');assert.equal(view.action,null);assert.equal(view.disableCommands,false);assert.match(view.title,/é‹è¡Œ/);assert.match(view.message,/é‹è»¢æ‰‹ãƒ›ãƒ¼ãƒ /);assert.equal((await record.bridge.activate()).reason,'action_not_available');
-});
-test('prototype DOM bridge renders notification recovery state and accessibility locks', () => {
-  const {R}=setup(),commandUi=R.createCommandUiController('passenger'),elements=feedbackDomElements(),bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:async()=>({processed:true})});
-  bridge.attach();commandUi.applyFeedback('passenger',commandUi.snapshot().generation,'unresolved',{title:'ä¾é ¼ã®é€šçŸ¥ã«æŽ¥ç¶šã§ãã¾ã›ã‚“',message:'é€šä¿¡ã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚',disableCommands:true,action:'reconnect'});bridge.render();
-  assert.equal(elements.box.hidden,false);assert.match(elements.box.className,/error/);assert.equal(elements.box.attributes['aria-busy'],'false');assert.equal(elements.title.textContent,'ä¾é ¼ã®é€šçŸ¥ã«æŽ¥ç¶šã§ãã¾ã›ã‚“');assert.equal(elements.action.textContent,'é€šçŸ¥ã‚’å†æŽ¥ç¶šã™ã‚‹');assert.equal(elements.action.hidden,false);assert.equal(elements.action.disabled,false);assert.equal(elements.action.attributes['aria-disabled'],'false');
-  for(const button of elements.commandButtons){assert.equal(button.disabled,true);assert.equal(button.attributes['aria-disabled'],'true');}
-});
-test('prototype DOM feedback action is single-flight and exposes pending ARIA state', async () => {
-  const {R}=setup(),commandUi=R.createCommandUiController('driver'),elements=feedbackDomElements();let calls=0,release;
-  const bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:()=>{calls+=1;return new Promise(resolve=>{release=resolve;});}});bridge.attach();commandUi.applyFeedback('driver',commandUi.snapshot().generation,'unresolved',{title:'é‹è¡Œã®é€šçŸ¥ã«æŽ¥ç¶šã§ãã¾ã›ã‚“',message:'å†æŽ¥ç¶šã—ã¦ãã ã•ã„ã€‚',disableCommands:true,action:'reconnect'});bridge.render();
-  const pending=bridge.activate();await Promise.resolve();const duplicate=await bridge.activate();assert.equal(calls,1);assert.equal(duplicate.reason,'action_in_progress');assert.equal(elements.action.disabled,true);assert.equal(elements.action.attributes['aria-disabled'],'true');assert.equal(elements.box.attributes['aria-busy'],'true');
-  release({processed:true,reason:'reconnected'});assert.equal((await pending).reason,'reconnected');assert.equal(elements.box.attributes['aria-busy'],'false');
-});
-test('role-page exit removes the actual feedback click listener and hides its banner', async () => {
-  const {R}=setup(),commandUi=R.createCommandUiController('passenger'),elements=feedbackDomElements();let calls=0;
-  const bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:async()=>{calls+=1;return {processed:true};}});bridge.attach();commandUi.applyFeedback('passenger',commandUi.snapshot().generation,'unresolved',{title:'ç¢ºèªãŒå¿…è¦ã§ã™',message:'',disableCommands:true,action:'refresh'});bridge.render();assert.equal(elements.action.listenerCount('click'),1);
-  bridge.detach();elements.action.dispatch('click');await Promise.resolve();assert.equal(calls,0);assert.equal(elements.action.listenerCount('click'),0);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal((await bridge.activate()).reason,'dom_bridge_inactive');
-});
-test('detaching fallback feedback releases its stale command lock', () => {
-  const {R}=setup(),commandUi=R.createCommandUiController('driver'),elements=feedbackDomElements();
-  const bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:async()=>({processed:true})});bridge.attach();commandUi.applyFeedback('driver',commandUi.snapshot().generation,'unresolved',{title:'å½¹å‰²ç”»é¢ã‚’é–‹å§‹ã§ãã¾ã›ã‚“',message:'å½¹å‰²é¸æŠžã¸æˆ»ã£ã¦ãã ã•ã„ã€‚',disableCommands:true,action:'reauth'});bridge.render();
-  assert.equal(elements.commandButtons[0].disabled,true);assert.equal(elements.commandButtons[0].attributes['aria-disabled'],'true');bridge.detach();
-  for(const button of elements.commandButtons){assert.equal(button.disabled,false);assert.equal(button.attributes['aria-disabled'],'false');}
-});
-test('delayed feedback completion cannot repaint after role-page exit', async () => {
-  const {R}=setup(),commandUi=R.createCommandUiController('driver'),elements=feedbackDomElements();let release;
-  const bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:()=>new Promise(resolve=>{release=resolve;})});bridge.attach();commandUi.applyFeedback('driver',commandUi.snapshot().generation,'reauth',{title:'å†ãƒ­ã‚°ã‚¤ãƒ³ãŒå¿…è¦ã§ã™',message:'èªè¨¼ã—ã¦ãã ã•ã„ã€‚',disableCommands:true,action:'reauth'});bridge.render();const pending=bridge.activate();await Promise.resolve();bridge.detach();release({processed:true,reason:'reauthentication_requested'});
-  assert.equal((await pending).reason,'dom_bridge_stale');assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(bridge.snapshot().attached,false);
-});
-test('same-role page re-entry uses a fresh DOM generation without duplicate listeners', async () => {
-  const {R}=setup(),commandUi=R.createCommandUiController('passenger'),elements=feedbackDomElements();let calls=0;
-  const bridge=R.createCommandFeedbackDomBridge({commandUi,elements,activate:async()=>{calls+=1;return {processed:true,reason:'refreshed'};}});bridge.attach();const first=bridge.snapshot().generation;bridge.detach();bridge.attach();const second=bridge.snapshot().generation;
-  commandUi.applyFeedback('passenger',commandUi.snapshot().generation,'unresolved',{title:'æœ€æ–°çŠ¶æ…‹ã‚’ç¢ºèª',message:'',disableCommands:true,action:'refresh'});bridge.render();elements.action.dispatch('click');await Promise.resolve();await Promise.resolve();assert.ok(second>first);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.action.addCount('click'),2);assert.equal(calls,1);assert.deepEqual(Object.keys(bridge.snapshot()).sort(),['attached','busy','generation','lastEvent']);
-});
-test('role-owned subscription failure reaches the prototype DOM through one listener', async () => {
-  const {R}=setup(),fixture=roleSubscriptionDomLifecycleFixture(R,{subscribe:async()=>{throw Error('offline');}});await fixture.lifecycle.enter('passenger');await fixture.lifecycle.idle();const record=fixture.subscriptions[0],state=record.bridge.snapshot();
-  assert.equal(record.elements.action.listenerCount('click'),1);assert.equal(record.elements.action.addCount('click'),1);assert.equal(record.elements.action.textContent,'é€šçŸ¥ã‚’å†æŽ¥ç¶šã™ã‚‹');assert.equal(record.elements.action.hidden,false);assert.equal(record.elements.commandButtons[0].disabled,true);assert.equal(record.elements.commandButtons[0].attributes['aria-disabled'],'true');assert.equal(state.action,'reconnect');assert.equal(state.commandsLocked,true);
-});
-test('prototype DOM reconnect path is single-flight through the active lifecycle generation', async () => {
-  const {R}=setup();let connections=0,release;
-  const fixture=roleSubscriptionDomLifecycleFixture(R,{subscribe:async()=>{connections+=1;if(connections===1)throw Error('offline');return()=>{};},verifyLatest:()=>new Promise(resolve=>{release=resolve;})});await fixture.lifecycle.enter('driver');await fixture.lifecycle.idle();const record=fixture.subscriptions[0];
-  const reconnect=record.bridge.activate();while(!release)await new Promise(resolve=>setImmediate(resolve));const duplicate=await record.bridge.activate();assert.equal(connections,2);assert.equal(duplicate.reason,'action_in_progress');assert.equal(record.elements.action.disabled,true);assert.equal(record.elements.box.attributes['aria-busy'],'true');
-  release({verified:true});assert.equal((await reconnect).processed,true);await record.bridge.idle();assert.equal(record.bridge.snapshot().commandsLocked,false);assert.equal(record.elements.action.hidden,true);assert.equal(record.elements.box.attributes['aria-busy'],'false');
-});
-test('role lifecycle exit detaches the prototype DOM before later clicks', async () => {
-  const {R}=setup();let connections=0;const fixture=roleSubscriptionDomLifecycleFixture(R,{subscribe:async()=>{connections+=1;throw Error('offline');}});await fixture.lifecycle.enter('passenger');await fixture.lifecycle.idle();const record=fixture.subscriptions[0];fixture.lifecycle.leave();
-  record.elements.action.dispatch('click');await Promise.resolve();assert.equal(connections,1);assert.equal(record.elements.action.listenerCount('click'),0);assert.equal(record.elements.box.hidden,true);assert.equal(record.bridge.snapshot().detached,true);assert.equal((await record.bridge.activate()).reason,'bridge_inactive');
-});
-test('role switch drops delayed prototype DOM recovery without repainting the new role', async () => {
-  const {R}=setup();let connections=0,release;
-  const fixture=roleSubscriptionDomLifecycleFixture(R,{subscribe:async({role})=>{connections+=1;if(role==='passenger'&&connections===1)throw Error('offline');return()=>{};},verifyLatest:({role})=>role==='passenger'?new Promise(resolve=>{release=resolve;}):Promise.resolve({verified:true})});await fixture.lifecycle.enter('passenger');await fixture.lifecycle.idle();const old=fixture.subscriptions[0],pending=old.bridge.activate();while(!release)await new Promise(resolve=>setImmediate(resolve));await fixture.lifecycle.enter('driver');const fresh=fixture.subscriptions[1];await fresh.bridge.idle();const freshRenders=fresh.renders.length;
-  release({verified:true});assert.equal((await pending).reason,'dom_bridge_stale');assert.equal(old.elements.action.listenerCount('click'),0);assert.equal(old.elements.box.hidden,true);assert.equal(fresh.elements.action.listenerCount('click'),1);assert.equal(fresh.renders.length,freshRenders);assert.equal(fresh.bridge.snapshot().commandsLocked,false);
-});
-test('same-role account re-entry replaces the prototype DOM subscription generation', async () => {
-  const {R}=setup();let connections=0;const fixture=roleSubscriptionDomLifecycleFixture(R,{subscribe:async()=>{connections+=1;throw Error('offline');}});await fixture.lifecycle.enter('passenger',{sessionBinding:{account:1}});await fixture.lifecycle.idle();const old=fixture.subscriptions[0];await fixture.lifecycle.enter('passenger',{sessionBinding:{account:2}});await fixture.lifecycle.idle();const fresh=fixture.subscriptions[1];
-  old.elements.action.dispatch('click');await Promise.resolve();assert.equal(connections,2);assert.equal(old.elements.action.listenerCount('click'),0);assert.equal(fresh.elements.action.listenerCount('click'),1);assert.equal(fresh.elements.action.textContent,'é€šçŸ¥ã‚’å†æŽ¥ç¶šã™ã‚‹');assert.equal(old.bridge.snapshot().detached,true);assert.equal(fresh.bridge.snapshot().detached,false);assert.ok(fresh.generation>old.generation);
-});
-test('role service provider accepts only the explicit six-method allowlist', async () => {
-  const {R}=setup();let calls=0;
-  const valid=allowedRoleServices({sessionForRole:()=>{calls+=1;return {accountRef:'passenger-a',viewerRole:'passenger'};}});
-  assert.equal(R.isAllowedRoleServiceProvider(valid),true);
-  assert.equal(R.isAllowedRoleServiceProvider({...valid,token:'secret'}),false);
-  const {verifyLatest,...missing}=valid;assert.equal(R.isAllowedRoleServiceProvider(missing),false);
-  const runtime=R.createRolePageRuntime({services:{...valid,endpoint:'https://example.invalid'},createLifecycle:()=>{throw Error('must not create');}});
-  assert.equal((await runtime.enter('home','passenger')).reason,'services_unavailable');assert.equal(calls,0);assert.equal(runtime.snapshot().serviceState,'unconfigured');
-});
-test('allowed service adapter assembles startup recovery, notification subscription and DOM once', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),documentState={visibilityState:'visible'},elements=feedbackDomElements(),navigations=[],contexts=[];let subscription,unsubscribes=0;
-  const services=allowedRoleServices({
-    readCurrentRide:async context=>{contexts.push(['read',context]);return {status:204};},
-    subscribeNotifications:async context=>{contexts.push(['subscribe',context]);subscription=context;return()=>{unsubscribes+=1;};},
-    handleNotificationHint:async context=>{contexts.push(['hint',context]);return {processed:true};}
-  });
-  const lifecycle=R.createRoleServiceLifecycle({services,elements,eventTarget,documentState,navigate:page=>navigations.push(page),storage:memoryStorage()});
-  const sessionBinding=Object.freeze({accountRef:'passenger-a',viewerRole:'passenger'}),entered=await lifecycle.enter('passenger',{sessionBinding});await lifecycle.idle();
-  assert.equal(entered.entered,true);assert.deepEqual(navigations,['home']);assert.deepEqual(contexts.map(([name])=>name),['subscribe','read']);assert.equal(elements.action.listenerCount('click'),1);
-  await subscription.onHint({type:'ride.changed',rideId:'fixture-ride',revision:2});await lifecycle.idle();assert.deepEqual(contexts.map(([name])=>name),['subscribe','read','hint']);
-  for(const [,context] of contexts){assert.equal(context.role,'passenger');assert.equal(context.generation,1);assert.equal(context.sessionBinding,sessionBinding);}
-  const state=lifecycle.snapshot(),encoded=JSON.stringify(state);assert.deepEqual(Object.keys(state).sort(),['activeRole','busy','entered','generation','lastAction']);assert.equal(encoded.includes('passenger-a'),false);assert.equal(encoded.includes('fixture-ride'),false);assert.equal(unsubscribes,0);
-});
-test('allowed service adapter aborts and detaches every injected entry on role exit', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements();let signal,unsubscribes=0;
-  const services=allowedRoleServices({subscribeNotifications:async context=>{signal=context.signal;return()=>{unsubscribes+=1;};}}),lifecycle=R.createRoleServiceLifecycle({services,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:()=>{},storage:memoryStorage()});
-  await lifecycle.enter('driver',{sessionBinding:{accountRef:'driver-a',viewerRole:'driver'}});await lifecycle.idle();assert.equal(signal.aborted,false);for(const type of ['visibilitychange','pageshow','online'])assert.equal(eventTarget.listenerCount(type),1);
-  const left=lifecycle.leave();assert.equal(left.left,true);assert.equal(signal.aborted,true);assert.equal(unsubscribes,1);assert.equal(elements.action.listenerCount('click'),0);for(const type of ['visibilitychange','pageshow','online'])assert.equal(eventTarget.listenerCount(type),0);
-});
-test('allowed service adapter drops delayed old-account recovery after a role switch', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),navigations=[];let releasePassenger;
-  const services=allowedRoleServices({readCurrentRide:context=>context.role==='passenger'?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({status:204})}),lifecycle=R.createRoleServiceLifecycle({services,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:page=>navigations.push(page),storage:memoryStorage()});
-  const old=lifecycle.enter('passenger',{sessionBinding:{accountRef:'passenger-a',viewerRole:'passenger'}});while(!releasePassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await lifecycle.enter('driver',{sessionBinding:{accountRef:'driver-b',viewerRole:'driver'}});releasePassenger({status:200,body:currentRideView('passenger')});const stale=await old;await lifecycle.idle();
-  assert.equal(fresh.entered,true);assert.equal(stale.reason,'stale_entry');assert.deepEqual(navigations,['driver-home']);assert.equal(lifecycle.snapshot().activeRole,'driver');const publicState=JSON.stringify(lifecycle.snapshot());assert.equal(publicState.includes('passenger-a'),false);assert.equal(publicState.includes('driver-b'),false);
-});
-test('router, runtime and adapter reconnect through one DOM action without duplicate work', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),session=Object.freeze({accountRef:'passenger-a',viewerRole:'passenger'});let page='role',role='passenger',connections=0,reads=0,verifications=0,unsubscribes=0,router;
-  const services=allowedRoleServices({sessionForRole:()=>session,readCurrentRide:async()=>{reads+=1;return {status:204};},subscribeNotifications:async()=>{connections+=1;if(connections===1)throw Error('offline');return()=>{unsubscribes+=1;};},verifyLatest:async()=>{verifications+=1;return {verified:true};}});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()})});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:target=>target==='role'?{page:'role',role:null}:{page:target,role},render:destination=>{page=destination.page;}});router.attach();
-  const entered=await router.navigate('home');await router.idle();assert.equal(entered.navigated,true);assert.equal(entered.reason,'entered');assert.equal(reads,1);assert.equal(connections,1);assert.equal(router.snapshot().revision,1);assert.equal(elements.action.textContent,'é€šçŸ¥ã‚’å†æŽ¥ç¶šã™ã‚‹');assert.equal(elements.action.listenerCount('click'),1);
-  elements.action.dispatch('click');elements.action.dispatch('click');await router.idle();assert.equal(connections,2);assert.equal(verifications,1);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);
-  role=null;await router.navigate('role');assert.equal(unsubscribes,1);assert.equal(elements.action.listenerCount('click'),0);for(const type of ['visibilitychange','pageshow','online'])assert.equal(eventTarget.listenerCount(type),0);
-});
-test('integrated same-role account switch detaches a pending reconnect before fresh entry', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),accountA=Object.freeze({accountRef:'passenger-a',viewerRole:'passenger'}),accountB=Object.freeze({accountRef:'passenger-b',viewerRole:'passenger'});let session=accountA,page='role',connections=0,unsubscribes=0,releaseOld,router;const accounts=[];
-  const services=allowedRoleServices({sessionForRole:()=>session,subscribeNotifications:async context=>{connections+=1;accounts.push(context.sessionBinding.accountRef);if(connections===1)throw Error('offline');return()=>{unsubscribes+=1;};},verifyLatest:context=>context.sessionBinding===accountA?new Promise(resolve=>{releaseOld=resolve;}):Promise.resolve({verified:true})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()})});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:target=>({page:target,role:'passenger'}),render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');await router.idle();
-  elements.action.dispatch('click');while(!releaseOld)await new Promise(resolve=>setImmediate(resolve));session=accountB;const fresh=await router.navigate('passenger-history');await Promise.resolve();await Promise.resolve();assert.equal(fresh.reason,'stale_navigation');assert.equal(router.snapshot().page,'home');assert.equal(runtime.snapshot().activeRole,'passenger');assert.deepEqual(accounts,['passenger-a','passenger-a','passenger-b']);assert.equal(unsubscribes,1);assert.equal(elements.action.listenerCount('click'),1);
-  const before={text:elements.action.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled};releaseOld({verified:true});await Promise.resolve();await Promise.resolve();await router.idle();assert.deepEqual({text:elements.action.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled},before);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot()]).includes('passenger-a'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot()]).includes('passenger-b'),false);
-});
-test('auth session loss tears down pending reconnect before safe fresh-session re-entry', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController(),accountA=Object.freeze({accountRef:'passenger-a',viewerRole:'passenger'}),accountB=Object.freeze({accountRef:'passenger-b',viewerRole:'passenger'});let session=accountA,page='role',connections=0,unsubscribes=0,releaseOld,router;const accounts=[];
-  const services=allowedRoleServices({sessionForRole:()=>session,subscribeNotifications:async context=>{connections+=1;accounts.push(context.sessionBinding.accountRef);if(connections===1)throw Error('offline');return()=>{unsubscribes+=1;};},verifyLatest:context=>context.sessionBinding===accountA?new Promise(resolve=>{releaseOld=resolve;}):Promise.resolve({verified:true})});
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:target=>target==='role'?{page:'role',role:null}:{page:target,role:'passenger'},render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');await router.idle();
-  elements.action.dispatch('click');while(!releaseOld)await new Promise(resolve=>setImmediate(resolve));session=null;eventTarget.dispatch('fiji:auth-session-changed',{detail:{sessionBinding:{accountRef:'attacker'}}});
-  while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.equal(unsubscribes,1);assert.equal(fallbackUi.snapshot().action,'reauth');assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);assert.match(elements.title.textContent,/èªè¨¼ã‚»ãƒƒã‚·ãƒ§ãƒ³/);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('attacker'),false);
-  releaseOld({verified:true});await Promise.resolve();await Promise.resolve();session=accountB;eventTarget.dispatch('fiji:auth-session-changed');await router.idle();assert.deepEqual(accounts,['passenger-a','passenger-a','passenger-b']);assert.equal(connections,3);assert.equal(runtime.snapshot().activeRole,'passenger');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot()]).includes('passenger-a'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot()]).includes('passenger-b'),false);
-});
-test('auth session listener is single, ignores event payload and is removed with the router', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),entries=[];let page='home';
-  const runtime={snapshot:()=>({}),enter:async(targetPage,role)=>{entries.push([targetPage,role]);return {entered:true,reason:'within_role'};},leave:()=>({left:true}),idle:async()=>({})};
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>({page:targetPage,role:'passenger'}),render:value=>{page=value.page;}});router.attach();router.attach();await router.navigate('home');target.dispatch('fiji:auth-session-changed',{detail:{role:'driver',sessionBinding:{accountRef:'injected'}}});await router.idle();
-  assert.equal(target.listenerCount('fiji:auth-session-changed'),1);assert.equal(target.addCount('fiji:auth-session-changed'),1);assert.deepEqual(entries,[['home','passenger'],['home','passenger']]);assert.equal(JSON.stringify(entries).includes('injected'),false);router.detach();assert.equal(target.listenerCount('fiji:auth-session-changed'),0);target.dispatch('fiji:auth-session-changed');await Promise.resolve();assert.equal(entries.length,2);
-});
-test('same-session entry joins the pending lifecycle and never reports success early', async () => {
-  const {R}=setup(),session=Object.freeze({accountRef:'passenger-a'});let release,calls=0,settled=false;
-  const lifecycle={snapshot:()=>({}),enter:()=>{calls+=1;return new Promise(resolve=>{release=resolve;});},leave:()=>({left:true}),idle:async()=>({})};
-  const runtime=R.createRolePageRuntime({services:allowedRoleServices({sessionForRole:()=>session}),createLifecycle:()=>lifecycle});
-  const first=runtime.enter('home','passenger');while(!release)await new Promise(resolve=>setImmediate(resolve));const joined=runtime.enter('passenger-history','passenger');joined.then(()=>{settled=true;});await Promise.resolve();
-  assert.equal(first,joined);assert.equal(calls,1);assert.equal(settled,false);assert.equal(runtime.snapshot().lastAction,'entry_joined');assert.equal(runtime.snapshot().busy,true);
-  release({entered:true,reason:'entered'});const [one,two]=await Promise.all([first,joined]);assert.equal(one.entered,true);assert.equal(two.entered,true);assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(runtime.snapshot().page,'passenger-history');
-});
-test('a delayed old-session rejection cannot stop a newer successful entry', async () => {
-  const {R}=setup(),accountA=Object.freeze({accountRef:'passenger-a'}),accountB=Object.freeze({accountRef:'passenger-b'});let session=accountA,rejectOld,leaves=0;
-  const lifecycle={snapshot:()=>({}),enter:(_role,{sessionBinding})=>sessionBinding===accountA?new Promise((_resolve,reject)=>{rejectOld=reject;}):Promise.resolve({entered:true,reason:'entered'}),leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
-  const runtime=R.createRolePageRuntime({services:allowedRoleServices({sessionForRole:()=>session}),createLifecycle:()=>lifecycle});
-  const old=runtime.enter('home','passenger');while(!rejectOld)await new Promise(resolve=>setImmediate(resolve));session=accountB;const fresh=await runtime.enter('passenger-history','passenger');rejectOld(Error('old session failed'));const stale=await old;
-  assert.equal(fresh.entered,true);assert.equal(stale.reason,'stale_entry');assert.equal(runtime.snapshot().activeRole,'passenger');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(leaves,0);assert.equal(JSON.stringify(runtime.snapshot()).includes('passenger-a'),false);assert.equal(JSON.stringify(runtime.snapshot()).includes('passenger-b'),false);
-});
-test('auth-change bursts coalesce before and during a pending fresh-session entry', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),accountA=Object.freeze({accountRef:'passenger-a'}),accountB=Object.freeze({accountRef:'passenger-b'});let session=accountA,page='role',releaseFresh,calls=0;
-  const lifecycle={snapshot:()=>({}),enter:(_role,{sessionBinding})=>{calls+=1;return sessionBinding===accountB?new Promise(resolve=>{releaseFresh=resolve;}):Promise.resolve({entered:true,reason:'entered'});},leave:()=>({left:true}),idle:async()=>({})};
-  const runtime=R.createRolePageRuntime({services:allowedRoleServices({sessionForRole:()=>session}),createLifecycle:()=>lifecycle});
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>({page:targetPage,role:'passenger'}),render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');session=accountB;
-  target.dispatch('fiji:auth-session-changed');target.dispatch('fiji:auth-session-changed');target.dispatch('fiji:auth-session-changed');while(!releaseFresh)await new Promise(resolve=>setImmediate(resolve));assert.equal(calls,2);assert.equal(router.snapshot().revision,2);assert.equal(router.snapshot().lastAction,'entering');
-  target.dispatch('fiji:auth-session-changed');target.dispatch('fiji:auth-session-changed');await Promise.resolve();assert.equal(calls,2);releaseFresh({entered:true,reason:'entered'});await router.idle();
-  assert.equal(calls,2);assert.equal(router.snapshot().revision,3);assert.equal(router.snapshot().lastAction,'within_role');assert.equal(runtime.snapshot().lastAction,'within_role');assert.equal(router.snapshot().busy,false);
-});
-test('role chooser invalidates a pending authentication sync without a late re-entry', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),accountA=Object.freeze({accountRef:'passenger-a'}),accountB=Object.freeze({accountRef:'passenger-b'});let session=accountA,page='role',releaseFresh,entries=0,leaves=0;
-  const lifecycle={snapshot:()=>({}),enter:(_role,{sessionBinding})=>{entries+=1;return sessionBinding===accountB?new Promise(resolve=>{releaseFresh=resolve;}):Promise.resolve({entered:true,reason:'entered'});},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
-  const runtime=R.createRolePageRuntime({services:allowedRoleServices({sessionForRole:()=>session}),createLifecycle:()=>lifecycle});
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'passenger'},render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');session=accountB;target.dispatch('fiji:auth-session-changed');while(!releaseFresh)await new Promise(resolve=>setImmediate(resolve));
-  const chosen=await router.navigate('role');assert.equal(chosen.reason,'role_chooser');assert.equal(router.snapshot().page,'role');assert.equal(router.snapshot().activeRole,null);assert.equal(runtime.snapshot().activeRole,null);target.dispatch('fiji:auth-session-changed');releaseFresh({entered:true,reason:'entered'});await router.idle();
-  assert.equal(entries,2);assert.equal(leaves,1);assert.equal(router.snapshot().page,'role');assert.equal(router.snapshot().lastAction,'role_chooser');assert.equal(runtime.snapshot().lastAction,'left');
-});
-test('cross-role navigation replaces a pending authentication sync with the new role only', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),passengerA=Object.freeze({accountRef:'passenger-a'}),passengerB=Object.freeze({accountRef:'passenger-b'}),driver=Object.freeze({accountRef:'driver-a'});let passengerSession=passengerA,page='role',releasePassenger;const entries=[];
-  const lifecycle={snapshot:()=>({}),enter:(role,{sessionBinding})=>{entries.push([role,sessionBinding]);return sessionBinding===passengerB?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({entered:true,reason:'entered'});},leave:()=>({left:true}),idle:async()=>({})};
-  const services=allowedRoleServices({sessionForRole:role=>role==='driver'?driver:passengerSession}),runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle});
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>({page:targetPage,role:targetPage.startsWith('driver')?'driver':'passenger'}),render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');passengerSession=passengerB;target.dispatch('fiji:auth-session-changed');while(!releasePassenger)await new Promise(resolve=>setImmediate(resolve));
-  const switched=await router.navigate('driver-home');assert.equal(switched.navigated,true);assert.equal(runtime.snapshot().activeRole,'driver');target.dispatch('fiji:auth-session-changed');await Promise.resolve();releasePassenger({entered:true,reason:'entered'});await router.idle();
-  assert.equal(entries.length,3);assert.deepEqual(entries.map(([role])=>role),['passenger','passenger','driver']);assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().lastAction,'within_role');assert.equal(JSON.stringify([router.snapshot(),runtime.snapshot()]).includes('passenger-'),false);
-});
-test('switching to a role without a session stops there and never restores the old role', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),passenger=Object.freeze({accountRef:'passenger-a'}),views=[];let entries=0,leaves=0,page='role';
-  const lifecycle={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:true,reason:'entered'};},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
-  const services=allowedRoleServices({sessionForRole:role=>role==='passenger'?passenger:null}),runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle,renderUnavailable:view=>views.push(view)});
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:targetPage.startsWith('driver')?'driver':'passenger'},render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');const failed=await router.navigate('driver-home');
-  assert.equal(failed.navigated,false);assert.equal(failed.reason,'session_unavailable');assert.equal(entries,1);assert.equal(leaves,1);assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(views.at(-1).role,'driver');assert.equal(views.at(-1).action,'reauth');assert.equal(views.at(-1).disableCommands,true);
-  await router.navigate('role');assert.equal(router.snapshot().activeRole,null);assert.equal(runtime.snapshot().activeRole,null);assert.notEqual(router.snapshot().page,'home');
-});
-test('a failed target-role entry remains locked even when an auth sync joined it', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),passenger=Object.freeze({accountRef:'passenger-a'}),driver=Object.freeze({accountRef:'driver-a'}),views=[];let page='role',rejectDriver,entries=0,leaves=0;
-  const lifecycle={snapshot:()=>({}),enter:(role)=>{entries+=1;return role==='driver'?new Promise((_resolve,reject)=>{rejectDriver=reject;}):Promise.resolve({entered:true,reason:'entered'});},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
-  const services=allowedRoleServices({sessionForRole:role=>role==='driver'?driver:passenger}),runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle,renderUnavailable:view=>views.push(view)});
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:targetPage.startsWith('driver')?'driver':'passenger'},render:destination=>{page=destination.page;}});router.attach();await router.navigate('home');const switching=router.navigate('driver-home');while(!rejectDriver)await new Promise(resolve=>setImmediate(resolve));target.dispatch('fiji:auth-session-changed');await Promise.resolve();assert.equal(entries,2);rejectDriver(Error('driver startup failed'));await switching;await router.idle();
-  assert.equal(entries,2);assert.equal(leaves,1);assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');assert.equal(router.snapshot().lastAction,'entry_failed');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entry_failed');assert.equal(views.length,1);assert.equal(views[0].role,'driver');assert.equal(views[0].action,'reauth');assert.match(views[0].title,/é–‹å§‹ã§ãã¾ã›ã‚“/);assert.equal(views[0].disableCommands,true);
-  await router.navigate('role');assert.equal(router.snapshot().activeRole,null);assert.equal(runtime.snapshot().activeRole,null);
-});
-test('failed target-role entry returns through the visible action and safely re-enters', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),session=Object.freeze({accountRef:'driver-a',viewerRole:'driver'});let page='role',attempts=0,leaves=0,router;
-  const lifecycle={snapshot:()=>({attempts}),enter:async()=>{attempts+=1;return attempts===1?{entered:false,reason:'entry_rejected'}:{entered:true,reason:'entered'};},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services:allowedRoleServices({sessionForRole:()=>session}),createLifecycle:()=>lifecycle,renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();
-  const failed=await router.navigate('driver-home');assert.equal(failed.reason,'entry_failed');assert.equal(attempts,1);assert.equal(elements.title.textContent,'å½¹å‰²ç”»é¢ã‚’é–‹å§‹ã§ãã¾ã›ã‚“');assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);const failedGeneration=fallbackDom.snapshot().generation;
-  const returned=await fallbackDom.activate();await router.idle();assert.equal(returned.reason,'dom_bridge_stale');assert.equal(router.snapshot().lastAction,'role_chooser');assert.equal(page,'role');assert.equal(runtime.snapshot().activeRole,null);assert.equal(fallbackDom.snapshot().attached,false);assert.equal(elements.action.listenerCount('click'),0);assert.equal(elements.commandButtons[0].disabled,false);
-  const restored=await router.navigate('driver-home');await router.idle();assert.equal(restored.navigated,true);assert.equal(restored.reason,'entered');assert.equal(attempts,2);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.ok(fallbackDom.snapshot().generation>failedGeneration);assert.ok(leaves>=2);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-a'),false);
-});
-test('a repeated explicit entry failure stays single and never becomes an auth retry loop', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),session=Object.freeze({accountRef:'driver-a',viewerRole:'driver'});let page='role',attempts=0,unavailable=0,router;
-  const lifecycle={snapshot:()=>({}),enter:async()=>{attempts+=1;return {entered:false,reason:'entry_rejected'};},leave:()=>({left:true}),idle:async()=>({})};
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services:allowedRoleServices({sessionForRole:()=>session}),createLifecycle:()=>lifecycle,renderUnavailable:view=>{unavailable+=1;fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();
-  assert.equal((await router.navigate('driver-home')).reason,'entry_failed');target.dispatch('fiji:auth-session-changed');target.dispatch('fiji:auth-session-changed');await router.idle();assert.equal(attempts,1);assert.equal(unavailable,1);assert.equal(router.snapshot().lastAction,'entry_failed');
-  assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');await router.idle();assert.equal(router.snapshot().page,'role');assert.equal((await router.navigate('driver-home')).reason,'entry_failed');const failedRevision=router.snapshot().revision;
-  target.dispatch('fiji:auth-session-changed');target.dispatch('fiji:auth-session-changed');target.dispatch('fiji:auth-session-changed');await router.idle();assert.equal(attempts,2);assert.equal(unavailable,2);assert.equal(router.snapshot().revision,failedRevision);assert.equal(router.snapshot().lastAction,'entry_failed');assert.equal(runtime.snapshot().lastAction,'entry_failed');assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.action.addCount('click'),2);assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.commandButtons[0].disabled,true);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-a'),false);
-});
-test('double role selection and duplicate hash entry share one lifecycle subscription', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),session=Object.freeze({accountRef:'driver-a',viewerRole:'driver'});let page='role',reads=0,connections=0,releaseRead,router;
-  const services=allowedRoleServices({sessionForRole:()=>session,readCurrentRide:async()=>{reads+=1;return new Promise(resolve=>{releaseRead=resolve;});},subscribeNotifications:async()=>{connections+=1;return()=>{};}});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()})});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();
-  const first=router.navigate('driver-home');while(!releaseRead||connections!==1)await new Promise(resolve=>setImmediate(resolve));const second=router.navigate('driver-home');eventTarget.dispatch('hashchange');eventTarget.dispatch('hashchange');await Promise.resolve();assert.equal(reads,1);assert.equal(connections,1);assert.equal(runtime.snapshot().busy,true);
-  releaseRead({status:204});const [firstResult,secondResult]=await Promise.all([first,second]);await router.idle();assert.equal(firstResult.reason,'stale_navigation');assert.equal(secondResult.reason,'stale_navigation');assert.equal(reads,1);assert.equal(connections,1);assert.equal(runtime.snapshot().revision,1);assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');assert.equal(router.snapshot().lastAction,'entered');assert.equal(elements.action.listenerCount('click'),1);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot()]).includes('driver-a'),false);
-});
-test('account change during coalesced entry discards the old read and subscription', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),accountA=Object.freeze({accountRef:'driver-a',viewerRole:'driver'}),accountB=Object.freeze({accountRef:'driver-b',viewerRole:'driver'});let page='role',session=accountA,releaseOld,router;
-  const reads=[],connections=[],disconnections=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return sessionBinding===accountA?new Promise(resolve=>{releaseOld=resolve;}):{status:204};},
-    subscribeNotifications:async({sessionBinding})=>{connections.push(sessionBinding.accountRef);return()=>disconnections.push(sessionBinding.accountRef);}
-  });
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()})});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();
-  const oldEntry=router.navigate('driver-home');while(!releaseOld||connections.length!==1)await new Promise(resolve=>setImmediate(resolve));session=accountB;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');
-  while(reads.length!==2||connections.length!==2)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(reads,['driver-a','driver-b']);assert.deepEqual(connections,['driver-a','driver-b']);assert.deepEqual(disconnections,['driver-a']);assert.equal(runtime.snapshot().activeRole,'driver');
-  releaseOld({status:200,body:currentRideView('driver')});const oldResult=await oldEntry;await router.idle();assert.equal(oldResult.reason,'stale_navigation');assert.deepEqual(reads,['driver-a','driver-b']);assert.deepEqual(connections,['driver-a','driver-b']);assert.deepEqual(disconnections,['driver-a']);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');assert.equal(elements.action.listenerCount('click'),1);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot()]).includes('driver-a'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot()]).includes('driver-b'),false);
-});
-test('replacement entry stops both account generations when the new session disappears', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accountA=Object.freeze({accountRef:'driver-a',viewerRole:'driver'}),accountB=Object.freeze({accountRef:'driver-b',viewerRole:'driver'});let page='role',session=accountA,releaseA,releaseB,unavailable=0,router;
-  const reads=[],connections=[],disconnections=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return new Promise(resolve=>{if(sessionBinding===accountA)releaseA=resolve;else releaseB=resolve;});},
-    subscribeNotifications:async({sessionBinding})=>{connections.push(sessionBinding.accountRef);return()=>disconnections.push(sessionBinding.accountRef);}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{unavailable+=1;fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();
-  const oldEntry=router.navigate('driver-home');while(!releaseA||connections.length!==1)await new Promise(resolve=>setImmediate(resolve));session=accountB;eventTarget.dispatch('fiji:auth-session-changed');while(!releaseB||connections.length!==2)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(disconnections,['driver-a']);
-  session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.equal(unavailable,1);assert.deepEqual(disconnections,['driver-a','driver-b']);assert.deepEqual(reads,['driver-a','driver-b']);assert.deepEqual(connections,['driver-a','driver-b']);assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.action.hidden,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);
-  releaseB({status:200,body:currentRideView('driver')});releaseA({status:200,body:currentRideView('driver')});const oldResult=await oldEntry;await router.idle();assert.equal(oldResult.reason,'stale_navigation');assert.equal(runtime.snapshot().lastAction,'session_unavailable');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().lastAction,'session_unavailable');assert.equal(router.snapshot().page,'driver-home');assert.deepEqual(reads,['driver-a','driver-b']);assert.deepEqual(connections,['driver-a','driver-b']);assert.deepEqual(disconnections,['driver-a','driver-b']);assert.equal(unavailable,1);assert.equal(elements.action.listenerCount('click'),1);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-a'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-b'),false);
-});
-test('reauthentication round trip admits only a third session after two stale entries', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accountA=Object.freeze({accountRef:'driver-a',viewerRole:'driver'}),accountB=Object.freeze({accountRef:'driver-b',viewerRole:'driver'}),accountC=Object.freeze({accountRef:'driver-c',viewerRole:'driver'});let page='role',session=accountA,releaseA,releaseB,unavailable=0,router;
-  const reads=[],connections=[],disconnections=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);if(sessionBinding===accountC)return {status:204};return new Promise(resolve=>{if(sessionBinding===accountA)releaseA=resolve;else releaseB=resolve;});},
-    subscribeNotifications:async({sessionBinding})=>{connections.push(sessionBinding.accountRef);return()=>disconnections.push(sessionBinding.accountRef);}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{unavailable+=1;fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();
-  const oldEntry=router.navigate('driver-home');while(!releaseA||connections.length!==1)await new Promise(resolve=>setImmediate(resolve));session=accountB;eventTarget.dispatch('fiji:auth-session-changed');while(!releaseB||connections.length!==2)await new Promise(resolve=>setImmediate(resolve));session=null;eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.equal(unavailable,1);assert.deepEqual(disconnections,['driver-a','driver-b']);
-  const chooser=await fallbackDom.activate();assert.equal(chooser.reason,'dom_bridge_stale');assert.equal(router.snapshot().page,'role');assert.equal(runtime.snapshot().activeRole,null);assert.equal(elements.action.listenerCount('click'),0);assert.equal(elements.commandButtons[0].disabled,false);
-  session=accountC;const fresh=await router.navigate('driver-home');assert.equal(fresh.navigated,true);assert.equal(fresh.reason,'entered');assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.deepEqual(connections,['driver-a','driver-b','driver-c']);assert.deepEqual(disconnections,['driver-a','driver-b']);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().page,'driver-home');
-  releaseB({status:200,body:currentRideView('driver')});releaseA({status:200,body:currentRideView('driver')});const oldResult=await oldEntry;await router.idle();assert.equal(oldResult.reason,'stale_navigation');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.deepEqual(connections,['driver-a','driver-b','driver-c']);assert.deepEqual(disconnections,['driver-a','driver-b']);assert.equal(unavailable,1);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-a'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-b'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-c'),false);
-});
-test('repeated logout and reauthentication keep only the current subscription and listeners', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b','driver-c'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],unavailable=0,router;
-  const reads=[],connections=[],disconnections=[];
-  const services=allowedRoleServices({sessionForRole:()=>session,readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},subscribeNotifications:async({sessionBinding})=>{connections.push(sessionBinding.accountRef);return()=>disconnections.push(sessionBinding.accountRef);}});
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{unavailable+=1;fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  for(let index=0;index<2;index+=1){session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');await router.idle();assert.equal(runtime.snapshot().lastAction,'session_unavailable');assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.commandButtons[0].disabled,true);assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');assert.equal(router.snapshot().page,'role');assert.equal(elements.action.listenerCount('click'),0);assert.equal(elements.commandButtons[0].disabled,false);session=accounts[index+1];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,false);}
-  assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.deepEqual(connections,['driver-a','driver-b','driver-c']);assert.deepEqual(disconnections,['driver-a','driver-b']);assert.equal(unavailable,2);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);assert.equal(eventTarget.addCount('fiji:auth-session-changed'),1);for(const type of ['visibilitychange','pageshow','online'])assert.equal(eventTarget.listenerCount(type),1);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.action.addCount('click'),5);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().lastAction,'entered');assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-a'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-b'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-c'),false);
-});
-test('saved callbacks from prior authentication cycles stop before authorized notification handling', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b','driver-c'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router;
-  const reads=[],subscriptions=[],disconnections=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);return {processed:true};}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  for(let index=0;index<2;index+=1){session=null;eventTarget.dispatch('fiji:auth-session-changed');await router.idle();assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');session=accounts[index+1];assert.equal((await router.navigate('driver-home')).reason,'entered');}
-  assert.equal(subscriptions.length,3);assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.deepEqual(disconnections,['driver-a','driver-b']);
-  const hint={type:'ride.changed',rideId:'fixture-ride',revision:9},oldA=await subscriptions[0].onHint(hint),oldB=await subscriptions[1].onHint(hint);
-  assert.equal(oldA.reason,'subscription_inactive');assert.equal(oldB.reason,'subscription_inactive');assert.deepEqual(handled,[]);assert.deepEqual(reads,['driver-a','driver-b','driver-c']);
-  const current=await subscriptions[2].onHint(hint);await router.idle();assert.equal(current.processed,true);assert.deepEqual(handled,[['driver-c',9]]);assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().page,'driver-home');assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot(),handled]).includes('driver-a'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot(),handled]).includes('driver-b'),false);
-});
-test('current disconnect wins a stale callback race and reconnects once', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b','driver-c'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,verifications=0;
-  const reads=[],subscriptions=[],disconnections=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:async({sessionBinding})=>{handled.push(sessionBinding.accountRef);return {processed:true};},
-    verifyLatest:async({sessionBinding})=>{verifications+=1;assert.equal(sessionBinding,accounts[2]);return {verified:true};}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  for(let index=0;index<2;index+=1){session=null;eventTarget.dispatch('fiji:auth-session-changed');await router.idle();await fallbackDom.activate();session=accounts[index+1];assert.equal((await router.navigate('driver-home')).reason,'entered');}
-  const disconnected=subscriptions[2].onDisconnect(),staleA=subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:10}),staleB=subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:10});
-  assert.equal(disconnected.reason,'subscription_disconnected');assert.equal((await staleA).reason,'subscription_inactive');assert.equal((await staleB).reason,'subscription_inactive');assert.deepEqual(handled,[]);assert.deepEqual(disconnections,['driver-a','driver-b','driver-c']);assert.equal(elements.action.textContent,'é€šçŸ¥ã‚’å†æŽ¥ç¶šã™ã‚‹');assert.equal(elements.action.hidden,false);assert.equal(elements.commandButtons[0].disabled,true);
-  elements.action.dispatch('click');elements.action.dispatch('click');await router.idle();assert.equal(subscriptions.length,4);assert.equal(subscriptions[3].sessionBinding,accounts[2]);assert.equal(verifications,1);assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.deepEqual(handled,[]);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().page,'driver-home');assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-a'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-b'),false);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes('driver-c'),false);
-});
-test('account switch during reconnect verification keeps only the replacement session', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b','driver-c','driver-d'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,releaseVerification;
-  const reads=[],subscriptions=[],disconnections=[],verifications=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:async({sessionBinding})=>{handled.push(sessionBinding.accountRef);return {processed:true};},
-    verifyLatest:({sessionBinding})=>{verifications.push(sessionBinding.accountRef);return sessionBinding===accounts[2]?new Promise(resolve=>{releaseVerification=resolve;}):Promise.resolve({verified:true});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  for(let index=0;index<2;index+=1){session=null;eventTarget.dispatch('fiji:auth-session-changed');await router.idle();await fallbackDom.activate();session=accounts[index+1];assert.equal((await router.navigate('driver-home')).reason,'entered');}
-  subscriptions[2].onDisconnect();elements.action.dispatch('click');while(!releaseVerification)await new Promise(resolve=>setImmediate(resolve));assert.equal(subscriptions.length,4);assert.deepEqual(verifications,['driver-c']);assert.equal(elements.commandButtons[0].disabled,true);
-  session=accounts[3];eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(subscriptions.length!==5||reads.length!==4)await new Promise(resolve=>setImmediate(resolve));assert.equal(subscriptions[4].sessionBinding,accounts[3]);assert.deepEqual(reads,['driver-a','driver-b','driver-c','driver-d']);assert.deepEqual(disconnections,['driver-a','driver-b','driver-c','driver-c']);assert.equal(elements.commandButtons[0].disabled,false);
-  releaseVerification({verified:true});await new Promise(resolve=>setImmediate(resolve));await router.idle();assert.equal((await subscriptions[3].onHint({type:'ride.changed',rideId:'fixture-ride',revision:11})).reason,'subscription_inactive');const current=await subscriptions[4].onHint({type:'ride.changed',rideId:'fixture-ride',revision:11});assert.equal(current.processed,true);assert.deepEqual(handled,['driver-d']);assert.deepEqual(verifications,['driver-c']);assert.equal(subscriptions.length,5);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().lastAction,'entered');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('replacement notification wins over delayed old reconnect verification', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,releaseVerification,releaseHint;
-  const reads=[],subscriptions=[],disconnections=[],verifications=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);return new Promise(resolve=>{releaseHint=resolve;});},
-    verifyLatest:({sessionBinding})=>{verifications.push(sessionBinding.accountRef);return new Promise(resolve=>{releaseVerification=resolve;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  subscriptions[0].onDisconnect();elements.action.dispatch('click');while(!releaseVerification)await new Promise(resolve=>setImmediate(resolve));assert.equal(subscriptions.length,2);assert.deepEqual(verifications,['driver-a']);assert.equal(elements.commandButtons[0].disabled,true);
-  session=accounts[1];eventTarget.dispatch('fiji:auth-session-changed');while(subscriptions.length!==3||reads.length!==2)await new Promise(resolve=>setImmediate(resolve));assert.equal(subscriptions[2].sessionBinding,accounts[1]);assert.deepEqual(reads,['driver-a','driver-b']);assert.deepEqual(disconnections,['driver-a','driver-a']);assert.equal(elements.commandButtons[0].disabled,false);
-  const currentHint=subscriptions[2].onHint({type:'ride.changed',rideId:'fixture-ride',revision:12});while(!releaseHint)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(handled,[['driver-b',12]]);
-  releaseVerification({verified:true});await new Promise(resolve=>setImmediate(resolve));assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:12})).reason,'subscription_inactive');assert.equal(subscriptions.length,3);assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().lastAction,'entered');
-  releaseHint({processed:true,reason:'notification_applied'});const current=await currentHint;await router.idle();assert.equal(current.processed,true);assert.equal(current.reason,'notification_applied');assert.deepEqual(handled,[['driver-b',12]]);assert.deepEqual(verifications,['driver-a']);assert.equal(elements.action.listenerCount('click'),1);for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('authentication loss discards a pending notification and renders one reauthentication action', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),account=Object.freeze({accountRef:'driver-a',viewerRole:'driver'});let page='role',session=account,router,releaseHint;
-  const reads=[],subscriptions=[],disconnections=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);return new Promise(resolve=>{releaseHint=resolve;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  const pending=subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:13});while(!releaseHint)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(handled,[['driver-a',13]]);
-  session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(disconnections,['driver-a']);assert.deepEqual(reads,['driver-a']);assert.equal(subscriptions.length,1);assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.action.hidden,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);assert.match(elements.title.textContent,/èªè¨¼ã‚»ãƒƒã‚·ãƒ§ãƒ³/);assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:14})).reason,'subscription_inactive');
-  const stopped={title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,disabled:elements.commandButtons[0].disabled};releaseHint({processed:true,reason:'notification_applied'});const stale=await pending;await router.idle();assert.equal(stale.processed,false);assert.equal(stale.reason,'bridge_stale');assert.deepEqual({title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,disabled:elements.commandButtons[0].disabled},stopped);assert.deepEqual(handled,[['driver-a',13]]);assert.equal(runtime.snapshot().lastAction,'session_unavailable');assert.equal(router.snapshot().lastAction,'session_unavailable');assert.equal(router.snapshot().page,'driver-home');assert.equal(fallbackUi.snapshot().action,'reauth');assert.equal(elements.action.listenerCount('click'),1);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('fresh reentry stays active when a pre-logout notification completes late', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,releaseOldHint;
-  const reads=[],subscriptions=[],disconnections=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);return sessionBinding===accounts[0]?new Promise(resolve=>{releaseOldHint=resolve;}):Promise.resolve({processed:true,reason:'notification_applied'});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  const oldHint=subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:15});while(!releaseOldHint)await new Promise(resolve=>setImmediate(resolve));session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(disconnections,['driver-a']);assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);
-  assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');assert.equal(router.snapshot().page,'role');assert.equal(runtime.snapshot().activeRole,null);assert.equal(elements.action.listenerCount('click'),0);session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);assert.equal(subscriptions[1].sessionBinding,accounts[1]);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);
-  const current=await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:16});assert.equal(current.processed,true);assert.equal(current.reason,'notification_applied');assert.deepEqual(handled,[['driver-a',15],['driver-b',16]]);const currentView={boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};
-  releaseOldHint({processed:true,reason:'notification_applied'});const stale=await oldHint;await router.idle();assert.equal(stale.processed,false);assert.equal(stale.reason,'bridge_stale');assert.deepEqual({boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},currentView);assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);assert.deepEqual(disconnections,['driver-a']);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().lastAction,'entered');assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('stale notification failure cannot interrupt a pending fresh-session notification', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,rejectOldHint,releaseNewHint;
-  const reads=[],subscriptions=[],disconnections=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);return sessionBinding===accounts[0]?new Promise((_resolve,reject)=>{rejectOldHint=reject;}):new Promise(resolve=>{releaseNewHint=resolve;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  const oldHint=subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:17});while(!rejectOldHint)await new Promise(resolve=>setImmediate(resolve));session=null;eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);assert.deepEqual(disconnections,['driver-a']);
-  const newHint=subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:18});while(!releaseNewHint)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(handled,[['driver-a',17],['driver-b',18]]);const freshView={boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};
-  rejectOldHint(Error('old notification failed'));const stale=await oldHint;await new Promise(resolve=>setImmediate(resolve));assert.equal(stale.processed,false);assert.equal(stale.reason,'bridge_stale');assert.deepEqual({boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},freshView);assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');
-  releaseNewHint({processed:true,reason:'notification_applied'});const current=await newHint;await router.idle();assert.equal(current.processed,true);assert.equal(current.reason,'notification_applied');assert.deepEqual(handled,[['driver-a',17],['driver-b',18]]);assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);assert.deepEqual(disconnections,['driver-a']);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('current notification failure locks only the active session and offers one explicit refresh', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),account=Object.freeze({accountRef:'driver-current',viewerRole:'driver'});let page='role',router,verifications=0;
-  const reads=[],subscriptions=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>account,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>{};},
-    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);throw Error('notification transport failed');},
-    verifyLatest:async({sessionBinding})=>{verifications+=1;assert.equal(sessionBinding,account);return {verified:true};}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  const failed=await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:19});assert.equal(failed.processed,false);assert.equal(failed.reason,'notification_failed');assert.deepEqual(handled,[['driver-current',19]]);assert.match(elements.title.textContent,/é‹è¡Œã®æœ€æ–°çŠ¶æ…‹ã‚’å–å¾—ã§ãã¾ã›ã‚“/);assert.equal(elements.action.textContent,'æœ€æ–°çŠ¶æ…‹ã‚’ç¢ºèªã™ã‚‹');assert.equal(elements.action.hidden,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);
-  elements.action.dispatch('click');elements.action.dispatch('click');await router.idle();assert.equal(verifications,1);assert.deepEqual(reads,['driver-current']);assert.equal(subscriptions.length,1);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().lastAction,'entered');assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('failed explicit refresh after a notification failure stays locked without an automatic loop', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),account=Object.freeze({accountRef:'driver-current',viewerRole:'driver'});let page='role',router,verifications=0;
-  const reads=[],subscriptions=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>account,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>{};},
-    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);throw Error('notification transport failed');},
-    verifyLatest:async({sessionBinding})=>{verifications+=1;assert.equal(sessionBinding,account);throw Error('verification transport failed');}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  const failed=await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:20});assert.equal(failed.reason,'notification_failed');assert.equal(elements.action.textContent,'æœ€æ–°çŠ¶æ…‹ã‚’ç¢ºèªã™ã‚‹');assert.equal(elements.action.hidden,false);assert.equal(elements.commandButtons[0].disabled,true);
-  elements.action.dispatch('click');elements.action.dispatch('click');await router.idle();await new Promise(resolve=>setImmediate(resolve));assert.equal(verifications,1);assert.deepEqual(handled,[['driver-current',20]]);assert.deepEqual(reads,['driver-current']);assert.equal(subscriptions.length,1);assert.match(elements.title.textContent,/é‹è¡Œã®æœ€æ–°çŠ¶æ…‹ã‚’ç¢ºèªã§ãã¾ã›ã‚“/);assert.match(elements.message.textContent,/è‡ªå‹•ç¢ºèªã¯åœæ­¢ã—ã¾ã—ãŸ/);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,true);assert.equal(elements.action.listenerCount('click'),1);
-  elements.action.dispatch('click');await router.idle();assert.equal(verifications,1);assert.equal(subscriptions.length,1);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,true);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('role chooser clears a terminal notification failure before fresh-session reentry', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,verifications=0;
-  const reads=[],subscriptions=[],disconnections=[],handled=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);if(sessionBinding===accounts[0])throw Error('notification transport failed');return {processed:true,reason:'notification_applied'};},
-    verifyLatest:async({sessionBinding})=>{verifications+=1;assert.equal(sessionBinding,accounts[0]);throw Error('verification transport failed');}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:21})).reason,'notification_failed');elements.action.dispatch('click');await router.idle();assert.equal(verifications,1);assert.match(elements.message.textContent,/è‡ªå‹•ç¢ºèªã¯åœæ­¢ã—ã¾ã—ãŸ/);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,true);
-  assert.equal((await router.navigate('role')).reason,'role_chooser');assert.equal(runtime.snapshot().activeRole,null);assert.equal(router.snapshot().page,'role');assert.deepEqual(disconnections,['driver-a']);assert.equal(elements.box.hidden,true);assert.equal(elements.action.listenerCount('click'),0);assert.equal(elements.commandButtons[0].disabled,false);
-  session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);assert.equal(subscriptions[1].sessionBinding,accounts[1]);assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:22})).reason,'subscription_inactive');const current=await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:22});await router.idle();assert.equal(current.processed,true);assert.equal(current.reason,'notification_applied');assert.deepEqual(handled,[['driver-a',21],['driver-b',22]]);assert.equal(verifications,1);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().page,'driver-home');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('fresh-session notification failure owns one new recovery action after terminal reentry', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router;
-  const reads=[],subscriptions=[],disconnections=[],handled=[],verifications=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);throw Error('notification transport failed');},
-    verifyLatest:async({sessionBinding})=>{verifications.push(sessionBinding.accountRef);if(sessionBinding===accounts[0])throw Error('verification transport failed');return {verified:true};}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:23})).reason,'notification_failed');elements.action.dispatch('click');await router.idle();assert.deepEqual(verifications,['driver-a']);assert.match(elements.message.textContent,/è‡ªå‹•ç¢ºèªã¯åœæ­¢ã—ã¾ã—ãŸ/);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,true);
-  assert.equal((await router.navigate('role')).reason,'role_chooser');assert.deepEqual(disconnections,['driver-a']);assert.equal(elements.box.hidden,true);assert.equal(elements.action.listenerCount('click'),0);assert.equal(elements.commandButtons[0].disabled,false);
-  session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);const freshFailure=await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:24});assert.equal(freshFailure.reason,'notification_failed');assert.match(elements.title.textContent,/é‹è¡Œã®æœ€æ–°çŠ¶æ…‹ã‚’å–å¾—ã§ãã¾ã›ã‚“/);assert.equal(elements.action.textContent,'æœ€æ–°çŠ¶æ…‹ã‚’ç¢ºèªã™ã‚‹');assert.equal(elements.action.hidden,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);
-  const freshView={title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:25})).reason,'subscription_inactive');assert.deepEqual({title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},freshView);
-  elements.action.dispatch('click');elements.action.dispatch('click');await router.idle();assert.deepEqual(verifications,['driver-a','driver-b']);assert.deepEqual(handled,[['driver-a',23],['driver-b',24]]);assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);assert.deepEqual(disconnections,['driver-a']);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().page,'driver-home');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('stale callback cannot interrupt a fresh-session notification verification', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,releaseFreshVerification;
-  const reads=[],subscriptions=[],disconnections=[],handled=[],verifications=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);throw Error('notification transport failed');},
-    verifyLatest:async({sessionBinding})=>{verifications.push(sessionBinding.accountRef);if(sessionBinding===accounts[0])throw Error('verification transport failed');return new Promise(resolve=>{releaseFreshVerification=()=>resolve({verified:true});});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:25})).reason,'notification_failed');elements.action.dispatch('click');await router.idle();assert.deepEqual(verifications,['driver-a']);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,true);
-  assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(disconnections,['driver-a']);assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);
-  assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:26})).reason,'notification_failed');elements.action.dispatch('click');elements.action.dispatch('click');while(!releaseFreshVerification)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(verifications,['driver-a','driver-b']);assert.equal(elements.commandButtons[0].disabled,true);assert.equal(elements.action.listenerCount('click'),1);
-  const pendingView={title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};const stale=await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:27});assert.equal(stale.processed,false);assert.equal(stale.reason,'subscription_inactive');assert.deepEqual({title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},pendingView);assert.deepEqual(handled,[['driver-a',25],['driver-b',26]]);assert.deepEqual(verifications,['driver-a','driver-b']);assert.equal(subscriptions.length,2);
-  releaseFreshVerification();await router.idle();assert.deepEqual(verifications,['driver-a','driver-b']);assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);assert.deepEqual(disconnections,['driver-a']);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().page,'driver-home');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('stale callback cannot alter a fresh-session verification failure', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,rejectFreshVerification;
-  const reads=[],subscriptions=[],disconnections=[],handled=[],verifications=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);throw Error('notification transport failed');},
-    verifyLatest:async({sessionBinding})=>{verifications.push(sessionBinding.accountRef);if(sessionBinding===accounts[0])throw Error('verification transport failed');return new Promise((_resolve,reject)=>{rejectFreshVerification=reject;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:28})).reason,'notification_failed');elements.action.dispatch('click');await router.idle();assert.deepEqual(verifications,['driver-a']);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,true);
-  assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(disconnections,['driver-a']);assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);
-  assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:29})).reason,'notification_failed');elements.action.dispatch('click');elements.action.dispatch('click');while(!rejectFreshVerification)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(verifications,['driver-a','driver-b']);assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:30})).reason,'subscription_inactive');assert.deepEqual(handled,[['driver-a',28],['driver-b',29]]);assert.equal(elements.commandButtons[0].disabled,true);
-  rejectFreshVerification(Error('fresh verification transport failed'));await router.idle();await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(verifications,['driver-a','driver-b']);assert.match(elements.title.textContent,/é‹è¡Œã®æœ€æ–°çŠ¶æ…‹ã‚’ç¢ºèªã§ãã¾ã›ã‚“/);assert.match(elements.message.textContent,/è‡ªå‹•ç¢ºèªã¯åœæ­¢ã—ã¾ã—ãŸ/);assert.equal(elements.action.hidden,true);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);
-  const stopped={title:elements.title.textContent,message:elements.message.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:31})).reason,'subscription_inactive');elements.action.dispatch('click');await router.idle();assert.deepEqual({title:elements.title.textContent,message:elements.message.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},stopped);assert.deepEqual(verifications,['driver-a','driver-b']);assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);assert.deepEqual(disconnections,['driver-a']);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(router.snapshot().page,'driver-home');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('authentication loss replaces a fresh-session pending verification with one reauthentication action', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,rejectFreshVerification,unavailable=0;
-  const reads=[],subscriptions=[],disconnections=[],handled=[],verifications=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);throw Error('notification transport failed');},
-    verifyLatest:async({sessionBinding})=>{verifications.push(sessionBinding.accountRef);if(sessionBinding===accounts[0])throw Error('verification transport failed');return new Promise((_resolve,reject)=>{rejectFreshVerification=reject;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{unavailable+=1;fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:32})).reason,'notification_failed');elements.action.dispatch('click');await router.idle();assert.deepEqual(verifications,['driver-a']);assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(disconnections,['driver-a']);
-  assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:33})).reason,'notification_failed');elements.action.dispatch('click');elements.action.dispatch('click');while(!rejectFreshVerification)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(verifications,['driver-a','driver-b']);assert.equal(elements.commandButtons[0].disabled,true);
-  session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.equal(unavailable,1);assert.deepEqual(disconnections,['driver-a','driver-b']);assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.action.hidden,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);assert.match(elements.title.textContent,/èªè¨¼ã‚»ãƒƒã‚·ãƒ§ãƒ³/);
-  const reauthView={title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};rejectFreshVerification(Error('late verification failure'));await router.idle();await new Promise(resolve=>setImmediate(resolve));assert.deepEqual({title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},reauthView);assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:34})).reason,'subscription_inactive');assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:34})).reason,'subscription_inactive');assert.deepEqual(handled,[['driver-a',32],['driver-b',33]]);assert.deepEqual(verifications,['driver-a','driver-b']);assert.deepEqual(reads,['driver-a','driver-b']);assert.equal(subscriptions.length,2);assert.equal(runtime.snapshot().lastAction,'session_unavailable');assert.equal(router.snapshot().page,'driver-home');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('third session remains active after authentication loss during fresh verification', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b','driver-c'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,rejectFreshVerification;
-  const reads=[],subscriptions=[],disconnections=[],handled=[],verifications=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);if(sessionBinding!==accounts[2])throw Error('notification transport failed');return {processed:true,reason:'notification_applied'};},
-    verifyLatest:async({sessionBinding})=>{verifications.push(sessionBinding.accountRef);if(sessionBinding===accounts[0])throw Error('verification transport failed');return new Promise((_resolve,reject)=>{rejectFreshVerification=reject;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:35})).reason,'notification_failed');elements.action.dispatch('click');await router.idle();assert.deepEqual(verifications,['driver-a']);assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:36})).reason,'notification_failed');elements.action.dispatch('click');elements.action.dispatch('click');while(!rejectFreshVerification)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(verifications,['driver-a','driver-b']);
-  session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(disconnections,['driver-a','driver-b']);assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);
-  assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');assert.equal(router.snapshot().page,'role');assert.equal(elements.action.listenerCount('click'),0);session=accounts[2];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.equal(subscriptions.length,3);assert.equal(subscriptions[2].sessionBinding,accounts[2]);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);
-  const current=await subscriptions[2].onHint({type:'ride.changed',rideId:'fixture-ride',revision:37});assert.equal(current.processed,true);assert.equal(current.reason,'notification_applied');assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:38})).reason,'subscription_inactive');assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:38})).reason,'subscription_inactive');
-  const currentView={boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};rejectFreshVerification(Error('late verification failure'));await router.idle();await new Promise(resolve=>setImmediate(resolve));assert.deepEqual({boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},currentView);assert.deepEqual(handled,[['driver-a',35],['driver-b',36],['driver-c',37]]);assert.deepEqual(verifications,['driver-a','driver-b']);assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.equal(subscriptions.length,3);assert.deepEqual(disconnections,['driver-a','driver-b']);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().lastAction,'entered');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('third-session notification wins over delayed old verification success', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b','driver-c'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,releaseOldVerification,releaseCurrentHint;
-  const reads=[],subscriptions=[],disconnections=[],handled=[],verifications=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);if(sessionBinding!==accounts[2])return Promise.reject(Error('notification transport failed'));return new Promise(resolve=>{releaseCurrentHint=resolve;});},
-    verifyLatest:async({sessionBinding})=>{verifications.push(sessionBinding.accountRef);if(sessionBinding===accounts[0])throw Error('verification transport failed');return new Promise(resolve=>{releaseOldVerification=resolve;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:39})).reason,'notification_failed');elements.action.dispatch('click');await router.idle();assert.deepEqual(verifications,['driver-a']);assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:40})).reason,'notification_failed');elements.action.dispatch('click');elements.action.dispatch('click');while(!releaseOldVerification)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(verifications,['driver-a','driver-b']);
-  session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');session=accounts[2];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.equal(subscriptions.length,3);assert.deepEqual(disconnections,['driver-a','driver-b']);
-  const currentHint=subscriptions[2].onHint({type:'ride.changed',rideId:'fixture-ride',revision:41});while(!releaseCurrentHint)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(handled,[['driver-a',39],['driver-b',40],['driver-c',41]]);const currentView={boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};
-  releaseOldVerification({verified:true});await new Promise(resolve=>setImmediate(resolve));assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:42})).reason,'subscription_inactive');assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:42})).reason,'subscription_inactive');assert.deepEqual({boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},currentView);assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');
-  releaseCurrentHint({processed:true,reason:'notification_applied'});const current=await currentHint;await router.idle();assert.equal(current.processed,true);assert.equal(current.reason,'notification_applied');assert.deepEqual(verifications,['driver-a','driver-b']);assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.equal(subscriptions.length,3);assert.deepEqual(disconnections,['driver-a','driver-b']);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().lastAction,'entered');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('authentication loss during third-session notification discards both current and old work', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b','driver-c'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,releaseOldVerification,releaseCurrentHint,unavailable=0;
-  const reads=[],subscriptions=[],disconnections=[],handled=[],verifications=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);if(sessionBinding!==accounts[2])return Promise.reject(Error('notification transport failed'));return new Promise(resolve=>{releaseCurrentHint=resolve;});},
-    verifyLatest:async({sessionBinding})=>{verifications.push(sessionBinding.accountRef);if(sessionBinding===accounts[0])throw Error('verification transport failed');return new Promise(resolve=>{releaseOldVerification=resolve;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{unavailable+=1;fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:43})).reason,'notification_failed');elements.action.dispatch('click');await router.idle();assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:44})).reason,'notification_failed');elements.action.dispatch('click');elements.action.dispatch('click');while(!releaseOldVerification)await new Promise(resolve=>setImmediate(resolve));session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.equal(unavailable,1);assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');
-  session=accounts[2];assert.equal((await router.navigate('driver-home')).reason,'entered');const currentHint=subscriptions[2].onHint({type:'ride.changed',rideId:'fixture-ride',revision:45});while(!releaseCurrentHint)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(handled,[['driver-a',43],['driver-b',44],['driver-c',45]]);
-  session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable'||unavailable!==2)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(disconnections,['driver-a','driver-b','driver-c']);assert.equal(elements.action.textContent,'å½¹å‰²é¸æŠžã¸æˆ»ã‚‹');assert.equal(elements.action.hidden,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(elements.commandButtons[0].disabled,true);assert.match(elements.title.textContent,/èªè¨¼ã‚»ãƒƒã‚·ãƒ§ãƒ³/);
-  const reauthView={title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};releaseOldVerification({verified:true});releaseCurrentHint({processed:true,reason:'notification_applied'});const staleCurrent=await currentHint;await router.idle();await new Promise(resolve=>setImmediate(resolve));assert.equal(staleCurrent.processed,false);assert.equal(staleCurrent.reason,'bridge_stale');assert.deepEqual({title:elements.title.textContent,message:elements.message.textContent,action:elements.action.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},reauthView);
-  for(const subscription of subscriptions)assert.equal((await subscription.onHint({type:'ride.changed',rideId:'fixture-ride',revision:46})).reason,'subscription_inactive');assert.deepEqual(verifications,['driver-a','driver-b']);assert.deepEqual(reads,['driver-a','driver-b','driver-c']);assert.equal(subscriptions.length,3);assert.deepEqual(disconnections,['driver-a','driver-b','driver-c']);assert.equal(runtime.snapshot().lastAction,'session_unavailable');assert.equal(router.snapshot().lastAction,'session_unavailable');assert.equal(router.snapshot().page,'driver-home');assert.equal(fallbackUi.snapshot().action,'reauth');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('fourth session reentry rejects all three departed generations', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b','driver-c','driver-d'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,releaseOldVerification,releaseThirdHint;
-  const reads=[],subscriptions=[],disconnections=[],handled=[],verifications=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);if(sessionBinding===accounts[2])return new Promise(resolve=>{releaseThirdHint=resolve;});if(sessionBinding===accounts[3])return Promise.resolve({processed:true,reason:'notification_applied'});return Promise.reject(Error('notification transport failed'));},
-    verifyLatest:async({sessionBinding})=>{verifications.push(sessionBinding.accountRef);if(sessionBinding===accounts[0])throw Error('verification transport failed');return new Promise(resolve=>{releaseOldVerification=resolve;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:47})).reason,'notification_failed');elements.action.dispatch('click');await router.idle();assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:48})).reason,'notification_failed');elements.action.dispatch('click');elements.action.dispatch('click');while(!releaseOldVerification)await new Promise(resolve=>setImmediate(resolve));
-  session=null;eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');session=accounts[2];assert.equal((await router.navigate('driver-home')).reason,'entered');const thirdHint=subscriptions[2].onHint({type:'ride.changed',rideId:'fixture-ride',revision:49});while(!releaseThirdHint)await new Promise(resolve=>setImmediate(resolve));
-  session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(disconnections,['driver-a','driver-b','driver-c']);assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');session=accounts[3];assert.equal((await router.navigate('driver-home')).reason,'entered');assert.deepEqual(reads,['driver-a','driver-b','driver-c','driver-d']);assert.equal(subscriptions.length,4);assert.equal(subscriptions[3].sessionBinding,accounts[3]);
-  const fourth=await subscriptions[3].onHint({type:'ride.changed',rideId:'fixture-ride',revision:50});assert.equal(fourth.processed,true);assert.equal(fourth.reason,'notification_applied');const fourthView={boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')};releaseOldVerification({verified:true});releaseThirdHint({processed:true,reason:'notification_applied'});const staleThird=await thirdHint;await router.idle();await new Promise(resolve=>setImmediate(resolve));assert.equal(staleThird.processed,false);assert.equal(staleThird.reason,'bridge_stale');
-  for(const subscription of subscriptions.slice(0,3))assert.equal((await subscription.onHint({type:'ride.changed',rideId:'fixture-ride',revision:51})).reason,'subscription_inactive');assert.deepEqual({boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click')},fourthView);assert.deepEqual(handled,[['driver-a',47],['driver-b',48],['driver-c',49],['driver-d',50]]);assert.deepEqual(verifications,['driver-a','driver-b']);assert.deepEqual(reads,['driver-a','driver-b','driver-c','driver-d']);assert.equal(subscriptions.length,4);assert.deepEqual(disconnections,['driver-a','driver-b','driver-c']);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().lastAction,'entered');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('fourth-session notification survives delayed failures from all departed generations', async () => {
-  const {R}=setup(),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('driver'),accounts=['driver-a','driver-b','driver-c','driver-d'].map(accountRef=>Object.freeze({accountRef,viewerRole:'driver'}));let page='role',session=accounts[0],router,rejectFirstVerification,rejectSecondVerification,rejectThirdHint,releaseFourthHint;
-  const reads=[],subscriptions=[],disconnections=[],handled=[],verifications=[];
-  const services=allowedRoleServices({
-    sessionForRole:()=>session,
-    readCurrentRide:async({sessionBinding})=>{reads.push(sessionBinding.accountRef);return {status:204};},
-    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding.accountRef);},
-    handleNotificationHint:({sessionBinding,hint})=>{handled.push([sessionBinding.accountRef,hint.revision]);if(sessionBinding===accounts[0]||sessionBinding===accounts[1])return Promise.reject(Error('notification transport failed'));if(sessionBinding===accounts[2])return new Promise((resolve,reject)=>{rejectThirdHint=reject;});return new Promise(resolve=>{releaseFourthHint=resolve;});},
-    verifyLatest:({sessionBinding})=>{verifications.push(sessionBinding.accountRef);return new Promise((resolve,reject)=>{if(sessionBinding===accounts[0])rejectFirstVerification=reject;else rejectSecondVerification=reject;});}
-  });
-  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
-  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:targetPage=>targetPage==='role'?{page:'role',role:null}:{page:targetPage,role:'driver'},render:destination=>{page=destination.page;}});router.attach();assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'fixture-ride',revision:52})).reason,'notification_failed');elements.action.dispatch('click');while(!rejectFirstVerification)await new Promise(resolve=>setImmediate(resolve));assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('driver-home')).reason,'entered');
-  assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'fixture-ride',revision:53})).reason,'notification_failed');elements.action.dispatch('click');while(!rejectSecondVerification)await new Promise(resolve=>setImmediate(resolve));session=null;eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));session=accounts[2];assert.equal((await router.navigate('driver-home')).reason,'entered');
-  const thirdHint=subscriptions[2].onHint({type:'ride.changed',rideId:'fixture-ride',revision:54});while(!rejectThirdHint)await new Promise(resolve=>setImmediate(resolve));session=null;eventTarget.dispatch('fiji:auth-session-changed');while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));session=accounts[3];assert.equal((await router.navigate('driver-home')).reason,'entered');const fourthHint=subscriptions[3].onHint({type:'ride.changed',rideId:'fixture-ride',revision:55});while(!releaseFourthHint)await new Promise(resolve=>setImmediate(resolve));
-  const fourthView={boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click'),runtimeAction:runtime.snapshot().lastAction,routerAction:router.snapshot().lastAction};rejectFirstVerification(Error('old first verification failed'));rejectSecondVerification(Error('old second verification failed'));rejectThirdHint(Error('old third notification failed'));const staleThird=await thirdHint;await new Promise(resolve=>setImmediate(resolve));assert.equal(staleThird.processed,false);assert.equal(staleThird.reason,'bridge_stale');assert.deepEqual({boxHidden:elements.box.hidden,actionHidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled,listeners:elements.action.listenerCount('click'),runtimeAction:runtime.snapshot().lastAction,routerAction:router.snapshot().lastAction},fourthView);
-  releaseFourthHint({processed:true,reason:'notification_applied'});const fourth=await fourthHint;await router.idle();assert.equal(fourth.processed,true);assert.equal(fourth.reason,'notification_applied');for(const subscription of subscriptions.slice(0,3))assert.equal((await subscription.onHint({type:'ride.changed',rideId:'fixture-ride',revision:56})).reason,'subscription_inactive');assert.deepEqual(handled,[['driver-a',52],['driver-b',53],['driver-c',54],['driver-d',55]]);assert.deepEqual(verifications,['driver-a','driver-b']);assert.deepEqual(reads,['driver-a','driver-b','driver-c','driver-d']);assert.deepEqual(disconnections,['driver-a','driver-b','driver-c']);assert.equal(elements.box.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().lastAction,'entered');for(const account of accounts)assert.equal(JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]).includes(account.accountRef),false);
-});
-test('role-page runtime stops safely when injected services are not configured', async () => {
-  const {R}=setup(),views=[];let factories=0;
-  const runtime=R.createRolePageRuntime({services:null,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
-  const result=await runtime.enter('home','passenger');
-  assert.equal(result.entered,false);assert.equal(result.reason,'services_unavailable');assert.equal(factories,0);assert.equal(views.length,1);assert.equal(views[0].role,'passenger');assert.equal(views[0].disableCommands,true);assert.equal(views[0].action,null);assert.match(views[0].title,/æœªè¨­å®š/);assert.match(views[0].message,/é€šä¿¡ã¯è¡Œã£ã¦ã„ã¾ã›ã‚“/);
-  assert.deepEqual(Object.keys(runtime.snapshot()).sort(),['activeRole','busy','lastAction','page','revision','serviceState']);assert.equal(runtime.snapshot().serviceState,'unconfigured');
-});
-test('partial role service injection cannot be mistaken for a live connection', async () => {
-  const {R}=setup(),views=[];let sessions=0,factories=0;
-  const services={configured:true,sessionForRole(){sessions+=1;return {viewerRole:'driver'};}};
-  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
-  const result=await runtime.enter('driver-home','driver');
-  assert.equal(result.reason,'services_unavailable');assert.equal(runtime.snapshot().serviceState,'unconfigured');assert.equal(sessions,0);assert.equal(factories,0);assert.equal(views[0].action,null);
-});
-test('configured role-page runtime enters once and preserves its generation across role navigation', async () => {
-  const {R}=setup(),session={account:'private-passenger'},calls=[];let factories=0,clears=0;
-  const lifecycle={snapshot:()=>({activeRole:'passenger'}),enter:async(role,options)=>{calls.push(['enter',role,options.sessionBinding]);return {entered:true,reason:'entered'};},leave:()=>{calls.push(['leave']);return {left:true};},idle:async()=>({})};
-  const services=allowedRoleServices({sessionForRole:()=>session});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>{factories+=1;assert.equal(injected,services);return lifecycle;},clearUnavailable:()=>{clears+=1;}});
-  assert.equal((await runtime.enter('home','passenger')).reason,'entered');assert.equal((await runtime.enter('passenger-history','passenger')).reason,'within_role');
-  assert.equal(factories,1);assert.equal(calls.length,1);assert.equal(calls[0][2],session);assert.equal(runtime.snapshot().page,'passenger-history');assert.equal(runtime.snapshot().activeRole,'passenger');assert.ok(clears>=2);assert.equal(JSON.stringify(runtime.snapshot()).includes('private-passenger'),false);
-  const left=runtime.leave();assert.equal(left.left,true);assert.equal(calls.at(-1)[0],'leave');assert.equal(runtime.snapshot().activeRole,null);
-});
-test('missing authenticated session blocks lifecycle creation and all service I/O', async () => {
-  const {R}=setup(),views=[];let factories=0;
-  const services=allowedRoleServices({sessionForRole:()=>null});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>{factories+=1;},renderUnavailable:view=>views.push(view)});
-  const result=await runtime.enter('driver-trips','driver');
-  assert.equal(result.reason,'session_unavailable');assert.equal(factories,0);assert.equal(views[0].role,'driver');assert.match(views[0].title,/èªè¨¼ã‚»ãƒƒã‚·ãƒ§ãƒ³/);assert.equal(views[0].outcome,'reauth');assert.equal(views[0].disableCommands,true);assert.equal(views[0].action,'reauth');
-});
-test('configured lifecycle entry failure stops and cannot be reused as an active page', async () => {
-  const {R}=setup(),session={account:'private'},views=[];let entries=0,leaves=0;
-  const lifecycle={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:false,reason:'entry_rejected'};},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
-  const services=allowedRoleServices({sessionForRole:()=>session});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle,renderUnavailable:view=>views.push(view)});
-  const first=await runtime.enter('home','passenger'),second=await runtime.enter('passenger-history','passenger');
-  assert.equal(first.reason,'entry_failed');assert.equal(second.reason,'entry_failed');assert.equal(entries,2);assert.equal(leaves,2);assert.equal(views.length,2);assert.equal(views[0].action,'reauth');assert.match(views[0].title,/é–‹å§‹ã§ãã¾ã›ã‚“/);assert.equal(runtime.snapshot().lastAction,'entry_failed');
-});
-test('role switch rejects a delayed old runtime entry without exposing session bindings', async () => {
-  const {R}=setup(),passengerSession={account:'private-a'},driverSession={account:'private-b'};let releasePassenger;
-  const lifecycle={snapshot:()=>({}),enter:role=>role==='passenger'?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({entered:true,reason:'entered'}),leave:()=>({left:true}),idle:async()=>({})};
-  const services=allowedRoleServices({sessionForRole:role=>role==='passenger'?passengerSession:driverSession});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle});
-  const old=runtime.enter('home','passenger');while(!releasePassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await runtime.enter('driver-home','driver');releasePassenger({entered:true,reason:'entered'});const stale=await old;
-  assert.equal(fresh.entered,true);assert.equal(stale.reason,'stale_entry');assert.equal(runtime.snapshot().activeRole,'driver');assert.equal(runtime.snapshot().page,'driver-home');const publicState=JSON.stringify(runtime.snapshot());assert.equal(publicState.includes('private-a'),false);assert.equal(publicState.includes('private-b'),false);
-});
-test('role-page router attaches one hash listener and routes its current target', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),entries=[],renders=[];let hash='home';
-  const runtime={snapshot:()=>({}),enter:async(page,role)=>{entries.push([page,role]);return {entered:true,reason:'entered'};},leave:()=>({left:true}),idle:async()=>({})};
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>hash,resolve:page=>({page,role:'passenger'}),render:value=>renders.push(value.page)});
-  assert.equal(router.attach().started,true);assert.equal(router.attach().reason,'already_attached');assert.equal(target.listenerCount('hashchange'),1);assert.equal(target.addCount('hashchange'),1);
-  target.dispatch('hashchange');await router.idle();assert.deepEqual(entries,[['home','passenger']]);assert.deepEqual(renders,['home']);assert.equal(router.snapshot().page,'home');
-});
-test('bottom-menu navigation preserves one injected role lifecycle generation', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),session={account:'private'},renders=[];let entries=0;
-  const lifecycle={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:true,reason:'entered'};},leave:()=>({left:true}),idle:async()=>({})};
-  const services=allowedRoleServices({sessionForRole:()=>session});
-  const runtime=R.createRolePageRuntime({services,createLifecycle:()=>lifecycle});
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:page=>({page,role:'passenger'}),render:value=>renders.push(value.page)});
-  assert.equal((await router.navigate('home')).navigated,true);assert.equal((await router.navigate('passenger-history')).reason,'within_role');assert.equal((await router.navigate('passenger-account')).reason,'within_role');
-  assert.equal(entries,1);assert.deepEqual(renders,['home','passenger-history','passenger-account']);assert.equal(runtime.snapshot().revision,3);assert.equal(router.snapshot().revision,3);
-});
-test('role chooser leaves the runtime before rendering the chooser', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),order=[];
-  const runtime={snapshot:()=>({}),enter:async()=>({entered:true}),leave:()=>{order.push('leave');return {left:true};},idle:async()=>({})};
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:()=>({page:'role',role:null}),render:()=>order.push('render')});
-  const result=await router.navigate('role');assert.equal(result.reason,'role_chooser');assert.deepEqual(order,['leave','render']);assert.equal(router.snapshot().activeRole,null);
-});
-test('rapid role navigation cannot repaint or restore a delayed old page', async () => {
-  const {R}=setup(),target=recoveryEventTarget(),renders=[];let releasePassenger;
-  const runtime={snapshot:()=>({}),enter:(page,role)=>role==='passenger'?new Promise(resolve=>{releasePassenger=resolve;}):Promise.resolve({entered:true,reason:'entered'}),leave:()=>({left:true}),idle:async()=>({})};
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:page=>({page,role:page.startsWith('driver-')?'driver':'passenger'}),render:value=>renders.push(value.page)});
-  const old=router.navigate('home');while(!releasePassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await router.navigate('driver-home');releasePassenger({entered:true,reason:'entered'});const stale=await old;
-  assert.equal(fresh.navigated,true);assert.equal(stale.reason,'stale_navigation');assert.deepEqual(renders,['home','driver-home']);assert.equal(router.snapshot().page,'driver-home');assert.equal(router.snapshot().activeRole,'driver');
-});
-test('delayed failure from a departed role cannot replace the fresh router result', async () => {
-  const {R}=setup(),target=recoveryEventTarget();let rejectPassenger;
-  const runtime={snapshot:()=>({}),enter:(page,role)=>role==='passenger'?new Promise((resolve,reject)=>{rejectPassenger=reject;}):Promise.resolve({entered:true,reason:'entered'}),leave:()=>({left:true}),idle:async()=>({})};
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:page=>({page,role:page.startsWith('driver-')?'driver':'passenger'}),render:()=>{}});
-  const old=router.navigate('home');while(!rejectPassenger)await new Promise(resolve=>setImmediate(resolve));const fresh=await router.navigate('driver-home');rejectPassenger(Error('offline'));const stale=await old;
-  assert.equal(fresh.navigated,true);assert.equal(stale.reason,'stale_navigation');assert.equal(router.snapshot().lastAction,'entered');assert.equal(router.snapshot().page,'driver-home');
-});
-test('detached role-page router ignores future hash changes and leaves its runtime', async () => {
-  const {R}=setup(),target=recoveryEventTarget();let entries=0,leaves=0,hash='home';
-  const runtime={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:true};},leave:()=>{leaves+=1;return {left:true};},idle:async()=>({})};
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>hash,resolve:page=>({page,role:'passenger'}),render:()=>{}});router.attach();router.detach();target.dispatch('hashchange');await Promise.resolve();
-  assert.equal(entries,0);assert.equal(leaves,1);assert.equal(target.listenerCount('hashchange'),0);assert.equal((await router.navigate('home')).reason,'router_detached');
-});
-test('invalid router destination stops before rendering or entering services', async () => {
-  const {R}=setup(),target=recoveryEventTarget();let entries=0,renders=0;
-  const runtime={snapshot:()=>({}),enter:async()=>{entries+=1;return {entered:true};},leave:()=>({left:true}),idle:async()=>({})};
-  const router=R.createRolePageRouter({runtime,eventTarget:target,readHash:()=>'',resolve:()=>({page:'driver-home',role:'passenger'}),render:()=>{renders+=1;}});
-  const result=await router.navigate('driver-home');assert.equal(result.reason,'invalid_destination');assert.equal(entries,0);assert.equal(renders,0);
-});
-test('prototype show path is wired through one explicit role-page router', () => {
-  assert.match(source,/window\.FijiPrototypeServices\|\|null/);assert.match(source,/R\.createRolePageRouter\(/);assert.match(source,/rolePageRouter\.attach\(\)/);assert.match(source,/fiji:auth-session-changed/);assert.match(source,/commandFeedbackDom\.attach\(\)/);assert.match(source,/clearUnavailable:\(\)=>\{commandUi\.clear\(\);commandFeedbackDom\.detach\(\);\}/);assert.match(source,/navigate:page=>state\.page===page\?null:show\(page\)/);assert.match(source,/function show\(target\)\{return rolePageRouter\.navigate\(target\);\}/);
-});
-test('profile and contact/payment preferences survive an in-document role switch', () => {
-  const {m}=setup(),p=passenger(m);
-  m.leave(); m.chooseRole('passenger');
-  assert.equal(m.state.profile.id,p.id);
-  const r=m.requestRide({pickup:p.pickup,destination:'Demo Beach'});
-  assert.equal(r.passengerName,'Review Guest'); assert.equal(r.language,'ja'); assert.equal(r.payment,'card');
-});
-test('new application cannot inject approval or enable quoting', () => {
-  const {m,V}=setup(); m.chooseRole('driver');
-  m.registerDriver({...application(V),status:'reviewed',approved:true,eligible:true});
-  assert.equal(m.gate().eligible,false);
-  assert.throws(()=>m.setOnline(true));
-  assert.equal(m.driverRequests().length,0);
-  assert.throws(()=>m.submitOffer('sample-city',{fare:'20',eta:'5'}));
-});
-test('reviewed demo account does not approve the separately submitted application', () => {
-  const {m,V}=setup(); m.chooseRole('driver'); const p=m.registerDriver(application(V));
-  m.useReviewedFixture(); assert.equal(m.gate().eligible,true);
-  m.leave(); m.chooseRole('driver');
-  assert.equal(m.state.profile.id,p.id); assert.equal(m.gate().eligible,false);
-});
-test('quoting is not assignment; selection preserves the agreed quote snapshot', () => {
-  const {m}=setup(); passenger(m);
-  const r=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
-  m.useReviewedFixture(); m.setOnline(true);
-  const o=m.submitOffer(r.id,{fare:'23.50',eta:'7'});
-  assert.equal(m.driverTrips().length,0);
-  m.chooseRole('passenger'); m.selectOffer(o.id);
-  assert.equal(r.quoteSnapshot.fareCents,2350); assert.equal(r.quoteSnapshot.eta,7);
-  assert.throws(()=>m.selectOffer(o.id));
-  m.useReviewedFixture(); assert.equal(m.driverTrips().length,1);
-  assert.throws(()=>m.submitOffer(r.id,{fare:'30',eta:'5'}));
-  assert.equal(r.quoteSnapshot.fareCents,2350);
-});
-test('ride cannot start without confirmation of the booked vehicle and driver', () => {
-  const {m,ride}=selected();
-  assert.throws(()=>m.confirmVehicle(ride.id,'DEMO 002',true,true));
-  assert.throws(()=>m.confirmVehicle(ride.id,'DEMO 001',false,true));
-  m.useReviewedFixture(); m.advanceTrip(ride.id);
-  assert.equal(ride.status,'arriving'); assert.throws(()=>m.advanceTrip(ride.id));
-  m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-  m.useReviewedFixture(); m.advanceTrip(ride.id); assert.equal(ride.status,'on_trip');
-  m.advanceTrip(ride.id); assert.equal(ride.status,'completed');
-});
-test('expired quotes and revoked eligibility are rechecked at selection', () => {
-  for(const reason of ['expired','revoked']) {
-    const {m}=setup(); passenger(m); const r=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
-    const o=m.getOffers(r.id)[0];
-    if(reason==='expired') o.expiresAt=Date.now()-1;
-    else m.state.records.find(x=>x.id===o.driverId).status='suspended';
-    assert.throws(()=>m.selectOffer(o.id)); assert.equal(r.status,'collecting');
-  }
-});
-test('changing a collecting route invalidates earlier quotes', () => {
-  const {m}=setup(); passenger(m);
-  const first=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}), old=m.getOffers(first.id)[0];
-  m.requestRide({pickup:'Demo Hotel',destination:'Demo Town'});
-  assert.equal(first.status,'cancelled'); assert.throws(()=>m.selectOffer(old.id));
-});
-test('editing pickup, destination or schedule immediately invalidates the active search and quotes', () => {
-  for(const [changes,reason] of [[{pickup:'New Hotel'},'route_changed'],[{destination:'Demo Town'},'route_changed'],[{pickupAt:new Date(Date.now()+3600000).toISOString()},'schedule_changed']]){
-    const {m}=setup();passenger(m);
-    const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
-    const result=m.invalidateRideSearch(ride.id,changes);
-    assert.equal(result.invalidated,true);assert.equal(result.reason,reason);assert.equal(ride.status,'cancelled');assert.equal(ride.cancelReason,reason);
-    assert.ok(m.state.offers.filter(o=>o.requestId===ride.id).every(o=>o.status==='expired'));assert.throws(()=>m.selectOffer(offer.id));
-  }
-  assert.match(source,/state\.currentRequest=null;state\.expectedId=null;state\.selected=null;\$\('live-summary'\)\.hidden=true;\$\('offers'\)\.replaceChildren\(\);clearLines\(\);/);
-});
-test('cancelled history distinguishes route edits, schedule edits and explicit cancellation', () => {
-  const {R}=setup();
-  assert.deepEqual({...R.cancellationReasonView('route_changed')},{kind:'search_change',message:'ä¹—è»Šåœ°ç‚¹ã¾ãŸã¯è¡Œãå…ˆã®å¤‰æ›´ã«ã‚ˆã‚Šã€ã“ã®ä¾é ¼ã‚’å–ã‚Šæ¶ˆã—ã¾ã—ãŸã€‚'});
-  assert.deepEqual({...R.cancellationReasonView('schedule_changed')},{kind:'schedule_change',message:'äºˆç´„æ—¥æ™‚ã®å¤‰æ›´ã«ã‚ˆã‚Šã€ã“ã®ä¾é ¼ã‚’å–ã‚Šæ¶ˆã—ã¾ã—ãŸã€‚'});
-  assert.deepEqual({...R.cancellationReasonView('passenger_requested')},{kind:'passenger',message:'åˆ©ç”¨è€…ãŒä¾é ¼ã‚’å–ã‚Šæ¶ˆã—ã¾ã—ãŸã€‚'});
-  assert.deepEqual({...R.cancellationReasonView('tampered')},{kind:'unknown',message:'ã“ã®ä¾é ¼ã¯å–ã‚Šæ¶ˆã•ã‚Œã¾ã—ãŸã€‚'});
-  assert.match(source,/const reason=R\.cancellationReasonView\(r\.cancelReason\);[\s\S]*?esc\(reason\.message\)/);
-});
-test('unchanged search input is retained and assigned rides cannot be silently edited', () => {
-  const {m}=setup();passenger(m);
-  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
-  assert.deepEqual({...m.invalidateRideSearch(ride.id,{pickup:'Demo Hotel',destination:'Demo Beach',airport:false,pickupAt:null})},{invalidated:false,reason:'unchanged'});
-  assert.equal(ride.status,'collecting');assert.equal(offer.status,'active');
-  m.selectOffer(offer.id);
-  assert.throws(()=>m.invalidateRideSearch(ride.id,{pickup:'New Hotel'}),/é¸æŠžæ¸ˆã¿ãƒ»ä¹—è»Šä¸­/);assert.equal(ride.status,'assigned');assert.equal(ride.pickup,'Demo Hotel');
-});
-test('a later vehicle mismatch revokes an earlier confirmation', () => {
-  const {m,ride}=selected();
-  m.useReviewedFixture(); m.advanceTrip(ride.id);
-  m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-  assert.throws(()=>m.confirmVehicle(ride.id,'DEMO 002',true,true));
-  m.useReviewedFixture();
-  assert.throws(()=>m.advanceTrip(ride.id),'Start must remain blocked after the new mismatch');
-});
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×|ïtèµ©hºÚn¶X§zÍIÝ\ÙHÝšXÝ	ÎÂ‹ËÈXØÙ\[˜ÙH™]šY]ÈÙˆHÝ\YYS›Ý›ÙXÝ[Ûˆ]]Üš^˜][Ûˆ\ÝË‚˜ÛÛœÝÝ\ÝHH™\]Z\™J	Û›ÙN\Ý	ÊNÂ˜ÛÛœÝ\ÜÙ\H™\]Z\™J	Û›ÙN˜\ÜÙ\ÜÝšXÝ	ÊNÂ˜ÛÛœÝœÈH™\]Z\™J	Û›ÙN™œÉÊNÂ˜ÛÛœÝ]H™\]Z\™J	Û›ÙNœ]	ÊNÂ˜ÛÛœÝ›HH™\]Z\™J	Û›ÙN›IÊNÂ˜ÛÛœÝÓÔTUSÓ”ËÐSÑSUSÓ—Ô‘PTÓÓ”ËØYÛÛ˜XÝ˜[Y]PÛÛ˜XÝHH™\]Z\™J	Ë‹‹Ø\KXÛÛ˜XÝXÚXÚË˜ÚœÉÊNÂ˜ÛÛœÝÑ’VT‘KUQUÑ’QSËØÙ[˜\š[ÜÎˆØÙ[˜\š[ÜË[’ÛÛ˜XÝ[“[ØÚÐÛÛ˜XÝ[ÛÛ˜Ý\œ™[˜ÞPÛÛ˜XÝ[“Ù™™\•˜[Y]PÛÛ˜XÝ[“Ù™™\“\ÝÛÛ˜XÝ[Ø[˜Ù[][Û”™X\ÛÛÛÛ˜XÝ[”šYTØY™]PÛÛ˜XÝ[›Ø\™[™Ô˜XÙPÛÛ˜XÝ[Ý\œ™[šYQ\ØÛÝ™\žPÛÛ˜XÝ[”™XÛÝ™\žT™]žPÛÛ˜XÝ[”™]š\Ú[Û“Y\™ÙPÛÛ˜XÝ[“›ÝYšXØ][Û’[ÛÛ˜XÝ[”Ù\ÜÚ[Û’\ÛÛ][ÛÛÛ˜XÝ[ÛÛ[X[™Ù\ÜÚ[ÛÛÛ˜XÝ[ÛÛ[X[™™XÛÝ™\žPÛÛ˜XÝ[]Y]ÛÛ˜XÝ\œÙT™]žPY\“\ßHH™\]Z\™J	Ë‹‹ÚXÛÛ˜XÝ\[›™\‹˜ÚœÉÊNÂ˜ÛÛœÝÛÝ\˜ÙHHœËœ™XYš[TÞ[˜Ê]š›Ú[Š×Ù\›˜[YK	Ë‹‹Ü›ÛK\Ü]Ú[™^š[	ÊK	Ý]Ž	ÊNÂ˜ÛÛœÝØÜš\ÈHË‹‹œÛÝ\˜ÙK›X]Ú[
+ÏØÜš\–×—JŠ×××JÊOÜØÜš\‹ÙÚJWK›X\
+OˆÌWJNÂ›]]Y]ÛÛ˜XÝÂ™[˜Ý[Ûˆ]Y]Y™\Ý[Ê
+HÈ™]\›ˆ]Y]ÛÛ˜XÝH[]Y]ÛÛ˜XÝ
 
-test('withdrawing either identity check requires a fresh successful confirmation', () => {
-  for(const checks of [[false,true],[true,false]]) {
-    const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
-    m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-    assert.throws(()=>m.confirmVehicle(ride.id,'DEMO 001',...checks));
-    m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
-    m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-    m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),true);
-    m.advanceTrip(ride.id); assert.equal(ride.status,'on_trip');
-  }
-});
-test('editing observed vehicle information clears confirmation before another lookup', () => {
-  const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
-  m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-  m.invalidateVehicleConfirmation(ride.id);
-  m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
-});
-test('drivers and unrelated passengers cannot clear another passenger confirmation', () => {
-  const {m,ride}=selected(); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-  m.useReviewedFixture(); assert.throws(()=>m.invalidateVehicleConfirmation(ride.id),/ã“ã®æ“ä½œ/);
-  m.chooseRole('passenger');
-  const owner=m.state.profile; m.state.profile={...owner,id:'unrelated-passenger'};
-  assert.throws(()=>m.invalidateVehicleConfirmation(ride.id),/ã“ã®ä¾é ¼/);
-  m.state.profile=owner; assert.equal(ride.vehicleConfirmed,true);
-});
-test('an approved replacement vehicle, driver, or changed assignment needs a new confirmation', () => {
-  for(const kind of ['vehicle','driver','holder','appearance','assignment','offer','schedule']) {
-    const {m,V,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
-    m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-    const record=m.state.records.find(x=>x.id===ride.driverId);
-    if(kind==='vehicle') record.vehicleId='replacement-vehicle';
-    if(kind==='driver') record.driverId='replacement-driver';
-    if(kind==='holder') record.holderId='replacement-holder';
-    if(kind==='appearance') record.color='different-color';
-    if(kind==='assignment') ride.assignmentRevision++;
-    if(kind==='offer') ride.selectedOfferId='replacement-offer';
-    if(kind==='schedule') ride.pickupAt=new Date(Date.now()+3600000).toISOString();
-    for(const doc of Object.values(record.documents)) doc.binding=record.holderId+'/'+record.vehicleId+'/'+record.driverId;
-    assert.equal(V.assess(record).eligible,true,'test replacement retains valid current evidence');
-    m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false,kind); assert.throws(()=>m.advanceTrip(ride.id));
-  }
-});
-test('a boolean flag without a matching confirmation record cannot start a ride', () => {
-  const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
-  ride.vehicleConfirmed=true;
-  assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
-});
-test('revocation after a successful check still blocks ride start', () => {
-  const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
-  m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-  m.state.records.find(x=>x.id===ride.driverId).status='suspended';
-  m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
-});
+NÈB›]šYTØY™]PÛÛ˜XÝÂ™[˜Ý[ÛˆšYTØY™]T™\Ý[Ê
+HÈ™]\›ˆšYTØY™]PÛÛ˜XÝH[”šYTØY™]PÛÛ˜XÝ
 
-test('passenger cancels a collecting request and all stale quotes become unusable', () => {
-  const {m}=setup(); passenger(m);
-  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}), offer=m.getOffers(ride.id)[0];
-  m.cancelRide(ride.id);
-  assert.equal(ride.status,'cancelled'); assert.equal(m.getOffers(ride.id).length,0);
-  assert.ok(m.state.offers.filter(o=>o.requestId===ride.id).every(o=>o.status==='expired'));
-  assert.throws(()=>m.selectOffer(offer.id));
-  m.useReviewedFixture(); m.setOnline(true);
-  assert.ok(!m.driverRequests().some(r=>r.id===ride.id));
-  assert.throws(()=>m.submitOffer(ride.id,{fare:'25',eta:'3'}));
-});
-test('assigned cancellation preserves the agreed price and driver history, not vehicle proof', () => {
-  const {m,ride,offer}=selected(), snapshot=ride.quoteSnapshot, driverId=ride.driverId;
-  m.confirmVehicle(ride.id,'DEMO 001',true,true);
-  m.cancelRide(ride.id);
-  assert.equal(ride.quoteSnapshot,snapshot); assert.ok(Object.isFrozen(snapshot));
-  assert.equal(snapshot.fareCents,2350); assert.equal(snapshot.eta,7);
-  assert.equal(ride.driverId,driverId); assert.equal(ride.selectedOfferId,offer.id);
-  assert.equal(offer.status,'expired'); assert.equal(ride.vehicleConfirmed,false); assert.equal(ride.vehicleConfirmation,null);
-  assert.equal(ride.cancelledFrom,'assigned'); assert.equal(ride.cancelledBy,'passenger');
-  assert.ok(Number.isFinite(Date.parse(ride.cancelledAt)));
-  assert.throws(()=>m.confirmVehicle(ride.id,'DEMO 001',true,true));
-  m.useReviewedFixture(); assert.equal(m.driverTrips()[0],ride);
-  assert.equal(m.state.online[driverId],false); assert.equal(m.canStartTrip(ride.id),false);
-  assert.throws(()=>m.advanceTrip(ride.id));
-});
-test('cancellation during pickup wins over a stale ride-start action even after confirmation', () => {
-  const {m,ride}=selected(); m.useReviewedFixture(); m.advanceTrip(ride.id);
-  m.chooseRole('passenger'); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-  m.cancelRide(ride.id); assert.equal(ride.cancelledFrom,'arriving');
-  m.useReviewedFixture(); assert.equal(m.canStartTrip(ride.id),false); assert.throws(()=>m.advanceTrip(ride.id));
-});
-test('cancellation requires the owning passenger and a known request', () => {
-  const {m,ride}=selected(); m.useReviewedFixture(); assert.throws(()=>m.cancelRide(ride.id),/ã“ã®æ“ä½œ/);
-  m.chooseRole('passenger'); const owner=m.state.profile;
-  m.state.profile={...owner,id:'unrelated-passenger'}; assert.throws(()=>m.cancelRide(ride.id),/ã“ã®ä¾é ¼ã‚’å–ã‚Šæ¶ˆã›ã¾ã›ã‚“/);
-  m.state.profile=owner; assert.throws(()=>m.cancelRide('missing-ride'),/ã“ã®ä¾é ¼ã‚’å–ã‚Šæ¶ˆã›ã¾ã›ã‚“/);
-  assert.equal(ride.status,'assigned'); assert.equal(ride.cancelledAt,undefined);
-  m.leave(); assert.throws(()=>m.cancelRide(ride.id),/ã“ã®æ“ä½œ/);
-});
-test('repeated cancellation is idempotent and cannot be performed by another passenger', () => {
-  const {m,ride}=selected(); m.cancelRide(ride.id); const first=JSON.stringify(ride);
-  assert.equal(m.cancelRide(ride.id),ride); assert.equal(JSON.stringify(ride),first);
-  m.state.profile={...m.state.profile,id:'unrelated-passenger'}; assert.throws(()=>m.cancelRide(ride.id));
-  assert.equal(JSON.stringify(ride),first);
-});
-test('an already started or completed ride cannot be cancelled from a stale dialog', () => {
-  for(const status of ['on_trip','completed']) {
-    const {m,ride}=selected(); m.confirmVehicle(ride.id,'DEMO 001',true,true);
-    m.useReviewedFixture(); m.advanceTrip(ride.id); m.advanceTrip(ride.id);
-    if(status==='completed') m.advanceTrip(ride.id);
-    m.chooseRole('passenger'); const before=JSON.stringify(ride);
-    assert.throws(()=>m.cancelRide(ride.id),/ä¹—è»Šé–‹å§‹å¾Œãƒ»å®Œäº†å¾Œ/); assert.equal(JSON.stringify(ride),before);
-  }
-});
-test('after cancellation a new ride can be requested and the driver explicitly resumes receiving requests', () => {
-  const {m,ride,offer}=selected(); m.cancelRide(ride.id);
-  const next=m.requestRide({pickup:ride.pickup,destination:ride.destination});
-  assert.notEqual(next.id,ride.id); assert.equal(next.status,'collecting');
-  assert.equal(m.myRequests().length,2); assert.throws(()=>m.selectOffer(offer.id));
-  m.useReviewedFixture(); assert.equal(m.driverRequests().length,0);
-  m.setOnline(true); assert.ok(m.driverRequests().some(r=>r.id===next.id));
-  assert.throws(()=>m.submitOffer(ride.id,{fare:'20',eta:'5'}));
-  m.submitOffer(next.id,{fare:'20',eta:'5'});
-});
-test('route replacement records a distinct cancellation reason and invalidates the old request', () => {
-  const {m}=setup(); passenger(m);
-  const first=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
-  m.requestRide({pickup:'Demo Hotel',destination:'Demo Town'});
-  assert.equal(first.cancelReason,'route_changed'); assert.equal(first.cancelledFrom,'collecting');
-  const at=first.cancelledAt; m.cancelRide(first.id); assert.equal(first.cancelReason,'route_changed'); assert.equal(first.cancelledAt,at);
-});
+NÈB›]›Ø\™[™Ô˜XÙPÛÛ˜XÝÂ™[˜Ý[Ûˆ›Ø\™[™Ô˜XÙT™\Ý[Ê
+HÈ™]\›ˆ›Ø\™[™Ô˜XÙPÛÛ˜XÝH[›Ø\™[™Ô˜XÙPÛÛ˜XÝ
 
-test('a future pickup time is normalized and shared with an eligible driver', () => {
-  const {m}=setup(); passenger(m);
-  const pickupAt=new Date(Date.now()+3600000).toISOString();
-  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt});
-  assert.equal(ride.pickupAt,pickupAt);
-  m.useReviewedFixture(); m.setOnline(true);
-  assert.equal(m.driverRequests().find(r=>r.id===ride.id).pickupAt,pickupAt);
-});
-test('immediate rides remain explicit and do not inherit an earlier schedule', () => {
-  const {m}=setup(); passenger(m);
-  const scheduled=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:new Date(Date.now()+3600000).toISOString()});
-  const immediate=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
-  assert.equal(immediate.pickupAt,null); assert.notEqual(immediate.id,scheduled.id);
-  assert.equal(scheduled.status,'cancelled'); assert.equal(scheduled.cancelReason,'schedule_changed');
-});
-test('invalid or past pickup times are rejected without creating or replacing a request', () => {
-  const {m}=setup(); passenger(m); const count=m.state.requests.length;
-  for(const pickupAt of ['not-a-date',new Date(Date.now()-60000).toISOString()]) {
-    assert.throws(()=>m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt}),/ç¾åœ¨ã‚ˆã‚Šå¾Œ/);
-    assert.equal(m.state.requests.length,count);
-  }
-});
-test('the same scheduled request is idempotent while a changed time replaces it', () => {
-  const {m}=setup(); passenger(m);
-  const firstAt=new Date(Date.now()+3600000).toISOString();
-  const secondAt=new Date(Date.now()+7200000).toISOString();
-  const first=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:firstAt});
-  assert.equal(m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:firstAt}),first);
-  const second=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:secondAt});
-  assert.equal(first.status,'cancelled'); assert.equal(first.cancelReason,'schedule_changed');
-  assert.equal(second.pickupAt,secondAt); assert.equal(second.status,'collecting');
-});
-test('selection snapshots the scheduled pickup alongside the agreed quote', () => {
-  const {m}=setup(); passenger(m); const pickupAt=new Date(Date.now()+3600000).toISOString();
-  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt});
-  m.useReviewedFixture(); m.setOnline(true); const offer=m.submitOffer(ride.id,{fare:'23.50',eta:'7'});
-  m.chooseRole('passenger'); m.selectOffer(offer.id);
-  assert.equal(ride.pickupAt,pickupAt); assert.equal(ride.quoteSnapshot.pickupAt,pickupAt);
-  assert.ok(Object.isFrozen(ride.quoteSnapshot));
-});
-test('cancelling a scheduled assignment retains its pickup time for both histories', () => {
-  const {m}=setup(); passenger(m); const pickupAt=new Date(Date.now()+3600000).toISOString();
-  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt});
-  m.useReviewedFixture(); m.setOnline(true); const offer=m.submitOffer(ride.id,{fare:'23.50',eta:'7'});
-  m.chooseRole('passenger'); m.selectOffer(offer.id); m.cancelRide(ride.id);
-  assert.equal(m.myRequests().find(r=>r.id===ride.id).pickupAt,pickupAt);
-  m.useReviewedFixture(); assert.equal(m.driverTrips().find(r=>r.id===ride.id).pickupAt,pickupAt);
-});
+NÈB›]Ý\œ™[šYQ\ØÛÝ™\žPÛÛ˜XÝÂ™[˜Ý[ÛˆÝ\œ™[šYQ\ØÛÝ™\žT™\Ý[Ê
+HÈ™]\›ˆÝ\œ™[šYQ\ØÛÝ™\žPÛÛ˜XÝH[Ý\œ™[šYQ\ØÛÝ™\žPÛÛ˜XÝ
 
-test('offer refresh records time expiry and explains why no quote is selectable', () => {
-  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
-  m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);
-  assert.equal(m.getOffers(ride.id).length,0);
-  const summary=m.offerSummary(ride.id);
-  assert.equal(summary.active,0); assert.ok(summary.expired>0); assert.equal(summary.unavailable,0);
-  assert.ok(m.state.offers.filter(o=>o.requestId===ride.id).every(o=>o.status==='expired'&&o.statusReason==='time'));
-});
-test('one expired offer does not hide another current offer', () => {
-  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
-  const before=m.getOffers(ride.id); assert.ok(before.length>1);
-  before[0].expiresAt=Date.now()-1;
-  const after=m.getOffers(ride.id),summary=m.offerSummary(ride.id);
-  assert.equal(after.length,before.length-1); assert.equal(summary.active,after.length); assert.equal(summary.expired,1);
-  assert.ok(!after.some(o=>o.id===before[0].id));
-});
-test('an eligible driver can re-quote after expiry without reviving the old offer', () => {
-  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
-  m.useReviewedFixture(); m.setOnline(true); const old=m.submitOffer(ride.id,{fare:'23.50',eta:'7'});
-  old.expiresAt=Date.now()-1; m.driverRequests();
-  assert.equal(old.status,'expired');
-  const fresh=m.submitOffer(ride.id,{fare:'24.00',eta:'6'});
-  assert.notEqual(fresh.id,old.id); assert.equal(old.status,'expired'); assert.equal(fresh.status,'active');
-  m.chooseRole('passenger'); const visible=m.getOffers(ride.id);
-  assert.ok(visible.some(o=>o.id===fresh.id)); assert.ok(!visible.some(o=>o.id===old.id));
-  m.selectOffer(fresh.id); assert.equal(ride.quoteSnapshot.fareCents,2400);
-});
-test('an offer made unavailable by eligibility cannot silently revive', () => {
-  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
-  const offer=m.getOffers(ride.id)[0],record=m.state.records.find(r=>r.id===offer.driverId);
-  record.status='suspended'; assert.ok(!m.getOffers(ride.id).some(o=>o.id===offer.id));
-  assert.equal(offer.status,'unavailable'); assert.equal(offer.statusReason,'eligibility');
-  record.status='reviewed'; assert.ok(!m.getOffers(ride.id).some(o=>o.id===offer.id));
-  assert.throws(()=>m.selectOffer(offer.id));
-});
-test('offer-state guidance is limited to the owning passenger', () => {
-  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),owner=m.state.profile;
-  m.useReviewedFixture(); assert.throws(()=>m.offerSummary(ride.id),/ã“ã®æ“ä½œ/);
-  m.chooseRole('passenger'); m.state.profile={...owner,id:'unrelated-passenger'};
-  assert.throws(()=>m.offerSummary(ride.id),/é–²è¦§ã§ãã¾ã›ã‚“/);
-  m.state.profile=owner; assert.throws(()=>m.offerSummary('missing-ride'),/é–²è¦§ã§ãã¾ã›ã‚“/);
-});
+NÈB›]™XÛÝ™\žT™]žPÛÛ˜XÝÂ™[˜Ý[Ûˆ™XÛÝ™\žT™]žT™\Ý[Ê
+HÈ™]\›ˆ™XÛÝ™\žT™]žPÛÛ˜XÝH[”™XÛÝ™\žT™]žPÛÛ˜XÝ
 
-test('offer selection advances the request revision and rejects a stale repeat', () => {
-  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
-  assert.equal(ride.revision,1); m.selectOffer(offer.id,1);
-  assert.equal(ride.status,'assigned'); assert.equal(ride.revision,2);
-  assert.throws(()=>m.selectOffer(offer.id,1),/åˆ¥ã®ç”»é¢ã§æ›´æ–°/);
-});
-test('cancellation wins an accept/cancel race and stale selection changes nothing', () => {
-  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
-  m.cancelRide(ride.id,1); const afterCancel=JSON.stringify(ride);
-  assert.equal(ride.revision,2); assert.throws(()=>m.selectOffer(offer.id,1),/åˆ¥ã®ç”»é¢ã§æ›´æ–°/);
-  assert.equal(JSON.stringify(ride),afterCancel);
-});
-test('selection wins an accept/cancel race and stale cancellation must refresh first', () => {
-  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
-  m.selectOffer(offer.id,1); const afterSelect=JSON.stringify(ride);
-  assert.throws(()=>m.cancelRide(ride.id,1),/åˆ¥ã®ç”»é¢ã§æ›´æ–°/); assert.equal(JSON.stringify(ride),afterSelect);
-  m.cancelRide(ride.id,2); assert.equal(ride.status,'cancelled'); assert.equal(ride.revision,3);
-});
-test('a cancellation retry is idempotent even with the original expected revision', () => {
-  const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
-  m.cancelRide(ride.id,1); const once=JSON.stringify(ride);
-  assert.equal(m.cancelRide(ride.id,1),ride); assert.equal(JSON.stringify(ride),once); assert.equal(ride.revision,2);
-});
-test('a stale driver transition cannot skip a newer trip state', () => {
-  const {m,ride}=selected(); assert.equal(ride.revision,2);
-  m.useReviewedFixture(); m.advanceTrip(ride.id,2); assert.equal(ride.status,'arriving'); assert.equal(ride.revision,3);
-  assert.throws(()=>m.advanceTrip(ride.id,2),/åˆ¥ã®ç”»é¢ã§æ›´æ–°/); assert.equal(ride.status,'arriving');
-});
+NÈB›]™]š\Ú[Û“Y\™ÙPÛÛ˜XÝÂ™[˜Ý[Ûˆ™]š\Ú[Û“Y\™ÙT™\Ý[Ê
+HÈ™]\›ˆ™]š\Ú[Û“Y\™ÙPÛÛ˜XÝH[”™]š\Ú[Û“Y\™ÙPÛÛ˜XÝ
 
-test('machine-readable API contract passes the executable acceptance checker', () => {
-  assert.deepEqual(validateContract(loadContract()),[]);
-});
-test('API contract enumerates every passenger and driver operation exactly once', () => {
-  const spec=loadContract(),ids=[];
-  for(const [method,route,id] of OPERATIONS){assert.equal(spec.paths[route][method].operationId,id);ids.push(id);}
-  assert.equal(new Set(ids).size,OPERATIONS.length);
-});
-test('all state-changing API commands require an idempotency key', () => {
-  const spec=loadContract();
-  for(const [method,route,id] of OPERATIONS.filter(([method])=>method==='post')){
-    const pathItem=spec.paths[route],parameters=[...(pathItem.parameters||[]),...(pathItem[method].parameters||[])];
-    const resolved=parameters.map(p=>p.$ref?spec.components.parameters[p.$ref.split('/').at(-1)]:p);
-    assert.ok(resolved.some(p=>p.name==='Idempotency-Key'&&p.in==='header'&&p.required),id);
-  }
-});
-test('API inputs never accept caller-controlled actor or approval fields', () => {
-  const text=JSON.stringify(loadContract().components.schemas);
-  for(const field of ['passengerId','driverId','reviewerId','approved','eligible','reviewStatus']) assert.ok(!text.includes(`\"${field}\"`),field);
-});
-test('API contract fixes money, revision and scheduled pickup representations', () => {
-  const schemas=loadContract().components.schemas;
-  assert.deepEqual(schemas.Revision,{type:'integer',minimum:1});
-  assert.equal(schemas.CreateOfferInput.properties.fareCents.type,'integer');
-  assert.equal(schemas.CreateRideRequestInput.properties.pickupAt.format,'date-time');
-  assert.equal(schemas.CreateRideRequestInput.properties.pickupTimeZone.const,'Pacific/Fiji');
-  assert.equal(schemas.SelectedQuote.readOnly,true);
-});
-test('API contract limits cancellation reasons to the three reviewed meanings', () => {
-  const schema=loadContract().components.schemas.CancelRideInput;
-  assert.deepEqual(schema.properties.reason.enum,CANCELLATION_REASONS);
-  assert.ok(schema.required.includes('reason'));
-  for(const change of [
-    reasons=>reasons.concat('search_edited'),
-    reasons=>reasons.filter(reason=>reason!=='schedule_changed')
-  ]){
-    const changed=structuredClone(loadContract());
-    changed.components.schemas.CancelRideInput.properties.reason.enum=change(changed.components.schemas.CancelRideInput.properties.reason.enum);
-    assert.ok(validateContract(changed).some(message=>message.includes('CancelRideInput reason must allow exactly')));
-  }
-});
-test('API checker fails closed when safety requirements are removed', () => {
-  const noKey=structuredClone(loadContract());
-  noKey.paths['/v1/offers/{offerId}/select'].post.parameters=noKey.paths['/v1/offers/{offerId}/select'].post.parameters.filter(p=>!p.$ref.endsWith('/IdempotencyKey'));
-  assert.ok(validateContract(noKey).some(message=>message.includes('selectRideOffer requires Idempotency-Key')));
-  const injected=structuredClone(loadContract());
-  injected.components.schemas.CreateOfferInput.properties.driverId={type:'string'};
-  assert.ok(validateContract(injected).some(message=>message.includes('server-owned driverId')));
-  const missingVehicleError=structuredClone(loadContract());
-  missingVehicleError.components.schemas.Error.properties.code.enum=missingVehicleError.components.schemas.Error.properties.code.enum.filter(code=>code!=='vehicle_confirmation_required');
-  assert.ok(validateContract(missingVehicleError).some(message=>message.includes('Error code enum requires vehicle_confirmation_required')));
-  const leakedRideState=structuredClone(loadContract());
-  leakedRideState.components.schemas.RideStateView.properties.assignedDriverId={type:'string'};
-  assert.ok(validateContract(leakedRideState).some(message=>message.includes('RideStateView must not expose private field assignedDriverId')));
-  const noConditional=structuredClone(loadContract());
-  delete noConditional.paths['/v1/rides/{requestId}'].get.responses['304'];
-  assert.ok(validateContract(noConditional).some(message=>message.includes('getRideState must document bodyless 304')));
-  const sharedCache=structuredClone(loadContract());
-  sharedCache.components.headers.PrivateNoCache.schema.const='public, max-age=60';
-  assert.ok(validateContract(sharedCache).some(message=>message.includes('ride state cache control must be private, no-cache')));
-  const storedOffers=structuredClone(loadContract());
-  storedOffers.components.headers.PrivateNoStore.schema.const='public, max-age=60';
-  assert.ok(validateContract(storedOffers).some(message=>message.includes('offer list cache control must be private, no-store')));
-  const missingOfferVary=structuredClone(loadContract());
-  delete missingOfferVary.paths['/v1/ride-requests/{requestId}/offers'].get.responses['200'].headers.Vary;
-  assert.ok(validateContract(missingOfferVary).some(message=>message.includes('listRideOffers 200 requires Vary header')));
-  const cacheableOfferDenial=structuredClone(loadContract());
-  delete cacheableOfferDenial.components.responses.PrivateRoleDenied.headers['Cache-Control'];
-  assert.ok(validateContract(cacheableOfferDenial).some(message=>message.includes('listRideOffers 403 requires Cache-Control header')));
-  const conditionalOffers=structuredClone(loadContract());
-  conditionalOffers.paths['/v1/ride-requests/{requestId}/offers'].get.responses['304']={description:'Not modified'};
-  assert.ok(validateContract(conditionalOffers).some(message=>message.includes('listRideOffers must return a complete 200 response instead of 304')));
-  const noOfferServerTime=structuredClone(loadContract());
-  noOfferServerTime.components.schemas.OfferList.required=noOfferServerTime.components.schemas.OfferList.required.filter(field=>field!=='serverNow');
-  assert.ok(validateContract(noOfferServerTime).some(message=>message.includes('OfferList requires a read-only date-time serverNow')));
-  const noRateLimit=structuredClone(loadContract());
-  delete noRateLimit.paths['/v1/rides/{requestId}'].get.responses['429'];
-  assert.ok(validateContract(noRateLimit).some(message=>message.includes('getRideState must document 429')));
-  const noRetryAfter=structuredClone(loadContract());
-  delete noRetryAfter.components.responses.ServiceUnavailable.headers['Retry-After'];
-  assert.ok(validateContract(noRetryAfter).some(message=>message.includes('getRideState 503 requires Retry-After header')));
-});
-test('current-ride discovery contract derives scope from authentication and fails closed', () => {
-  const spec=loadContract(),operation=spec.paths['/v1/rides/current'].get;
-  assert.equal(operation.operationId,'getCurrentRide');
-  assert.deepEqual(operation.parameters,undefined);
-  assert.ok(operation.responses['200']);
-  assert.ok(operation.responses['204']);
-  assert.ok(operation.responses['409']);
-  assert.equal(operation.responses['304'],undefined);
-  const withRideId=structuredClone(spec);
-  withRideId.paths['/v1/rides/current'].get.parameters=[{name:'requestId',in:'query',required:false,schema:{type:'string'}}];
-  assert.ok(validateContract(withRideId).some(message=>message.includes('without path or query identifiers')));
-  const withoutEmpty=structuredClone(spec);
-  delete withoutEmpty.paths['/v1/rides/current'].get.responses['204'];
-  assert.ok(validateContract(withoutEmpty).some(message=>message.includes('getCurrentRide must document 204')));
-  const conditional=structuredClone(spec);
-  conditional.paths['/v1/rides/current'].get.responses['304']={description:'unsafe empty startup response'};
-  assert.ok(validateContract(conditional).some(message=>message.includes('full startup result instead of 304')));
-});
-test('HTTP contract runner enforces role, ownership, eligibility and safe errors over loopback', async () => {
-  const results=await runMockContract();
-  assert.equal(results.length,14);
-  assert.equal(results.filter(r=>r.status===404).length,5);
-  assert.equal(results.filter(r=>r.status===403).length,3);
-  assert.equal(results.filter(r=>r.status===401).length,1);
-  assert.equal(results.filter(r=>r.status===422).length,2);
-  assert.equal(results.filter(r=>r.status<300).length,3);
-});
-test('HTTP cancellation preserves only reviewed reasons and rejects tampered input without side effects', async () => {
-  const contract=await cancellationReasonResults();
-  assert.deepEqual(contract.allowed.map(item=>item.reason),CANCELLATION_REASONS);
-  for(const item of contract.allowed){
-    assert.equal(item.result.status,200);
-    assert.equal(item.state.cancelReason,item.reason);
-    assert.equal(item.auditEvents[0].reason,item.reason);
-    assert.equal(item.auditEvents[0].outcome,'committed');
-  }
-  assert.deepEqual(contract.invalid.map(item=>[item.status,item.body.code]),Array(4).fill([422,'invalid_request']));
-  assert.deepEqual(contract.invalidState,{id:FIXTURE.requestId,status:'collecting',revision:FIXTURE.revision,assignedDriverId:null,vehicleConfirmation:null});
-  assert.deepEqual(contract.invalidAuditEvents,[]);
-  assert.equal(contract.invalidStoredKeys,0);
-});
-test('exact cancellation replay returns the original reason without duplicate state or audit', async () => {
-  const {allowed}=await cancellationReasonResults();
-  for(const item of allowed){
-    assert.deepEqual(item.replay,item.result);
-    assert.equal(item.state.cancelReason,item.reason);
-    assert.equal(item.state.revision,FIXTURE.revision+1);
-    assert.equal(item.auditEvents.length,1);
-    assert.equal(item.storedKeys,1);
-  }
-});
-test('an idempotency key cannot be reused to replace the recorded cancellation reason', async () => {
-  const {allowed}=await cancellationReasonResults();
-  for(const item of allowed){
-    assert.notEqual(item.changedReason,item.reason);
-    assert.deepEqual([item.conflict.status,item.conflict.body.code],[409,'idempotency_conflict']);
-    assert.equal(item.state.cancelReason,item.reason);
-    assert.equal(item.auditEvents[0].reason,item.reason);
-  }
-});
-test('a new idempotency key cannot reclassify an already cancelled request', async () => {
-  const {immutable}=await cancellationReasonResults();
-  assert.deepEqual(immutable.map(item=>item.reason),CANCELLATION_REASONS);
-  for(const item of immutable){
-    assert.notEqual(item.changedReason,item.reason);
-    assert.deepEqual([item.committed.status,item.amendment.status,item.amendment.body.code],[200,409,'invalid_transition']);
-    assert.equal(item.state.cancelReason,item.reason);
-    assert.equal(item.state.revision,FIXTURE.revision+1);
-    assert.deepEqual(item.auditEvents.map(event=>[event.outcome,event.reason]),[['committed',item.reason],['rejected','invalid_transition']]);
-    assert.equal(item.storedKeys,2);
-  }
-});
-test('HTTP contract scenarios conceal foreign resources instead of leaking ownership', () => {
-  const hidden=httpScenarios().filter(s=>s.concealed);
-  assert.deepEqual(hidden.map(s=>s.expected[0]),[404,404,404,404,404]);
-  assert.ok(hidden.every(s=>s.expected[1]==='resource_not_found'));
-});
-test('HTTP contract runner fails when a permissive transport returns success for every request', async () => {
-  const permissiveFetch=async()=>({status:200,text:async()=>'{}',headers:{get:()=>null}});
-  await assert.rejects(runHttpContract('http://mock.invalid',undefined,permissiveFetch),/no session cannot read offers/);
-});
-test('authenticated passenger and assigned driver discover role-shaped current state without a ride ID', async () => {
-  const {passenger,driver}=await currentRideDiscoveryResults();
-  assert.deepEqual([passenger.status,passenger.body.viewerRole,passenger.body.nextAction],[200,'passenger','track_pickup']);
-  assert.deepEqual([driver.status,driver.body.viewerRole,driver.body.nextAction],[200,'driver','start_pickup']);
-  const safeFields=['id','status','revision','viewerRole','nextAction','updatedAt'];
-  assert.deepEqual(Object.keys(passenger.body),safeFields);
-  assert.deepEqual(Object.keys(driver.body),safeFields);
-});
-test('unrelated authenticated actors receive bodyless 204 without foreign ride details', async () => {
-  const {otherPassenger,otherDriver}=await currentRideDiscoveryResults();
-  for(const result of [otherPassenger,otherDriver]){
-    assert.deepEqual([result.status,result.body],[204,null]);
-    assert.equal(result.headers.cacheControl,'private, no-cache');
-    assert.equal(result.headers.vary,'Authorization');
-    assert.equal(result.headers.etag,null);
-  }
-});
-test('completed and cancelled rides are excluded from current-ride discovery', async () => {
-  const {completedPassenger,completedDriver,cancelledPassenger,cancelledDriver}=await currentRideDiscoveryResults();
-  assert.deepEqual([completedPassenger.status,completedPassenger.body],[204,null]);
-  assert.deepEqual([completedDriver.status,completedDriver.body],[204,null]);
-  assert.deepEqual([cancelledPassenger.status,cancelledPassenger.body],[204,null]);
-  assert.deepEqual([cancelledDriver.status,cancelledDriver.body],[204,null]);
-});
-test('multiple unfinished candidates stop with a non-disclosing conflict', async () => {
-  const {multiple}=await currentRideDiscoveryResults();
-  assert.equal(multiple.status,409);
-  assert.equal(multiple.body.code,'ambiguous_current_ride');
-  assert.match(multiple.body.requestId,/^trace-mock-/);
-  assert.ok(!JSON.stringify(multiple.body).includes(FIXTURE.requestId));
-  assert.ok(!JSON.stringify(multiple.body).includes('ride-duplicate-fixture'));
-});
-test('current-ride discovery rejects missing authentication and caller-supplied ride IDs', async () => {
-  const {unauthenticated,injectedId}=await currentRideDiscoveryResults();
-  assert.deepEqual([unauthenticated.status,unauthenticated.body.code],[401,'authentication_required']);
-  assert.deepEqual([injectedId.status,injectedId.body.code],[422,'invalid_request']);
-});
-test('current-ride discovery is a side-effect-free private full read', async () => {
-  const {passenger,driver,before,after}=await currentRideDiscoveryResults();
-  assert.deepEqual(after,before);
-  assert.equal(passenger.headers.cacheControl,'private, no-cache');
-  assert.equal(passenger.headers.vary,'Authorization');
-  assert.match(passenger.headers.etag,/^"[A-Za-z0-9_-]{24}"$/);
-  assert.notEqual(passenger.headers.etag,driver.headers.etag);
-});
-test('concurrent offer selection and cancellation produce exactly one HTTP winner', async () => {
-  const race=await runConcurrencyContract();
-  assert.deepEqual(race.pair.map(result=>result.status).sort((a,b)=>a-b),[200,409]);
-  assert.equal(race.loser.body.code,'stale_revision');
-  assert.equal(race.loser.body.revision,3);
-  assert.equal(race.state.revision,3);
-  assert.equal(race.state.status,race.winner.body.status);
-});
-test('exact Idempotency-Key replay returns the frozen first success without another change', async () => {
-  const race=await runConcurrencyContract();
-  assert.equal(race.replay.status,200);
-  assert.deepEqual(race.replay.body,race.winner.body);
-  assert.equal(race.state.revision,3);
-  assert.equal(race.storedKeys,2);
-});
-test('reusing an Idempotency-Key with changed content is rejected', async () => {
-  const race=await runConcurrencyContract();
-  assert.equal(race.conflict.status,409);
-  assert.equal(race.conflict.body.code,'idempotency_conflict');
-  assert.match(race.conflict.body.requestId,/^trace-mock-/);
-});
-test('server clock rejects an expired offer without changing the ride', async () => {
-  const validity=await runOfferValidityContract();
-  assert.equal(validity.expired.result.status,409);
-  assert.equal(validity.expired.result.body.code,'offer_expired');
-  assert.equal(validity.expired.result.body.revision,2);
-  assert.equal(validity.expired.offer.status,'expired');
-  assert.deepEqual(validity.expired.ride,{id:'ride-owner-1',status:'collecting',revision:2,assignedDriverId:null,vehicleConfirmation:null});
-});
-test('offer is expired at the exact server-side expiry boundary', async () => {
-  const validity=await runOfferValidityContract();
-  assert.equal(validity.boundary.result.body.code,'offer_expired');
-  assert.equal(validity.boundary.offer.statusReason,'time');
-  assert.equal(validity.valid.result.status,200,'one millisecond before expiry remains selectable');
-  assert.equal(validity.valid.ride.selectedQuote.selectedAt,'2026-09-17T03:00:00.000Z');
-});
-test('selection rechecks current driver eligibility and invalidates the offer', async () => {
-  const validity=await runOfferValidityContract();
-  assert.equal(validity.ineligible.result.status,409);
-  assert.equal(validity.ineligible.result.body.code,'driver_unavailable');
-  assert.equal(validity.ineligible.offer.status,'unavailable');
-  assert.equal(validity.ineligible.offer.statusReason,'eligibility');
-  assert.equal(validity.ineligible.ride.revision,2);
-});
-test('client cannot override the trusted offer-selection clock', async () => {
-  const validity=await runOfferValidityContract();
-  assert.equal(validity.clientClock.result.status,422);
-  assert.equal(validity.clientClock.result.body.code,'invalid_request');
-  assert.equal(validity.clientClock.ride.status,'collecting');
-  assert.equal(validity.clientClock.offer.status,'active');
-});
-test('offer list returns only an active server-timed offer with its expiry', async () => {
-  const {active}=await offerListResults();
-  assert.equal(active.result.status,200);
-  assert.deepEqual(active.result.headers,{etag:null,cacheControl:'private, no-store',vary:'Authorization'});
-  assert.equal(active.result.body.serverNow,'2026-09-17T03:00:00.000Z');
-  assert.deepEqual(active.result.body.summary,{active:1,expired:0,unavailable:0});
-  assert.deepEqual(active.result.body.offers,[{
-    id:FIXTURE.offerId,requestId:FIXTURE.requestId,fareCents:2300,etaMinutes:7,
-    status:'active',expiresAt:'2026-09-17T03:00:00.001Z'
-  }]);
-});
-test('offer list denials are also non-storable and authorization-separated', async () => {
-  const {denied}=await offerListResults();
-  assert.deepEqual(denied.map(item=>item.status),[401,403,404]);
-  for(const item of denied){
-    assert.equal(item.headers.cacheControl,'private, no-store');
-    assert.equal(item.headers.vary,'Authorization');
-    assert.equal(item.headers.etag,null);
-  }
-});
-test('conditional offer reads return the complete latest list instead of preserving a stale quote', async () => {
-  const {conditional}=await offerListResults();
-  assert.equal(conditional.result.status,200);
-  assert.deepEqual(conditional.result.headers,{etag:null,cacheControl:'private, no-store',vary:'Authorization'});
-  assert.deepEqual(conditional.result.body,{serverNow:'2026-09-17T03:00:00.000Z',offers:[],summary:{active:0,expired:1,unavailable:0}});
-  assert.equal(conditional.offer.status,'expired');
-  assert.equal(conditional.offer.statusReason,'time');
-  assert.deepEqual(conditional.auditEvents,[]);
-  assert.equal(conditional.storedKeys,0);
-});
-test('offer list uses the same trusted server time for active, expired and unavailable guidance', async () => {
-  const {active,expired,unavailable,conditional}=await offerListResults();
-  for(const item of [active,expired,unavailable,conditional]){
-    assert.equal(item.result.body.serverNow,'2026-09-17T03:00:00.000Z');
-  }
-  assert.ok(Date.parse(active.result.body.offers[0].expiresAt)>Date.parse(active.result.body.serverNow));
-  assert.equal(expired.result.body.summary.expired,1);
-});
-test('offer list distinguishes expiry from eligibility loss without changing the ride', async () => {
-  const {expired,unavailable}=await offerListResults();
-  assert.deepEqual(expired.result.body,{serverNow:'2026-09-17T03:00:00.000Z',offers:[],summary:{active:0,expired:1,unavailable:0}});
-  assert.equal(expired.offer.status,'expired');
-  assert.equal(expired.offer.statusReason,'time');
-  assert.deepEqual(unavailable.result.body,{serverNow:'2026-09-17T03:00:00.000Z',offers:[],summary:{active:0,expired:0,unavailable:1}});
-  assert.equal(unavailable.offer.status,'unavailable');
-  assert.equal(unavailable.offer.statusReason,'eligibility');
-  for(const item of [expired,unavailable]){
-    assert.deepEqual(item.ride,{id:FIXTURE.requestId,status:'collecting',revision:FIXTURE.revision,assignedDriverId:null,vehicleConfirmation:null});
-    assert.deepEqual(item.auditEvents,[]);
-    assert.equal(item.storedKeys,0);
-  }
-});
-test('successful offer selection records a minimal server-timestamped audit event', async () => {
-  const {validity}=await auditedHttpResults(),event=validity.valid.auditEvents[0];
-  assert.deepEqual(event,{
-    id:'audit-1',type:'offer.selection',outcome:'committed',reason:null,
-    actorRole:'passenger',actorRef:'passenger-owner',requestId:FIXTURE.requestId,
-    offerId:FIXTURE.offerId,fromRevision:2,toRevision:3,occurredAt:'2026-09-17T03:00:00.000Z'
-  });
-});
-test('expiry and eligibility selection rejections are audited without advancing the ride', async () => {
-  const {validity}=await auditedHttpResults();
-  for(const [result,reason] of [[validity.expired,'offer_expired'],[validity.ineligible,'driver_unavailable']]){
-    assert.equal(result.auditEvents.length,1);
-    assert.equal(result.auditEvents[0].outcome,'rejected');
-    assert.equal(result.auditEvents[0].reason,reason);
-    assert.equal(result.auditEvents[0].fromRevision,2);
-    assert.equal(result.auditEvents[0].toRevision,2);
-    assert.equal(result.ride.revision,2);
-  }
-});
-test('concurrent commands record one commit and one stale rejection without replay duplication', async () => {
-  const {race}=await auditedHttpResults();
-  assert.equal(race.auditEvents.length,2);
-  assert.equal(race.auditEvents.filter(event=>event.outcome==='committed').length,1);
-  assert.equal(race.auditEvents.filter(event=>event.reason==='stale_revision').length,1);
-  assert.deepEqual(race.auditEvents.map(event=>event.id),['audit-1','audit-2']);
-});
-test('audit events use only the allowlist and exclude credentials and private request inputs', async () => {
-  const {events}=await auditedHttpResults();
-  for(const event of events) assert.deepEqual(Object.keys(event),AUDIT_FIELDS);
-  const encoded=JSON.stringify(events).toLowerCase();
-  for(const forbidden of [...Object.values(FIXTURE.tokens),'idempotency-key','phone','email','observedplate','permit','+679','@']){
-    assert.ok(!encoded.includes(forbidden.toLowerCase()),forbidden);
-  }
-});
-test('assigned driver transition advances one revision and exact replay changes nothing', async () => {
-  const result=await rideSafetyResults();
-  assert.deepEqual(result.arriving,{status:200,body:{id:FIXTURE.requestId,status:'arriving',revision:3}});
-  assert.deepEqual(result.arrivingReplay,result.arriving);
-  assert.equal(result.auditEvents.filter(event=>event.type==='ride.transition'&&event.fromRevision===2).length,1);
-});
-test('vehicle confirmation normalizes the booked plate and is idempotent', async () => {
-  const result=await rideSafetyResults();
-  assert.equal(result.confirmation.status,201);
-  assert.deepEqual(result.confirmation.body,{requestId:FIXTURE.requestId,assignmentRevision:3,confirmedAt:'2026-09-17T03:00:00.000Z'});
-  assert.deepEqual(result.confirmationReplay,result.confirmation);
-  assert.equal(result.auditEvents.filter(event=>event.type==='vehicle.confirmation'&&event.outcome==='committed').length,2,'initial and fresh reconfirmation only');
-});
-test('a later vehicle mismatch clears proof and advances the revision once', async () => {
-  const result=await rideSafetyResults(),event=result.auditEvents.find(item=>item.reason==='vehicle_mismatch');
-  assert.equal(result.mismatch.status,409);
-  assert.equal(result.mismatch.body.code,'vehicle_mismatch');
-  assert.equal(result.mismatch.body.revision,5);
-  assert.deepEqual([event.fromRevision,event.toRevision],[4,5]);
-});
-test('ride start needs current vehicle proof and current driver eligibility', async () => {
-  const result=await rideSafetyResults();
-  assert.equal(result.startWithoutConfirmation.body.code,'vehicle_confirmation_required');
-  assert.equal(result.startWithoutConfirmation.body.revision,5);
-  assert.equal(result.revokedDriver.body.code,'driver_unavailable');
-  assert.equal(result.revokedDriver.body.revision,6);
-  assert.deepEqual([result.started.body.status,result.started.body.revision],['on_trip',7]);
-  assert.deepEqual([result.completed.body.status,result.completed.body.revision],['completed',8]);
-  assert.equal(result.state.status,'completed');
-  assert.equal(result.state.revision,8);
-});
-test('ride safety audit records decisions without observed plate or replay duplicates', async () => {
-  const result=await rideSafetyResults();
-  assert.equal(result.auditEvents.length,8);
-  assert.deepEqual(result.auditEvents.map(event=>event.id),['audit-1','audit-2','audit-3','audit-4','audit-5','audit-6','audit-7','audit-8']);
-  assert.ok(result.auditEvents.every(event=>Object.keys(event).join('|')===AUDIT_FIELDS.join('|')));
-  const encoded=JSON.stringify(result.auditEvents).toLowerCase();
-  assert.ok(!encoded.includes('demo 001'));
-  assert.ok(!encoded.includes('demo 999'));
-  assert.ok(!encoded.includes('observedplate'));
-});
-test('boarding race commits exactly one of cancellation and ride start', async () => {
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    assert.deepEqual([race.cancel.status,race.start.status].sort((a,b)=>a-b),[200,409]);
-    assert.equal(race.state.revision,7);
-    assert.equal(race.auditEvents.filter(event=>event.outcome==='committed').length,1);
-    assert.equal(race.auditEvents.filter(event=>event.reason==='stale_revision').length,1);
-  }
-});
-test('cancellation-first prevents stale ride start and clears vehicle proof', async () => {
-  const {cancelFirst}=await boardingRaceResults();
-  assert.equal(cancelFirst.cancel.status,200);
-  assert.equal(cancelFirst.state.status,'cancelled');
-  assert.equal(cancelFirst.state.vehicleConfirmation,null);
-  assert.equal(cancelFirst.start.body.code,'stale_revision');
-  assert.equal(cancelFirst.start.body.revision,7);
-});
-test('ride-start-first prevents stale cancellation after boarding begins', async () => {
-  const {startFirst}=await boardingRaceResults();
-  assert.equal(startFirst.start.status,200);
-  assert.equal(startFirst.state.status,'on_trip');
-  assert.equal(startFirst.cancel.body.code,'stale_revision');
-  assert.equal(startFirst.cancel.body.revision,7);
-});
-test('boarding-race winner replay is stable without duplicate state or audit', async () => {
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    const winnerResult=race.winner==='cancel'?race.cancel:race.start;
-    assert.deepEqual(race.replay,winnerResult);
-    assert.equal(race.state.revision,7);
-    assert.equal(race.auditEvents.length,2);
-    assert.deepEqual(race.auditEvents.map(event=>event.id),['audit-1','audit-2']);
-  }
-});
-test('cancellation-race participants recover role-shaped cancelled state', async () => {
-  const {recovery}= (await boardingRaceResults()).cancelFirst;
-  assert.deepEqual(recovery.passenger,{status:200,body:{
-    id:FIXTURE.requestId,status:'cancelled',revision:7,viewerRole:'passenger',
-    nextAction:'show_cancelled_history',updatedAt:'2026-09-17T03:00:00.000Z'
-  },headers:{etag:recovery.passenger.headers.etag,cacheControl:'private, no-cache',vary:'Authorization'}});
-  assert.deepEqual(recovery.driver,{status:200,body:{
-    id:FIXTURE.requestId,status:'cancelled',revision:7,viewerRole:'driver',
-    nextAction:'show_cancelled_trip',updatedAt:'2026-09-17T03:00:00.000Z'
-  },headers:{etag:recovery.driver.headers.etag,cacheControl:'private, no-cache',vary:'Authorization'}});
-});
-test('ride-start-race participants recover role-shaped on-trip state', async () => {
-  const {recovery}= (await boardingRaceResults()).startFirst;
-  assert.deepEqual([recovery.passenger.body.status,recovery.passenger.body.revision,recovery.passenger.body.nextAction],['on_trip',7,'show_on_trip']);
-  assert.deepEqual([recovery.driver.body.status,recovery.driver.body.revision,recovery.driver.body.nextAction],['on_trip',7,'continue_trip']);
-  assert.deepEqual([recovery.passenger.body.viewerRole,recovery.driver.body.viewerRole],['passenger','driver']);
-});
-test('recovery read conceals the ride from unrelated passengers and drivers', async () => {
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    for(const result of [race.recovery.otherPassenger,race.recovery.otherDriver]){
-      assert.equal(result.status,404);
-      assert.equal(result.body.code,'resource_not_found');
-      assert.match(result.body.requestId,/^trace-mock-/);
-      assert.ok(!JSON.stringify(result.body).includes('passenger-owner'));
-      assert.ok(!JSON.stringify(result.body).includes('driver-assigned'));
-    }
-  }
-});
-test('recovery response exposes only the documented safe field allowlist', async () => {
-  const safeFields=['id','status','revision','viewerRole','nextAction','updatedAt'];
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    assert.deepEqual(Object.keys(race.recovery.passenger.body),safeFields);
-    assert.deepEqual(Object.keys(race.recovery.driver.body),safeFields);
-    const encoded=JSON.stringify([race.recovery.passenger.body,race.recovery.driver.body]).toLowerCase();
-    for(const forbidden of ['assigneddriverid','vehicleconfirmation','selectedofferid','plate','phone','permit']) assert.ok(!encoded.includes(forbidden),forbidden);
-  }
-});
-test('recovery reads do not advance revision, consume idempotency keys or add audit events', async () => {
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    assert.equal(race.state.revision,7);
-    assert.equal(race.storedKeys,2);
-    assert.equal(race.auditEvents.length,2);
-    assert.deepEqual(race.auditEvents.map(event=>event.id),['audit-1','audit-2']);
-  }
-});
-test('ride-state responses use private role-scoped validators', async () => {
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    assert.match(race.recovery.passenger.headers.etag,/^"[A-Za-z0-9_-]{24}"$/);
-    assert.match(race.recovery.driver.headers.etag,/^"[A-Za-z0-9_-]{24}"$/);
-    assert.notEqual(race.recovery.passenger.headers.etag,race.recovery.driver.headers.etag);
-    for(const result of [race.recovery.passenger,race.recovery.driver]){
-      assert.equal(result.headers.cacheControl,'private, no-cache');
-      assert.equal(result.headers.vary,'Authorization');
-    }
-  }
-});
-test('matching strong and weak validators return bodyless 304', async () => {
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    assert.deepEqual([race.recovery.passengerNotModified.status,race.recovery.passengerNotModified.body],[304,null]);
-    assert.deepEqual([race.recovery.driverNotModified.status,race.recovery.driverNotModified.body],[304,null]);
-    assert.equal(race.recovery.passengerNotModified.headers.etag,race.recovery.passenger.headers.etag);
-    assert.equal(race.recovery.driverNotModified.headers.etag,race.recovery.driver.headers.etag);
-  }
-});
-test('a stale validator returns the current representation and replacement ETag', async () => {
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    assert.equal(race.recovery.stalePassenger.status,200);
-    assert.equal(race.recovery.stalePassenger.body.revision,7);
-    assert.equal(race.recovery.stalePassenger.body.status,race.state.status);
-    assert.equal(race.recovery.stalePassenger.headers.etag,race.recovery.passenger.headers.etag);
-  }
-});
-test('a passenger validator cannot suppress the driver representation', async () => {
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    assert.equal(race.recovery.crossRoleValidator.status,200);
-    assert.equal(race.recovery.crossRoleValidator.body.viewerRole,'driver');
-    assert.equal(race.recovery.crossRoleValidator.headers.etag,race.recovery.driver.headers.etag);
-  }
-});
-test('wildcard revalidation occurs only after participant authorization', async () => {
-  const races=await boardingRaceResults();
-  for(const race of [races.cancelFirst,races.startFirst]){
-    assert.deepEqual([race.recovery.wildcardPassenger.status,race.recovery.wildcardPassenger.body],[304,null]);
-    assert.equal(race.recovery.wildcardOther.status,404);
-    assert.equal(race.recovery.wildcardOther.body.code,'resource_not_found');
-    assert.equal(race.recovery.wildcardOther.headers.etag,null);
-  }
-});
-test('429 recovery honors Retry-After before succeeding', async () => {
-  const {rateLimited}=await recoveryRetryResults();
-  assert.deepEqual(rateLimited.delays,[3000]);
-  assert.deepEqual(rateLimited.result.attempts.map(attempt=>attempt.status),[429,200]);
-  assert.equal(rateLimited.result.stopped,'success');
-  assert.equal(rateLimited.result.result.body.revision,7);
-});
-test('503 recovery uses capped exponential backoff when Retry-After is absent', async () => {
-  const {unavailable}=await recoveryRetryResults();
-  assert.deepEqual(unavailable.delays,[1000,2000]);
-  assert.deepEqual(unavailable.result.attempts.map(attempt=>attempt.status),[503,503,200]);
-  assert.equal(unavailable.result.stopped,'success');
-});
-test('network failure retries with backoff and then recovers', async () => {
-  const {network}=await recoveryRetryResults();
-  assert.equal(network.calls,2);
-  assert.deepEqual(network.delays,[1000]);
-  assert.deepEqual(network.result.attempts.map(attempt=>attempt.status),[0,200]);
-  assert.equal(network.result.stopped,'success');
-});
-test('retry delays and attempts are bounded during a sustained outage', async () => {
-  const {exhausted}=await recoveryRetryResults();
-  assert.deepEqual(exhausted.delays,[60000,60000,60000]);
-  assert.equal(exhausted.result.attempts.length,4);
-  assert.equal(exhausted.result.stopped,'exhausted');
-  assert.ok(exhausted.result.attempts.every(attempt=>attempt.status===503));
-});
-test('access denial stops recovery without retrying or revealing the ride', async () => {
-  const {accessDenied}=await recoveryRetryResults();
-  assert.deepEqual(accessDenied.delays,[]);
-  assert.equal(accessDenied.result.attempts.length,1);
-  assert.equal(accessDenied.result.stopped,'access');
-  assert.equal(accessDenied.result.result.status,404);
-  assert.equal(accessDenied.result.result.body.code,'resource_not_found');
-});
-test('a hidden screen stops recovery before any network request', async () => {
-  const {hidden}=await recoveryRetryResults();
-  assert.equal(hidden.calls,0);
-  assert.deepEqual(hidden.result.attempts,[]);
-  assert.equal(hidden.result.stopped,'hidden');
-});
-test('Retry-After accepts an HTTP date but rejects invalid input and clamps extremes', () => {
-  const now=Date.parse('2026-09-17T03:00:00Z');
-  assert.equal(parseRetryAfterMs('Thu, 17 Sep 2026 03:00:05 GMT',now),5000);
-  assert.equal(parseRetryAfterMs('invalid',now),null);
-  assert.equal(parseRetryAfterMs('0',now),1000);
-  assert.equal(parseRetryAfterMs('999',now),60000);
-});
-test('a delayed recovery response cannot roll back a newer notification', () => {
-  const {newerNotification,delayedRecovery}=revisionMergeResults();
-  assert.equal(newerNotification.applied,true);
-  assert.equal(newerNotification.state.revision,8);
-  assert.equal(newerNotification.state.status,'cancelled');
-  assert.equal(delayedRecovery.applied,false);
-  assert.equal(delayedRecovery.reason,'stale');
-  assert.equal(delayedRecovery.state.revision,8);
-  assert.equal(delayedRecovery.state.status,'cancelled');
-});
-test('a delayed notification cannot roll back a newer recovery response', () => {
-  const {newerRecovery,delayedNotification}=revisionMergeResults();
-  assert.equal(newerRecovery.state.revision,9);
-  assert.equal(newerRecovery.state.status,'on_trip');
-  assert.equal(delayedNotification.applied,false);
-  assert.equal(delayedNotification.reason,'stale');
-  assert.equal(delayedNotification.state.status,'on_trip');
-});
-test('an exact duplicate revision is ignored without requesting recovery', () => {
-  const {duplicate}=revisionMergeResults();
-  assert.equal(duplicate.applied,false);
-  assert.equal(duplicate.reason,'duplicate');
-  assert.equal(duplicate.needsRecovery,false);
-  assert.equal(duplicate.state.revision,8);
-});
-test('conflicting content at the same revision is not applied and requests recovery', () => {
-  const {conflicting}=revisionMergeResults();
-  assert.equal(conflicting.applied,false);
-  assert.equal(conflicting.reason,'same_revision_conflict');
-  assert.equal(conflicting.needsRecovery,true);
-  assert.equal(conflicting.state.status,'cancelled');
-});
-test('a notification revision gap waits for an authoritative recovery snapshot', () => {
-  const {gap,gapRecovery}=revisionMergeResults();
-  assert.equal(gap.applied,false);
-  assert.equal(gap.reason,'revision_gap');
-  assert.equal(gap.needsRecovery,true);
-  assert.equal(gap.state.revision,7);
-  assert.equal(gapRecovery.applied,true);
-  assert.equal(gapRecovery.state.revision,10);
-  assert.equal(gapRecovery.state.status,'completed');
-});
-test('cross-ride, cross-role and notification-only baselines never enter the current view', () => {
-  const {wrongRide,wrongRole,missingBaseline,recoveredBaseline}=revisionMergeResults();
-  for(const result of [wrongRide,wrongRole]){
-    assert.equal(result.applied,false);
-    assert.equal(result.reason,'scope_mismatch');
-    assert.equal(result.needsRecovery,false);
-    assert.equal(result.state.revision,7);
-  }
-  assert.equal(missingBaseline.reason,'missing_baseline');
-  assert.equal(missingBaseline.needsRecovery,true);
-  assert.equal(missingBaseline.state,null);
-  assert.equal(recoveredBaseline.applied,true);
-  assert.equal(recoveredBaseline.reason,'baseline');
-  assert.equal(recoveredBaseline.state.revision,8);
-});
-test('a minimal notification hint obtains display state only from an authorized recovery read', async () => {
-  const {authorized}=await notificationHintResults();
-  assert.equal(authorized.calls,1);
-  assert.deepEqual(authorized.recoveredFrom,{type:'ride.changed',rideId:FIXTURE.requestId,revision:9});
-  assert.equal(authorized.fetched,true);
-  assert.equal(authorized.applied,true);
-  assert.equal(authorized.state.revision,9);
-  assert.equal(authorized.state.status,'on_trip');
-  assert.equal(authorized.state.nextAction,'show_on_trip');
-});
-test('notification payloads containing private or display fields are rejected without a read', async () => {
-  const {sensitive,rejectedCalls}=await notificationHintResults();
-  assert.equal(rejectedCalls,0);
-  assert.equal(sensitive.fetched,false);
-  assert.equal(sensitive.applied,false);
-  assert.equal(sensitive.reason,'invalid_hint');
-  assert.equal(sensitive.state.status,'cancelled');
-});
-test('stale, duplicate and foreign ride hints do not trigger recovery traffic', async () => {
-  const {stale,duplicate,foreign,rejectedCalls}=await notificationHintResults();
-  assert.equal(rejectedCalls,0);
-  assert.deepEqual([stale.reason,duplicate.reason,foreign.reason],['stale_or_duplicate_hint','stale_or_duplicate_hint','foreign_hint']);
-  for(const result of [stale,duplicate,foreign]){
-    assert.equal(result.fetched,false);
-    assert.equal(result.state.revision,8);
-  }
-});
-test('an authorized 404 clears cached ride state after access is lost', async () => {
-  const {accessLost}=await notificationHintResults();
-  assert.equal(accessLost.fetched,true);
-  assert.equal(accessLost.reason,'access_lost');
-  assert.equal(accessLost.state,null);
-  assert.equal(accessLost.needsRecovery,false);
-});
-test('a newer hint with a 304 response never fabricates the hinted state', async () => {
-  const {notYetVisible}=await notificationHintResults();
-  assert.equal(notYetVisible.fetched,true);
-  assert.equal(notYetVisible.applied,false);
-  assert.equal(notYetVisible.reason,'hint_not_yet_visible');
-  assert.equal(notYetVisible.needsRecovery,true);
-  assert.equal(notYetVisible.state.revision,8);
-  assert.equal(notYetVisible.state.status,'cancelled');
-});
-test('a notification can request but cannot itself establish an initial display baseline', async () => {
-  const {initial}=await notificationHintResults();
-  assert.equal(initial.fetched,true);
-  assert.equal(initial.applied,true);
-  assert.equal(initial.reason,'baseline');
-  assert.equal(initial.state.revision,4);
-  assert.equal(initial.state.status,'assigned');
-  assert.equal(initial.state.viewerRole,'passenger');
-});
-test('logout clears ride state, ETag and scheduled retry state', () => {
-  const {loggedOut,retryCancelled}=sessionIsolationResults();
-  assert.equal(retryCancelled,1);
-  assert.equal(loggedOut.active,false);
-  assert.equal(loggedOut.state,null);
-  assert.equal(loggedOut.etag,null);
-  assert.equal(loggedOut.retryScheduled,false);
-  assert.equal(loggedOut.inFlight,0);
-});
-test('logout aborts an in-flight recovery request', () => {
-  const {logoutSignalAborted}=sessionIsolationResults();
-  assert.equal(logoutSignalAborted,true);
-});
-test('a recovery response completing after logout cannot restore cached state', () => {
-  const {delayedAfterLogout}=sessionIsolationResults();
-  assert.equal(delayedAfterLogout.applied,false);
-  assert.equal(delayedAfterLogout.reason,'stale_session');
-  assert.equal(delayedAfterLogout.state,null);
-});
-test('role switching clears passenger cache and rejects its delayed response', () => {
-  const {afterRoleSwitch,passengerSignalAborted,delayedPassenger}=sessionIsolationResults();
-  assert.equal(afterRoleSwitch.active,true);
-  assert.equal(afterRoleSwitch.viewerRole,'driver');
-  assert.equal(afterRoleSwitch.state,null);
-  assert.equal(afterRoleSwitch.etag,null);
-  assert.equal(passengerSignalAborted,true);
-  assert.equal(delayedPassenger.reason,'stale_session');
-  assert.equal(delayedPassenger.state,null);
-});
-test('the new role can apply only its own authorized recovery response', () => {
-  const {driverRecovery,driverState}=sessionIsolationResults();
-  assert.equal(driverRecovery.applied,true);
-  assert.equal(driverRecovery.state.viewerRole,'driver');
-  assert.equal(driverState.viewerRole,'driver');
-  assert.equal(driverState.state.status,'on_trip');
-  assert.equal(driverState.state.nextAction,'continue_trip');
-  assert.equal(driverState.etag,'"driver-etag"');
-});
-test('switching accounts rejects an old response even when role and ride ID match', () => {
-  const {delayedAccountA,accountBState}=sessionIsolationResults();
-  assert.equal(delayedAccountA.applied,false);
-  assert.equal(delayedAccountA.reason,'stale_session');
-  assert.equal(delayedAccountA.state,null);
-  assert.equal(accountBState.active,true);
-  assert.equal(accountBState.viewerRole,'passenger');
-  assert.equal(accountBState.state,null);
-  assert.equal(accountBState.etag,null);
-});
-test('a command success completing after logout is discarded', () => {
-  const {loggedOut,logoutAborted,delayedSuccess}=commandSessionResults();
-  assert.equal(loggedOut.active,false);
-  assert.equal(loggedOut.inFlight,0);
-  assert.equal(logoutAborted,true);
-  assert.equal(delayedSuccess.committed,false);
-  assert.equal(delayedSuccess.reason,'stale_session');
-  assert.equal(delayedSuccess.autoRetry,false);
-});
-test('session expiry during a state-changing command requires reauthentication without auto-retry', () => {
-  const {sessionExpired}=commandSessionResults();
-  assert.equal(sessionExpired.committed,false);
-  assert.equal(sessionExpired.reason,'session_expired');
-  assert.equal(sessionExpired.autoRetry,false);
-  assert.equal(sessionExpired.needsReauth,true);
-  assert.equal(sessionExpired.needsRecovery,true);
-});
-test('an unknown command outcome is reconciled before an explicit same-key retry', () => {
-  const {outcomeUnknown}=commandSessionResults();
-  assert.equal(outcomeUnknown.committed,false);
-  assert.equal(outcomeUnknown.reason,'outcome_unknown');
-  assert.equal(outcomeUnknown.autoRetry,false);
-  assert.equal(outcomeUnknown.needsRecovery,true);
-  assert.equal(outcomeUnknown.reuseSameKey,true);
-});
-test('account switching rejects the old command but allows the new account command', () => {
-  const {delayedAccountA,accountBCommitted}=commandSessionResults();
-  assert.equal(delayedAccountA.reason,'stale_session');
-  assert.equal(delayedAccountA.committed,false);
-  assert.equal(accountBCommitted.reason,'committed');
-  assert.equal(accountBCommitted.committed,true);
-});
-test('the same raw Idempotency-Key is isolated by authenticated account', () => {
-  const {accountAScope,reauthScope,accountBScope,accountAHandleScope,accountBHandleScope}=commandSessionResults();
-  assert.equal(accountAScope,reauthScope);
-  assert.equal(accountAScope,accountAHandleScope);
-  assert.equal(accountBScope,accountBHandleScope);
-  assert.notEqual(accountAScope,accountBScope);
-});
-test('structured idempotency scoping avoids delimiter collisions', () => {
-  const {delimiterA,delimiterB}=commandSessionResults();
-  assert.notEqual(delimiterA,delimiterB);
-});
-test('an already-applied unknown command completes from recovered state without replay', async () => {
-  const {alreadyApplied,appliedReplayCalls}=await commandRecoveryResults();
-  assert.equal(alreadyApplied.committed,true);
-  assert.equal(alreadyApplied.reason,'confirmed_by_recovery');
-  assert.equal(alreadyApplied.resent,false);
-  assert.equal(alreadyApplied.state.status,'cancelled');
-  assert.equal(appliedReplayCalls,0);
-});
-test('an unchanged recovered state permits exactly one explicit same-key replay', async () => {
-  const {replayed,replayCalls}=await commandRecoveryResults();
-  assert.equal(replayed.committed,true);
-  assert.equal(replayed.reason,'committed_by_replay');
-  assert.equal(replayed.resent,true);
-  assert.equal(replayCalls.length,1);
-  assert.equal(replayCalls[0].action,'cancel_ride');
-  assert.equal(replayCalls[0].idempotencyKey,'recover-cancel-key');
-});
-test('a newer conflicting state stops recovery without replaying the command', async () => {
-  const {changed,changedReplayCalls}=await commandRecoveryResults();
-  assert.equal(changed.committed,false);
-  assert.equal(changed.reason,'state_changed');
-  assert.equal(changed.resent,false);
-  assert.equal(changed.state.status,'on_trip');
-  assert.equal(changedReplayCalls,0);
-});
-test('loss of recovery access stops the command without replay', async () => {
-  const {denied,deniedReplayCalls}=await commandRecoveryResults();
-  assert.equal(denied.committed,false);
-  assert.equal(denied.reason,'access_lost');
-  assert.equal(denied.resent,false);
-  assert.equal(deniedReplayCalls,0);
-});
-test('an unknown replay outcome stops after the single explicit replay', async () => {
-  const {replayUnknown,unknownReplayCalls}=await commandRecoveryResults();
-  assert.equal(replayUnknown.committed,false);
-  assert.equal(replayUnknown.reason,'replay_unresolved');
-  assert.equal(replayUnknown.resent,true);
-  assert.equal(unknownReplayCalls,1);
-});
-test('a session switch during recovery discards the result and prevents replay', async () => {
-  const {staleSession,staleReplayCalls}=await commandRecoveryResults();
-  assert.equal(staleSession.committed,false);
-  assert.equal(staleSession.reason,'stale_session');
-  assert.equal(staleSession.resent,false);
-  assert.equal(staleReplayCalls,0);
-});
+NÈB›]›ÝYšXØ][Û’[ÛÛ˜XÝÂ™[˜Ý[Ûˆ›ÝYšXØ][Û’[™\Ý[Ê
+HÈ™]\›ˆ›ÝYšXØ][Û’[ÛÛ˜XÝH[“›ÝYšXØ][Û’[ÛÛ˜XÝ
+
+NÈB›]Ù\ÜÚ[Û’\ÛÛ][ÛÛÛ˜XÝÂ™[˜Ý[ÛˆÙ\ÜÚ[Û’\ÛÛ][Û”™\Ý[Ê
+HÈ™]\›ˆÙ\ÜÚ[Û’\ÛÛ][ÛÛÛ˜XÝH[”Ù\ÜÚ[Û’\ÛÛ][ÛÛÛ˜XÝ
+
+NÈB›]ÛÛ[X[™Ù\ÜÚ[ÛÛÛ˜XÝÂ™[˜Ý[ÛˆÛÛ[X[™Ù\ÜÚ[Û”™\Ý[Ê
+HÈ™]\›ˆÛÛ[X[™Ù\ÜÚ[ÛÛÛ˜XÝH[ÛÛ[X[™Ù\ÜÚ[ÛÛÛ˜XÝ
+
+NÈB›]ÛÛ[X[™™XÛÝ™\žPÛÛ˜XÝÂ™[˜Ý[ÛˆÛÛ[X[™™XÛÝ™\žT™\Ý[Ê
+HÈ™]\›ˆÛÛ[X[™™XÛÝ™\žPÛÛ˜XÝH[ÛÛ[X[™™XÛÝ™\žPÛÛ˜XÝ
+
+NÈB›]Ø[˜Ù[][Û”™X\ÛÛÛÛ˜XÝÂ™[˜Ý[ÛˆØ[˜Ù[][Û”™X\ÛÛ”™\Ý[Ê
+HÈ™]\›ˆØ[˜Ù[][Û”™X\ÛÛÛÛ˜XÝH[Ø[˜Ù[][Û”™X\ÛÛÛÛ˜XÝ
+
+NÈB›]Ù™™\“\ÝÛÛ˜XÝÂ™[˜Ý[ÛˆÙ™™\“\Ý™\Ý[Ê
+HÈ™]\›ˆÙ™™\“\ÝÛÛ˜XÝH[“Ù™™\“\ÝÛÛ˜XÝ
+
+NÈB™[˜Ý[ÛˆÙ]\
+
+HÂˆÛÛœÝØ[™›ÞH›K˜Ü™X]PÛÛ^
+ßJNÂˆØÜš\ËœÛXÙJŠK™›Ü‘XXÚ
+ØÜš\Oˆ›Kœ[’[ÛÛ^
+ØÜš\Ø[™›Þ
+JNÂˆ™]\›ˆÛNˆØ[™›Þ•^T›Û\Ë˜Ü™X]J
+KŽˆØ[™›Þ•^U™\šYšXØ][Û‹ŽˆØ[™›Þ•^T›Û\ßNÂŸB™[˜Ý[Ûˆ\ÜÙ[™Ù\ŠJHÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÂˆ™]\›ˆKœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰Ô™]šY]ÈÝY\Ý	ËÛ™N‰ÊÎNL	Ë[™ÝXYÙN‰Ú˜IË^[Y[‰ØØ\™	ËXÚÝ\‰Ñ[[ÈÝ[	ËÛÛœÙ[Y_JNÂŸB™[˜Ý[Ûˆ\XØ][ÛŠŠHÂˆ™]\›ˆÛ˜[YN‰Ô™]šY]È\XØ[	ËÛ™N‰ÊÍÎL	Ë]N‰ÑSSÈIËÛ\Ž‰Ñ[[ÈÛ\‰Ë™ZXÛN‰Ñ[[ÈØ\‰Ë^T\›Z]‰ÑSSËUVIËš]™\“XÙ[˜ÙN‰ÑSSËSPÉËÝ”\›Z]‰ÑSSËTÕ‰Ë˜\ÙN‰Ó˜YH[[ÉËÛÛœÙ[YKØÝ[Y[Î“Øš™XÝ™œ›ÛQ[šY\Ê‹”‘TURT‘Q›X\
+ÈOˆÚËØ]XÚY[‰ÑSSËIÊÚÊÉËœ‰Ë^\™\Ð]›™]È]J]K››ÝÊ
+JÎ
+KÒTÓÔÝš[™Ê
+_WJJ_NÂŸB\Ý
+	ØÛY[YXÛÙYÛÛÙÛHÛZ[\È™[XZ[ˆ[œ]\ÜÚ\Ý[˜ÙH[[\ÝYÙ\™\ˆ™\šYšXØ][Û‰Ë
+
+HOˆÂˆÛÛœÝÔ‹_O\Ù]\
+
+NÂˆÛÛœÝÛY[Û›OT‹™ÛÛÙÛRY[]PÛÛ›™XÝ[Û•šY]ÊÂˆÜ™Y[X[[\ÜYYKÛÛÙÛS[šÙYYKÙ\™\•™\šYšYYYKÝXŽ‰ÌLÍŽLMLÍLŒMLÌMLLLÌŒÍÉËˆ™\šYšXØ][ÛŽžÜÛÝ\˜ÙN‰ØÛY[	ËÚYÛ˜]\™NYK]YY[˜ÙNYK\ÜÝY\ŽYK›Ý^\™YY_BˆJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹˜ÛY[Û›_KÜÝ]N‰Ú[œ]Ø\ÜÚ\Ý	ËX™[‰ÑÛÛÙÛyaiyb¦ú(ç9bª{ï"9§+9.®¹è®º*£y§*¹£©yí¦»ï"IËØ[]][XØ]N™˜[ÙK\œÚ\ÝÝXš™XÝ™˜[Ù_JNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝ[Kœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰ÑÛÛÙÛH[œ]ÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ú˜IË^[Y[‰ØØ\™	ËXÚÝ\‰Ñ[[ÈÝ[	ËÛÛœÙ[YKÛÛÙÛS[šÙYYKÛÛÙÛTÝXŽ‰ÌLÍŽLMLÍLŒMLÌMLLLÌŒÍÉßJNÂˆ\ÜÙ\™\]X[
+	ÙÛÛÙÛS[šÙY	È[ˆ˜[ÙJNØ\ÜÙ\™\]X[
+	ÙÛÛÙÛTÝX‰È[ˆ˜[ÙJNÂˆÛÛœÝ™\šYšYYT‹™ÛÛÙÛRY[]PÛÛ›™XÝ[Û•šY]ÊØÜ™Y[X[[\ÜYYK™\šYšXØ][ÛŽžÜÛÝ\˜ÙN‰Ø]][XØ]YÜÙ\™\‰ËÚYÛ˜]\™NYK]YY[˜ÙNYK\ÜÝY\ŽYK›Ý^\™YY__JNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹™\šYšYYKÜÝ]N‰Ý™\šYšYY	ËX™[‰ÑÛÛÙÛy§+9.®¹è®º*£y®"8àoÉËØ[]][XØ]NYK\œÚ\ÝÝXš™XÝY_JNÂŸJNÂ\Ý
+	ÑÛÛÙÛH[œ]\ÜÚ\Ý[˜ÙH™YÚ\Ý˜][ÛˆÛ˜\ÚÝÝš\È[™\šYšYY[šÈ[™ÝXš™XÝÛZ[\ÉË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆÛÛœÝÛ˜\ÚÝT‹™ÛÛÙÛRY[]T™YÚ\Ý˜][Û”Û˜\ÚÝ
+ÂˆÜ™Y[X[[\ÜYYKÛÛÙÛS[šÙYYKÛÛÙÛTÝXŽ‰ÌLÍŽLMLÍLŒMLÌMLLLÌŒÍÉËÙ\™\•™\šYšYYYKˆ™\šYšXØ][ÛŽžÜÛÝ\˜ÙN‰ØÛY[	ËÚYÛ˜]\™NYK]YY[˜ÙNYK\ÜÝY\ŽYK›Ý^\™YY_BˆJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹œÛ˜\ÚÝKÂˆÛÛÙÛR[œ]\ÜÚ\ÝYYKÛÛÙÛRY[]TÝ]N‰Ý[™\šYšYY	ËˆX™[‰ÑÛÛÙÛyaiyb¦ú(ç9bªy®"8àoûï"9§+9.®¹è®º*£y§*¹£©yí¦»ï"IËØ[]][XØ]N™˜[ÙK™YYÔÙ\™\”™Yœ™\Ú™˜[ÙBˆJNÂˆ\ÜÙ\™\]X[
+	ÙÛÛÙÛS[šÙY	È[ˆÛ˜\ÚÝ˜[ÙJNØ\ÜÙ\™\]X[
+	ÙÛÛÙÛTÝX‰È[ˆÛ˜\ÚÝ˜[ÙJNØ\ÜÙ\™\]X[
+	ÜÝXš™XÝ	È[ˆÛ˜\ÚÝ˜[ÙJNÂŸJNÂ\Ý
+	ÑÛÛÙÛHY[]HØ[››Ý™H™\ÝÜ™Y\È™\šYšYYÜˆ]][XØ][™Èœ›ÛHÛY[ÝÜ˜YÙIË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆÛÛœÝ[\\™YR”ÓÓ‹œÝš[™ÚYžJÂˆÛÛÙÛR[œ]\ÜÚ\ÝYYKÛÛÙÛRY[]TÝ]N‰Ý™\šYšYY	ËÛÛÙÛS[šÙYYKˆÛÛÙÛTÝXŽ‰ÌLÍŽLMLÍLŒMLÌMLLLÌŒÍÉËÝXš™XÝ‰ÌLÍŽLMLÍLŒMLÌMLLLÌŒÍÉËˆØ[]][XØ]NYK™\šYšXØ][ÛŽžÜÛÝ\˜ÙN‰Ø]][XØ]YÜÙ\™\‰ËÚYÛ˜]\™NYK]YY[˜ÙNYK\ÜÝY\ŽYK›Ý^\™YY_BˆJNÂˆÛÛœÝ™\ÝÜ™YT‹œ™\ÝÜ™QÛÛÙÛRY[]T™YÚ\Ý˜][Û”Û˜\ÚÝ
+[\\™Y
+NÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹œ™\ÝÜ™YKÂˆÛÛÙÛR[œ]\ÜÚ\ÝYYKÛÛÙÛRY[]TÝ]N‰Ý[™\šYšYY	ËˆX™[‰ÑÛÛÙÛyaiyb¦ú(ç9bªy®"8àoûï"9§+9.®¹è®º*£y§*¹£©yí¦»ï"IËØ[]][XØ]N™˜[ÙK™YYÔÙ\™\”™Yœ™\Ú™˜[ÙBˆJNÂˆÛÛœÝÛÜœ\T‹œ™\ÝÜ™QÛÛÙÛRY[]T™YÚ\Ý˜][Û”Û˜\ÚÝ
+	ÞØ˜YœÛÛ‰ÊNÂˆ\ÜÙ\™\]X[
+ÛÜœ\™ÛÛÙÛRY[]TÝ]K	Ý[˜]˜Z[X›IÊNØ\ÜÙ\™\]X[
+ÛÜœ\˜Ø[]][XØ]K˜[ÙJNÂŸJNÂ\Ý
+	ÑÛÛÙÛHX\È™\ÜÈÛÛ›™XÝYÛ›HY\ˆTHØY[™X\YK[ˆ˜Z[ÈÛÜÙY	Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹™ÛÛÙÛSX\ÐÛÛ›™XÝ[Û•šY]ÊßJ_KÜÝ]N‰Ù[[ÉËX™[‰ùåiyg,9fìøàîøàáøàèº(j9é.»ï"ÛÛÙÛHX\È9§*¹£©yí¦»ï"IË]™N™˜[ÙKXÝ[ÛŽ‰ØÛÛ™šYÝ\™IßJNÂˆ›ÜŠÛÛœÝ[œ]ÙˆÞØÛÛ™šYÝ\™YY_KØÛÛ™šYÝ\™YYK\SØYYY_KØÛÛ™šYÝ\™YYKX\YNY_WJ^ÂˆÛÛœÝšY]ÏT‹™ÛÛÙÛSX\ÐÛÛ›™XÝ[Û•šY]Ê[œ]
+NØ\ÜÙ\™\]X[
+šY]ËœÝ]K	ØÛÛ›™XÝ[™ÉÊNØ\ÜÙ\™\]X[
+šY]Ë›]™K˜[ÙJNØ\ÜÙ\™Ù\Ó›ÝX]Ú
+šY]Ë›X™[ù£©yí¦¹®"8àoËÊNÂˆBˆÛÛœÝÛÛ›™XÝYT‹™ÛÛÙÛSX\ÐÛÛ›™XÝ[Û•šY]ÊØÛÛ™šYÝ\™YYK\SØYYYKX\YNY_JNÂˆ\ÜÙ\™\]X[
+ÛÛ›™XÝYœÝ]K	ØÛÛ›™XÝY	ÊNØ\ÜÙ\™\]X[
+ÛÛ›™XÝY›]™KYJNØ\ÜÙ\›X]Ú
+ÛÛ›™XÝY›X™[ù£©yí¦¹®"8àoËÊNÂˆ›ÜŠÛÛœÝ˜Z[\™HÙˆÞØÛÛ™šYÝ\™YYK\SØYYYKX\YNYK]]˜Z[\™NY_KØÛÛ™šYÝ\™YYKØY˜Z[YY_WJ^ÂˆÛÛœÝšY]ÏT‹™ÛÛÙÛSX\ÐÛÛ›™XÝ[Û•šY]Ê˜Z[\™JNØ\ÜÙ\™\]X[
+šY]ËœÝ]K	Ù˜Z[Y	ÊNØ\ÜÙ\™\]X[
+šY]Ë›]™K˜[ÙJNØ\ÜÙ\™\]X[
+šY]Ë˜XÝ[Û‹	Ü™[ØY	ÊNØ\ÜÙ\›X]Ú
+šY]Ë›X™[øàáøàèº(j9é.‹ÊNÂˆBŸJNÂ\Ý
+	ÑÛÛÙÛHX\ÈÙ[ÛØØ][ÛˆØ[››Ý™\ÜÛÛ›™XÝY™Y›Ü™HHXÝ]™HX\™XXÚ\ÈYIË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KX\ÏT‹˜Ü™X]QÛÛÙÛSX\Ô™XY[™\ÜÐÛÛ›Û\Š
+NÂˆÛÛœÝš\œÝ[X\Ë˜™YÚ[ŠYJNÂˆ\ÜÙ\™\]X[
+š\œÝœÝ]KœÝ]K	ØÛÛ›™XÝ[™ÉÊNÂˆÛÛœÝØØ]Y[X\Ë›ØØ][ÛŠš\œÝÚÙ[ŠNÂˆ\ÜÙ\™\]X[
+ØØ]YœÝ]K›ØØ][Û”™XYKYJNØ\ÜÙ\™\]X[
+ØØ]YœÝ]K›]™K˜[ÙJNØ\ÜÙ\™Ù\Ó›ÝX]Ú
+ØØ]YœÝ]K›X™[ù£©yí¦¹®"8àoËÊNÂˆÛÛœÝØYY[X\Ë˜\T™XYJš\œÝÚÙ[ŠNÂˆ\ÜÙ\™\]X[
+ØYYœÝ]K›]™K˜[ÙJNØ\ÜÙ\™Ù\Ó›ÝX]Ú
+ØYYœÝ]K›X™[ù£©yí¦¹®"8àoËÊNÂˆÛÛœÝYO[X\ËšYJš\œÝÚÙ[ŠNÂˆ\ÜÙ\™\]X[
+YKœÝ]K›]™KYJNØ\ÜÙ\™\]X[
+YKœÝ]K›X™[	ÑÛÛÙÛHX\È9£©yí¦¹®"8àoøàîùãï¹g*9g,8à¤º(j9é.‰ÊNÂŸJNÂ\Ý
+	ÑÛÛÙÛHX\È]]˜Z[\™H™[[Ý™\ÈÛÛ›™XÝYÝ]H[™™\]Z\™\È™[ØY	Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KX\ÏT‹˜Ü™X]QÛÛÙÛSX\Ô™XY[™\ÜÐÛÛ›Û\Š
+NÂˆÛÛœÝš\œÝ[X\Ë˜™YÚ[ŠYJNÂˆX\Ë˜\T™XYJš\œÝÚÙ[ŠNÛX\Ë›ØØ][ÛŠš\œÝÚÙ[ŠNÛX\ËšYJš\œÝÚÙ[ŠNÂˆ\ÜÙ\™\]X[
+X\ËœÛ˜\ÚÝ
+
+KœÝ]K	ØÛÛ›™XÝY	ÊNÂˆÛÛœÝ˜Z[Y[X\Ë™˜Z[
+š\œÝÚÙ[ŠNÂˆ\ÜÙ\™\]X[
+˜Z[YœÝ]KœÝ]K	Ù˜Z[Y	ÊNØ\ÜÙ\™\]X[
+˜Z[YœÝ]K›]™K˜[ÙJNØ\ÜÙ\™\]X[
+˜Z[YœÝ]K›ØØ][Û”™XYK˜[ÙJNÂˆÛÛœÝ™]žO[X\Ë˜™YÚ[ŠYJNØ\ÜÙ\™\]X[
+™]žK˜XØÙ\Y˜[ÙJNØ\ÜÙ\™\]X[
+™]žKœ™X\ÛÛ‹	Ü™[ØYÜ™\]Z\™Y	ÊNÂˆ\ÜÙ\™\]X[
+X\ËšYJš\œÝÚÙ[ŠK˜XØÙ\Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+X\Ë›ØØ][ÛŠš\œÝÚÙ[ŠK˜XØÙ\Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+X\ËœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹™]žKÚÙ[ŠNØ\ÜÙ\™\]X[
+X\ËœÛ˜\ÚÝ
+
+KœÝ]K	Ù˜Z[Y	ÊNØ\ÜÙ\™\]X[
+X\ËœÛ˜\ÚÝ
+
+Kœ™[ØY™\]Z\™YYJNÂŸJNÂ\Ý
+	ÑÛÛÙÛHX\È˜Z[\™H™]\›œÈ\Ý[˜][Ûˆ[žHÈHX[X[˜[˜XÚÉË
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÙ[˜Ý[ÛˆX\˜Z[
+^
+W×ÊœXÙTÙ[XÝ[Û—˜Ø[˜Ù[
+
+NÜÝ]Wœ›Ý]TÙ\W
+×
+ÎØÛX\“[™\×
+
+NËÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÜÝ]W›X\™XYOY˜[ÙNÜÝ]W›ØY[™ÓX\Y˜[ÙNÜÝ]W›X\[[ÜÝ]Wœ›Ý]SX[[ÜÝ]W›X\ÛÛ›™XÝ[Û•ÚÙ[[[ÜÝ]W›X\ØÜš\×œ™[[Ý™W
+
+NÜÝ]W›X\ØÜš\[[ÜÝ]W™\Ý[˜][ÛW	
+	Ù\Ý[˜][Û‰×
+W˜[YWš[W
+
+NÜXÚÝ\[œ]›X\˜Z[\™W
+
+NËÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙK×	
+	ÙÛÛÙÛK\ÙX\˜Ú	×
+Wœ™\XÙPÚ[™[—
+
+N×	
+	ÙÛÛÙÛK\ÙX\˜Ú	×
+WšY[]YN×	
+	ÛÙ™›[™K\ÙX\˜Ú	×
+WšY[Y˜[ÙNËÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙK×	
+	Û]™K\Ý[[X\žI×
+WšY[]YN×	
+	Ü›Ý]K\Ý]\É×
+W^ÛÛ[Iùg,9fìù§*¹£©yí¦¸à ¹æë¹æ¡9g,8àkù¢bùaiyb¦øàiøàcxào¸àfxà ‰ÎËÊNÂŸJNÂ\Ý
+	ÑÛÛÙÛHX\È˜Z[\™HXZÙ\ÈH[™[™ÈXÙHØ[˜XÚÈÝ[H™Y›Ü™H˜[˜XÚÈ[œ]™\Ý[Y\ÉË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÙ[XÝ[ÛT‹˜Ü™X]QÛÛÙÛTXÙTÙ[XÝ[ÛÛÛ›Û\Š
+K[™[™Ï\Ù[XÝ[Û‹˜™YÚ[Š
+NÂˆÙ[XÝ[Û‹˜Ø[˜Ù[
+
+NÂˆ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜Ø[\J[™[™ËÚÙ[ŠK˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜\J[™[™ËÚÙ[ŠKœ™X\ÛÛ‹	ÜÝ[WÜXÙIÊNÂˆ\ÜÙ\™\]X[
+Ù[XÝ[Û‹™˜Z[
+[™[™ËÚÙ[ŠKœ™X\ÛÛ‹	ÜÝ[WÜXÙIÊNÂŸJNÂ\Ý
+	Û]™HÛÛÙÛHX\ÈÛÛ›™XÝ[Ûˆ\Ù\ÈHÙ[™\˜][Û‹\ÜXÚYšXÈØ[˜XÚÈ[™ØZ]È›ÜˆYIË
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØÛÛœÝÛÛ›™XÝ[Û[X\Ô™XY[™\Ü×˜™YÚ[—
+YW
+NÚY—
+XÛÛ›™XÝ[Û—˜XØÙ\Y
+\™]\›–×××JØÛÛœÝØ[˜XÚÓ˜[YOIÝ^R[š]X\	×
+ØÛÛ›™XÝ[Û—ÚÙ[ŽÛ][š][Y\ŽËÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÜÝ]W›X\ÛÛ›™XÝ[Û•ÚÙ[XÛÛ›™XÝ[Û—ÚÙ[ŽÜÝ]W›ØY[™ÓX\]YNÖ×××JÛX\Ô™XY[™\Ü×˜\T™XYW
+ÛÛ›™XÝ[Û—ÚÙ[—
+KÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÙÛÛÙÛW›X\×™]™[˜Y\Ý[™\“Û˜ÙW
+Ý]W›X\	ÚYIË×××JÛX\Ô™XY[™\Ü×šYW
+ÛÛ›™XÝ[Û—ÚÙ[—
+NÚY—
+XÝ\œ™[
+
+WZYW˜XØÙ\YYWœÝ]WœÝ]HOOIØÛÛ›™XÝY	×
+\™]\›ŽËÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØØ[˜XÚÏI×
+Ù[˜ÛÙUT’PÛÛ\Û™[
+Ø[˜XÚÓ˜[YW
+KÊNÂˆ\ÜÙ\™Ù\Ó›ÝX]Ú
+ÛÝ\˜ÙKØØ[˜XÚÏ]^R[š]X\
+Î–ÉÉ—JKÊNÂŸJNÂ\Ý
+	Ø[ˆÛX\ÈØ[˜XÚÈØ[››ÝÜ™X]HHØ[YK\YÙH™]žHÙ[™\˜][Û‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KX\ÏT‹˜Ü™X]QÛÛÙÛSX\Ô™XY[™\ÜÐÛÛ›Û\Š
+NÂˆÛÛœÝÛ[X\Ë˜™YÚ[ŠYJNÛX\Ë™˜Z[
+ÛÚÙ[ŠNØÛÛœÝ™]žO[X\Ë˜™YÚ[ŠYJNÂˆ\ÜÙ\™\]X[
+™]žK˜XØÙ\Y˜[ÙJNØ\ÜÙ\™\]X[
+™]žKÚÙ[‹ÛÚÙ[ŠNØ\ÜÙ\™\]X[
+X\ËœÛ˜\ÚÝ
+
+Kœ™[ØY™\]Z\™YYJNÂˆ\ÜÙ\™\]X[
+X\Ë˜\T™XYJÛÚÙ[ŠKœÝ]KœÝ]K	Ù˜Z[Y	ÊNØ\ÜÙ\™\]X[
+X\ËšYJÛÚÙ[ŠKœÝ]KœÝ]K	Ù˜Z[Y	ÊNÂŸJNÂ\Ý
+	Û]™HX\È˜Z[\™H™[[Ý™\ÈH[š™XÝYØÜš\[™\ØX›\È[œØY™H™XÛÛ›™XÝ	Ë
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÜÝ]W›X\ØÜš\×œ™[[Ý™W
+
+NÜÝ]W›X\ØÜš\[[Ö×××J×	
+	ØÛÛ›™XÝ[X\É×
+W™\ØX›Y]YNËÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKùk¢yaj8àj¹a£y£©yí¦¸àjøàkøàæ¸àï8à®8à¤¹a£z*«xàoú/¯8àoøàeøài¸àcøàh8àexàaÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÜØÜš\›Û™\œ›ÜY˜Z[ÜÝ]W›X\ØÜš\\ØÜš\ÙØÝ[Y[šXY˜\[™Ú[
+ØÜš\
+NËÊNÂŸJNÂ\Ý
+	ÑÛÛÙÛHXÙHÙ[XÝ[Ûˆ\Ù\ÈHÝX›HY™\ÜÈ[™™Z™XÝÈZ\ÜÚ[™ÈÛÛÜ™[˜]\ÉË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆÛÛœÝÙ[XÝYT‹™ÛÛÙÛTXÙQ\Ý[˜][ÛŠÙ\Ü^S˜[YN‰ÐZ\œÜ	Ë›Ü›X]YY™\ÜÎ‰Ó˜YH[\›˜][Û˜[Z\œÜšZšIËØØ][ÛŽžÛ]Š
+OO‹LMËÍMK™ÎŠ
+OOŒMÍËß_JNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹œÙ[XÝYKÛX™[‰Ó˜YH[\›˜][Û˜[Z\œÜšZšIË›Ý]NœÙ[XÝYœ›Ý]_JNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹œÙ[XÝYœ›Ý]_KÛ]‹LMËÍMK™ÎŒMÍËßJNÂˆ\ÜÙ\™\]X[
+‹™ÛÛÙÛTXÙQ\Ý[˜][ÛŠÙ\Ü^S˜[YN‰Ó›ÈØØ][Û‰ßJK[
+NÂˆ\ÜÙ\™\]X[
+‹™ÛÛÙÛTXÙQ\Ý[˜][ÛŠÛØØ][ÛŽžÛ]“˜S‹™ÎŒMÍËß_JK[
+NÂŸJNÂ\Ý
+	ÑÛÛÙÛHXÙHÙ[XÝ[Ûˆ[˜[Y]\ÈÛ][Ý\È™Y›Ü™H™\XÚ[™ÈH›Ý]H\Ý[˜][Û‰Ë
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÚY—
+\XÙTÙ[XÝ[Û—˜Ø[\W
+Ù[XÝ[Û—ÚÙ[—
+W
+\™]\›ŽØÛÛœÝÙ[XÝYT—™ÛÛÙÛTXÙQ\Ý[˜][Û—
+
+NÚY—
+\Ù[XÝY
+WÜXÙTÙ[XÝ[Û—˜\W
+Ù[XÝ[Û—ÚÙ[—
+NÜ™]\›Ž×ZY—
+Z[˜[Y]PÝ\œ™[ÙX\˜Ú
+Ù\Ý[˜][ÛŽœÙ[XÝY›X™[W
+W
+WÜXÙTÙ[XÝ[Û—˜\W
+Ù[XÝ[Û—ÚÙ[—
+NÜ™]\›Ž×ZY—
+\XÙTÙ[XÝ[Û—˜\W
+Ù[XÝ[Û—ÚÙ[—
+W˜XØÙ\Y
+\™]\›Ž×ÊœÝ]W™\Ý[˜][Û\Ù[XÝYœ›Ý]N×	
+	Ù\Ý[˜][Û‰×
+W˜[YO\Ù[XÝY›X™[ËÊNÂˆÛÛœÝÔ‹_O\Ù]\
+
+NÜ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ó˜YHÝÛ‰ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆÛÛœÝÙ[XÝYT‹™ÛÛÙÛTXÙQ\Ý[˜][ÛŠÙ\Ü^S˜[YN‰ÐZ\œÜ	Ë›Ü›X]YY™\ÜÎ‰Ó˜YH[\›˜][Û˜[Z\œÜšZšIËØØ][ÛŽžÛ]‹LMËÍMK™ÎŒMÍËß_JNÂˆ\ÜÙ\™\]X[
+Kš[˜[Y]TšYTÙX\˜Ú
+šYKšYÙ\Ý[˜][ÛŽœÙ[XÝY›X™[JKš[˜[Y]YYJNÂˆ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ØØ[˜Ù[Y	ÊNØ\ÜÙ\™\]X[
+Ù™™\‹œÝ]\Ë	Ù^\™Y	ÊNØ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠÙ™™\‹šY
+JNÂŸJNÂ\Ý
+	ØH™]Ù\ˆÛÛÙÛHXÙHÙ[XÝ[Ûˆ™Z™XÝÈH[^YYÛ\ˆ™\Ý[	Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÙ[XÝ[ÛT‹˜Ü™X]QÛÛÙÛTXÙTÙ[XÝ[ÛÛÛ›Û\Š
+NÂˆÛÛœÝÛ\Ù[XÝ[Û‹˜™YÚ[Š
+KÝ\œ™[\Ù[XÝ[Û‹˜™YÚ[Š
+NÂˆ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜Ø[\JÛÚÙ[ŠK˜[ÙJNØ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜\JÛÚÙ[ŠKœ™X\ÛÛ‹	ÜÝ[WÜXÙIÊNÂˆ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜Ø[\JÝ\œ™[ÚÙ[ŠKYJNØ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜\JÝ\œ™[ÚÙ[ŠK˜XØÙ\YYJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹œÙ[XÝ[Û‹œÛ˜\ÚÝ
+
+_KÙÙ[™\˜][ÛŽ˜Ý\œ™[ÚÙ[‹[™[™Î™˜[Ù_JNÂŸJNÂ\Ý
+	ÛX[X[\Ý[˜][Ûˆ[™šYHÝX›Z\ÜÚ[ÛˆØ[˜Ù[H[™[™ÈÛÛÙÛHXÙH™\Ý[	Ë
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙK×	
+	Ù\Ý[˜][Û‰×
+W˜Y]™[\Ý[™\—
+	Ú[œ]	Ë
+
+HOˆÈXÙTÙ[XÝ[Û—˜Ø[˜Ù[
+
+NËÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙK×	
+	Ùš[™[Ù™™\œÉ×
+W›Û˜ÛXÚÈH
+
+HOˆ×ÊžH×ÊœXÙTÙ[XÝ[Û—˜Ø[˜Ù[
+
+NËÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÚY—
+\XÙTÙ[XÝ[Û—˜Ø[\W
+Ù[XÝ[Û—ÚÙ[—
+W
+\™]\›ŽØÛÛœÝÙ[XÝYT—™ÛÛÙÛTXÙQ\Ý[˜][Û—
+
+NËÊNÂˆÛÛœÝÔŸO\Ù]\
+
+KÙ[XÝ[ÛT‹˜Ü™X]QÛÛÙÛTXÙTÙ[XÝ[ÛÛÛ›Û\Š
+K[™[™Ï\Ù[XÝ[Û‹˜™YÚ[Š
+NÂˆÙ[XÝ[Û‹˜Ø[˜Ù[
+
+NØ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜Ø[\J[™[™ËÚÙ[ŠK˜[ÙJNØ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜\J[™[™ËÚÙ[ŠK˜XØÙ\Y˜[ÙJNÂŸJNÂ\Ý
+	ØH[^YYÛÛÙÛHXÙH˜Z[\™HÝ^\ÈÚ[[Y\ˆH™]Ù\ˆÙ[XÝ[Û‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÙ[XÝ[ÛT‹˜Ü™X]QÛÛÙÛTXÙTÙ[XÝ[ÛÛÛ›Û\Š
+NÂˆÛÛœÝÛ\Ù[XÝ[Û‹˜™YÚ[Š
+KÝ\œ™[\Ù[XÝ[Û‹˜™YÚ[Š
+NÂˆ\ÜÙ\™\]X[
+Ù[XÝ[Û‹™˜Z[
+ÛÚÙ[ŠK˜XØÙ\Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜Ø[\JÝ\œ™[ÚÙ[ŠKYJNÂˆ\ÜÙ\™\]X[
+Ù[XÝ[Û‹˜\JÝ\œ™[ÚÙ[ŠK˜XØÙ\YYJNÂŸJNÂ\Ý
+	ÛÛ›HHÝ\œ™[ÛÛÙÛHXÙH˜Z[\™HÛÜÙ\ÈH[™[™ÈÙ[XÝ[Ûˆ[™ÚÝÜÈÝZY[˜ÙIË
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØØ]ÚÚY—
+XÙTÙ[XÝ[Û—™˜Z[
+Ù[XÝ[Û—ÚÙ[—
+W˜XØÙ\Y
+]Ø\Ý
+	ùæë¹æ¡9g,8à¤¹cå¹o¥øàiøàcxào¸àføà¤øà ¹a£z`n9¢§¸àeøài¸àcøàh8àexàa8à ‰×
+N×KÊNÂˆÛÛœÝÔŸO\Ù]\
+
+KÙ[XÝ[ÛT‹˜Ü™X]QÛÛÙÛTXÙTÙ[XÝ[ÛÛÛ›Û\Š
+KÝ\œ™[\Ù[XÝ[Û‹˜™YÚ[Š
+NÂˆÛÛœÝ˜Z[Y\Ù[XÝ[Û‹™˜Z[
+Ý\œ™[ÚÙ[ŠNÂˆ\ÜÙ\™\]X[
+˜Z[Y˜XØÙ\YYJNØ\ÜÙ\™\]X[
+˜Z[Yœ™X\ÛÛ‹	ÜXÙWÙ˜Z[Y	ÊNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹œÙ[XÝ[Û‹œÛ˜\ÚÝ
+
+_KÙÙ[™\˜][ÛŽ˜Ý\œ™[ÚÙ[‹[™[™Î™˜[Ù_JNÂˆ\ÜÙ\™\]X[
+Ù[XÝ[Û‹™˜Z[
+Ý\œ™[ÚÙ[ŠK˜XØÙ\Y˜[ÙJNÂŸJNÂ\Ý
+	ÛX[X[XÚÝ\Ý\š]™\ÈX\[™Ù[ÛØØ][Ûˆ˜Z[\™H[™Ø[ˆÝ[Ü™X]HH™\]Y\Ý	Ë
+
+HOˆÂˆÛÛœÝÔ‹_O\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	Ô˜[XYHØZ[Ø[ØIÊNÂˆÛÛœÝØØ][™Ï\XÚÝ\˜™YÚ[“ØØ][ÛŠ
+NÂˆÛÛœÝ˜Z[Y\XÚÝ\›ØØ][Û‘˜Z[\™JØØ][™ËÚÙ[ŠNÂˆ\ÜÙ\™\]X[
+˜Z[YœÝ]K˜[YK	Ô˜[XYHØZ[Ø[ØIÊNØ\ÜÙ\™\]X[
+˜Z[YœÝ]KœÛÝ\˜ÙK	ÛX[X[	ÊNØ\ÜÙ\™\]X[
+˜Z[YœÝ]K˜Ø[”™\]Y\ÝYJNØ\ÜÙ\›X]Ú
+˜Z[YœÝ]K›Y\ÜØYÙKù¢bùaiyb¦øàeøàgù.eú.â¹g,9à®KÊNÂˆÛÛœÝX\˜Z[Y\XÚÝ\›X\˜Z[\™J
+NÂˆ\ÜÙ\™\]X[
+X\˜Z[Y˜[YK	Ô˜[XYHØZ[Ø[ØIÊNØ\ÜÙ\™\]X[
+X\˜Z[Y˜Ø[”™\]Y\ÝYJNØ\ÜÙ\›X]Ú
+X\˜Z[Y›Y\ÜØYÙKù¢bùaiyb¦øàeøàgù.eú.â¹g,9à®KÊNÂˆ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\›X\˜Z[Y˜[YK\Ý[˜][ÛŽ‰Ó˜YHZ\œÜ	ßJNÂˆ\ÜÙ\™\]X[
+šYKœXÚÝ\	Ô˜[XYHØZ[Ø[ØIÊNØ\ÜÙ\™\]X[
+šYK™\Ý[˜][Û‹	Ó˜YHZ\œÜ	ÊNÂŸJNÂ\Ý
+	Û]HÙ[ÛØØ][Ûˆ™\Ý[Ø[››ÝÝ™\Üš]HH™]Ù\ˆX[X[XÚÝ\	Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	Ó˜YHÝÛ‰ÊNÂˆÛÛœÝÛ\XÚÝ\˜™YÚ[“ØØ][ÛŠ
+NÂˆXÚÝ\œÙ]X[X[
+	Ô˜Y\ÜÛÛˆ›H[˜\˜]IÊNÂˆÛÛœÝÝ[O\XÚÝ\›ØØ][Û”ÝXØÙ\ÜÊÛÚÙ[‹	ùãï¹g*9g,	ÊNÂˆ\ÜÙ\™\]X[
+Ý[K˜XØÙ\Y˜[ÙJNØ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÛØØ][Û‰ÊNØ\ÜÙ\™\]X[
+Ý[KœÝ]K˜[YK	Ô˜Y\ÜÛÛˆ›H[˜\˜]IÊNØ\ÜÙ\™\]X[
+Ý[KœÝ]KœÛÝ\˜ÙK	ÛX[X[	ÊNÂˆ\ÜÙ\™\]X[
+XÚÝ\˜Ø[\SØØ][ÛŠÛÚÙ[ŠK˜XØÙ\Y˜[ÙJNÂˆÛÛœÝœ™\Ú\XÚÝ\˜™YÚ[“ØØ][ÛŠ
+NÂˆÛÛœÝ\YY\XÚÝ\›ØØ][Û”ÝXØÙ\ÜÊœ™\ÚÚÙ[‹	ùãï¹g*9g,	ÊNÂˆ\ÜÙ\™\]X[
+\YY˜XØÙ\YYJNØ\ÜÙ\™\]X[
+\YYœÝ]K˜[YK	ùãï¹g*9g,	ÊNØ\ÜÙ\™\]X[
+\YYœÝ]KœÛÝ\˜ÙK	ÙÙ[ÛØØ][Û‰ÊNÂŸJNÂ\Ý
+	Ü\ÜÙ[™Ù\ˆ™YÚ\Ý˜][ÛˆÞ[˜Ú›Ûš^™\È]ÈY˜][XÚÝ\[ÈHš\œÝšYH™\]Y\Ý	Ë
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØÛÛœÝ˜[Y]YT—œ\ÜÙ[™Ù\”™YÚ\Ý˜][Û’[œ]
+[œ]
+KXÚÝ\]˜[Y]YœXÚÝ\×ÊšY—
+Z[˜[Y]PÝ\œ™[ÙX\˜Ú
+ÜXÚÝ\Z\œÜ™˜[ÙWW
+W
+\™]\›Ž×Ê˜ÛÛœÝ[[Ù[œ™YÚ\Ý\”\ÜÙ[™Ù\—
+˜[Y]Y
+NÜÝ]WœXÚÝ\\œXÚÝ\	ÉÎËÊNÂˆÛÛœÝÔ‹_O\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	Ó˜YKšZšIÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝ›Ùš[O[Kœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰ÒÝ[ÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰Ô˜[XYHÝZ]\ÈØZ[Ø[ØIËÛÛœÙ[Y_JNÂˆXÚÝ\œÙ]X[X[
+›Ùš[KœXÚÝ\	Ó˜YKšZšIÊNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\œXÚÝ\œÛ˜\ÚÝ
+
+K˜[YK\Ý[˜][ÛŽ‰Ó˜YHZ\œÜ	ßJNÂˆ\ÜÙ\™\]X[
+šYKœXÚÝ\	Ô˜[XYHÝZ]\ÈØZ[Ø[ØIÊNØ\ÜÙ\››Ý\]X[
+šYKœXÚÝ\	Ó˜YKšZšIÊNÂŸJNÂ\Ý
+	Ü›Ùš[HXÚÝ\Ú[™ÙHÚ[œÈÝ™\ˆHØØ][Ûˆ™\]Y\ÝÝ\Y™Y›Ü™H™K\™YÚ\Ý˜][Û‰Ë
+
+HOˆÂˆÛÛœÝÔ‹_O\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	Ó˜YKšZšIÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÂˆKœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰ÒÝ[ÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰Ô˜[XYHÝZ]\ÈØZ[Ø[ØIËÛÛœÙ[Y_JNÂˆÛÛœÝÛØØ][Û\XÚÝ\˜™YÚ[“ØØ][ÛŠ
+NÂˆÛÛœÝ\]Y[Kœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰ÒÝ[ÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰Ô˜Y\ÜÛÛˆ›H[˜\˜]IËÛÛœÙ[Y_JNÂˆXÚÝ\œÙ]X[X[
+\]YœXÚÝ\	Ó˜YKšZšIÊNÂˆÛÛœÝÝ[O\XÚÝ\›ØØ][Û”ÝXØÙ\ÜÊÛØØ][Û‹ÚÙ[‹	ùãï¹g*9g,	ÊNÂˆ\ÜÙ\™\]X[
+Ý[K˜XØÙ\Y˜[ÙJNØ\ÜÙ\™\]X[
+Ý[KœÝ]K˜[YK	Ô˜Y\ÜÛÛˆ›H[˜\˜]IÊNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\œXÚÝ\œÛ˜\ÚÝ
+
+K˜[YK\Ý[˜][ÛŽ‰Ó˜YHZ\œÜ	ßJNÂˆ\ÜÙ\™\]X[
+šYKœXÚÝ\	Ô˜Y\ÜÛÛˆ›H[˜\˜]IÊNÂŸJNÂ\Ý
+	Ü›Ùš[HXÚÝ\\]H[˜[Y]\ÈHÛÙX\˜Ú[™ÛX\œÈ]ÈZ\œÜØÛÜIË
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØÛÛœÝ˜[Y]YT—œ\ÜÙ[™Ù\”™YÚ\Ý˜][Û’[œ]
+[œ]
+KXÚÝ\]˜[Y]YœXÚÝ\×ÊšY—
+Z[˜[Y]PÝ\œ™[ÙX\˜Ú
+ÜXÚÝ\Z\œÜ™˜[ÙWW
+W
+\™]\›Ž×Ê˜ÛÛœÝ[[Ù[œ™YÚ\Ý\”\ÜÙ[™Ù\—
+˜[Y]Y
+KÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÜXÚÝ\[œ]œÙ]X[X[
+Ý]WœXÚÝ\
+NÜÝ]W˜Z\œÜY˜[ÙN×	
+	ØZ\œÜ\XÚÝ\	×
+W˜ÚXÚÙYY˜[ÙN×	
+	ØZ\œÜXÚXÚÉ×
+W˜ÚXÚÙYY˜[ÙNËÊNÂˆÛÛœÝÔ‹_O\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	Ó˜YHZ\œÜ	ÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÛKœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰ÐZ\œÜÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰Ó˜YHZ\œÜ	ËÛÛœÙ[Y_JNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ó˜YHZ\œÜ	Ë\Ý[˜][ÛŽ‰Ñ[˜\˜]IËZ\œÜY_JKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆÛÛœÝÚ[™ÙO[Kš[˜[Y]TšYTÙX\˜Ú
+šYKšYÜXÚÝ\‰Ô˜Y\ÜÛÛˆ›H[˜\˜]IËZ\œÜ™˜[Ù_JNÂˆ\ÜÙ\™\]X[
+Ú[™ÙKš[˜[Y]YYJNØ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ØØ[˜Ù[Y	ÊNØ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠÙ™™\‹šY
+JNÂˆÛÛœÝ›Ùš[O[Kœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰ÐZ\œÜÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰Ô˜Y\ÜÛÛˆ›H[˜\˜]IËÛÛœÙ[Y_JNÜXÚÝ\œÙ]X[X[
+›Ùš[KœXÚÝ\
+NÂˆ\ÜÙ\™\]X[
+XÚÝ\œÛ˜\ÚÝ
+
+K˜[YK	Ô˜Y\ÜÛÛˆ›H[˜\˜]IÊNØ\ÜÙ\™\]X[
+‹œXÚÝ\Z\œÜØÛÜJÜÛÝ\˜ÙN‰ÛX[X[	ËÛÛ™š\›YYZ\œÜ™˜[Ù_JK˜[ÙJNÂŸJNÂ\Ý
+	Ú[˜[Y\ÜÙ[™Ù\ˆ›Ùš[H[œ]X]™\ÈHXÝ]™H™\]Y\Ý[™Ù™™\œÈ[ÝXÚY	Ë
+
+HOˆÂˆÛÛœÝÔ‹_O\Ù]\
+
+NÜ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝÛXÚÝ\[KœÝ]Kœ›Ùš[KœXÚÝ\šYO[Kœ™\]Y\ÝšYJÜXÚÝ\›ÛXÚÝ\\Ý[˜][ÛŽ‰Ó˜YHZ\œÜ	ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆ\ÜÙ\›ÝÜÊ
+
+OO”‹œ\ÜÙ[™Ù\”™YÚ\Ý˜][Û’[œ]
+Û˜[YN‰Ô™]šY]ÈÝY\Ý	ËÛ™N‰ÊÎNL	Ë[XZ[‰Ú[˜[YY[XZ[	Ë[™ÝXYÙN‰Ú˜IË^[Y[‰ØØ\™	ËXÚÝ\‰Ó™]ÈÝ[	ËÛÛœÙ[Y_JKøàèxàï8àêøà¨¸àâxàë8à®KÊNÂˆ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ØÛÛXÝ[™ÉÊNØ\ÜÙ\™\]X[
+Ù™™\‹œÝ]\Ë	ØXÝ]™IÊNØ\ÜÙ\™\]X[
+KœÝ]Kœ›Ùš[KœXÚÝ\ÛXÚÝ\
+NÂŸJNÂ\Ý
+	Ý˜[Y]Y\ÜÙ[™Ù\ˆ›Ùš[H[œ][˜[Y]\ÈÛ][Ý\È™Y›Ü™H›Ùš[H™\XÙ[Y[	Ë
+
+HOˆÂˆÛÛœÝÔ‹_O\Ù]\
+
+NÜ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\›KœÝ]Kœ›Ùš[KœXÚÝ\\Ý[˜][ÛŽ‰Ó˜YHZ\œÜ	ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆÛÛœÝ˜[Y\ÏT‹œ\ÜÙ[™Ù\”™YÚ\Ý˜][Û’[œ]
+Û˜[YN‰È™]šY]ÈÝY\Ý	ËÛ™N‰È
+ÍÎL	Ë[XZ[‰ÙÝY\Ý^[\K˜ÛÛIË[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰È™]ÈÝ[	ËÛÛœÙ[Y_JNÂˆ\ÜÙ\™\]X[
+˜[Y\ËœXÚÝ\	Ó™]ÈÝ[	ÊNØ\ÜÙ\™\]X[
+˜[Y\ËœÛ™K	ÊÍÎL	ÊNÂˆ\ÜÙ\™\]X[
+Kš[˜[Y]TšYTÙX\˜Ú
+šYKšYÜXÚÝ\˜[Y\ËœXÚÝ\Z\œÜ™˜[Ù_JKš[˜[Y]YYJNÂˆÛÛœÝ\]Y[Kœ™YÚ\Ý\”\ÜÙ[™Ù\Š˜[Y\ÊNÂˆ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ØØ[˜Ù[Y	ÊNØ\ÜÙ\™\]X[
+Ù™™\‹œÝ]\Ë	Ù^\™Y	ÊNØ\ÜÙ\™\]X[
+\]YœXÚÝ\	Ó™]ÈÝ[	ÊNÂŸJNÂ\Ý
+	Ø\ÜÚYÛ™YšYH›ØÚÜÈ›Ùš[HXÚÝ\™\XÙ[Y[™Y›Ü™HH›Ùš[H\È]]]Y	Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÜ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝÜšYÚ[˜[[KœÝ]Kœ›Ùš[KœXÚÝ\šYO[Kœ™\]Y\ÝšYJÜXÚÝ\›ÜšYÚ[˜[\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÛKœÙ[XÝÙ™™\ŠÙ™™\‹šY
+NÂˆ\ÜÙ\›ÝÜÊ
+
+OO›Kš[˜[Y]TšYTÙX\˜Ú
+šYKšYÜXÚÝ\‰Ó™]ÈÝ[	ËZ\œÜ™˜[Ù_JKú`n9¢§¹®"8àoøàîù.eú.â¹.+KÊNÂˆ\ÜÙ\™\]X[
+KœÝ]Kœ›Ùš[KœXÚÝ\ÜšYÚ[˜[
+NØ\ÜÙ\™\]X[
+šYKœXÚÝ\ÜšYÚ[˜[
+NØ\ÜÙ\™\]X[
+šYKœÝ]\Ë	Ø\ÜÚYÛ™Y	ÊNÂŸJNÂ\Ý
+	Ø›[šÈ™YÚ\Ý\™YXÚÝ\™[XZ[œÈ[œÙ][™›ØÚÜÈHšYH[[^XÚ][œ]	Ë
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙK×	
+	ÜXÚÝ\[X™[	×
+W^ÛÛ[\Ý]WœXÚÝ\ÜÝ]WœXÚÝ\
+ÉÈ0­È8àáøàè‰Î‰ù.eú.â¹g,9à®xà¤º*+yk¦‰ÎËÊNÂˆÛÛœÝÔ‹_O\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	Ó˜YKšZšIÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝ›Ùš[O[Kœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰Ó›ÈXÚÝ\ÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰È	ËÛÛœÙ[Y_JNÂˆXÚÝ\œÙ]X[X[
+›Ùš[KœXÚÝ\	ÉÊNÂˆ\ÜÙ\™\]X[
+XÚÝ\œÛ˜\ÚÝ
+
+K˜[YK	ÉÊNØ\ÜÙ\™\]X[
+XÚÝ\œÛ˜\ÚÝ
+
+KœÛÝ\˜ÙK	Ù[\IÊNØ\ÜÙ\™\]X[
+XÚÝ\œÛ˜\ÚÝ
+
+K˜Ø[”™\]Y\Ý˜[ÙJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›Kœ™\]Y\ÝšYJÜXÚÝ\œXÚÝ\œÛ˜\ÚÝ
+
+K˜[YK\Ý[˜][ÛŽ‰Ó˜YHZ\œÜ	ßJKù.eú.â¹g,9à®xàj9æë¹æ¡9g,ÊNÂˆ\ÜÙ\™\]X[
+K›^T™\]Y\ÝÊ
+K›[™Ý
+NÂŸJNÂ\Ý
+	ØÛX\š[™È›Ùš[HXÚÝ\\ØØ\™È[ˆÛ˜[YH[™™Z™XÝÈ[^YYÙ[ÛØØ][Û‰Ë
+
+HOˆÂˆÛÛœÝÔ‹_O\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	Ô˜[XYHÝZ]\ÈØZ[Ø[ØIÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÂˆKœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰ÒÝ[ÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰Ô˜[XYHÝZ]\ÈØZ[Ø[ØIËÛÛœÙ[Y_JNÂˆÛÛœÝÛØØ][Û\XÚÝ\˜™YÚ[“ØØ][ÛŠ
+NÂˆÛÛœÝ\]Y[Kœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰ÒÝ[ÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰ÉËÛÛœÙ[Y_JNÂˆXÚÝ\œÙ]X[X[
+\]YœXÚÝ\	ÉÊNÂˆÛÛœÝÝ[O\XÚÝ\›ØØ][Û”ÝXØÙ\ÜÊÛØØ][Û‹ÚÙ[‹	ùãï¹g*9g,	ÊNÂˆ\ÜÙ\™\]X[
+Ý[K˜XØÙ\Y˜[ÙJNØ\ÜÙ\™\]X[
+Ý[KœÝ]K˜[YK	ÉÊNØ\ÜÙ\™\]X[
+Ý[KœÝ]K˜Ø[”™\]Y\Ý˜[ÙJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›Kœ™\]Y\ÝšYJÜXÚÝ\œXÚÝ\œÛ˜\ÚÝ
+
+K˜[YK\Ý[˜][ÛŽ‰Ó˜YHZ\œÜ	ßJKù.eú.â¹g,9à®xàj9æë¹æ¡9g,ÊNÂˆ\ÜÙ\™\]X[
+K›^T™\]Y\ÝÊ
+K›[™Ý
+NÂŸJNÂ\Ý
+	ÜXÚÝ\™\]Y\ÝšY]È\Ý[™ÝZ\Ú\ÈZ\ÜÚ[™ËØØ][™È[™™XYHÝ]\ÉË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹œXÚÝ\™\]Y\ÝšY]ÊÝ˜[YN‰ÉË[™[™Î™˜[Ù_J_KÜ™XYN™˜[ÙK˜[YN‰ÉËXÝ[ÛŽ‰ÙY]ÜXÚÝ\	ËY\ÜØYÙN‰ù.eú.â¹g,9à®xà¤¹aiyb¦øàeøài¸àcøàh8àexàa8à ‰ßJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹œXÚÝ\™\]Y\ÝšY]ÊÝ˜[YN‰Ô˜[XYHÝZ]\ÈØZ[Ø[ØIË[™[™ÎY_J_KÜ™XYN™˜[ÙK˜[YN‰Ô˜[XYHÝZ]\ÈØZ[Ø[ØIËXÝ[ÛŽ‰ÝØZ]ÛÜ—ÙY]	ËY\ÜØYÙN‰ùãï¹g*9g,8à¤¹è®º*£y.+xàiøàfxà ¹k£9.¡¸à¤¹o¡xài8àbøà y.eú.â¹g,9à®xà¤¹¢bùaiyb¦øàeøài¸àcøàh8àexàa8à ‰ßJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹œXÚÝ\™\]Y\ÝšY]ÊÝ˜[YN‰Ô˜[XYHÝZ]\ÈØZ[Ø[ØIË[™[™Î™˜[Ù_J_KÜ™XYNYK˜[YN‰Ô˜[XYHÝZ]\ÈØZ[Ø[ØIËXÝ[ÛŽ›[Y\ÜØYÙN‰ÉßJNÂŸJNÂ\Ý
+	ÛZ\ÜÚ[™ÈXÚÝ\Ü[œÈX[X[™XÛÝ™\žH[™^XÚ][œ][˜X›\ÈH™\]Y\Ý	Ë
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÚY—
+\XÚÝ\šY]×œ™XYW
+WÚY—
+XÚÝ\šY]×˜XÝ[ÛOOIÙY]ÜXÚÝ\	×
+\ÚÝÔXÚÝ\˜[˜XÚ×
+XÚÝ\šY]×›Y\ÜØYÙW
+NÙ[ÙHØ\Ý
+XÚÝ\šY]×›Y\ÜØYÙW
+NÜ™]\›Ž×KÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÚY—
+\XÚÝ\[œ]œÛ˜\ÚÝ
+
+W˜Ø[”™\]Y\Ý
+[Ü[”XÚÝ\Y]Ü—
+
+NËÊNÂˆÛÛœÝÔ‹_O\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	ÉÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÛKœ™YÚ\Ý\”\ÜÙ[™Ù\ŠÛ˜[YN‰Ó›ÈXÚÝ\ÝY\Ý	ËÛ™N‰ÊÍÎL	Ë[™ÝXYÙN‰Ù[‰Ë^[Y[‰ØØ\Ú	ËXÚÝ\‰ÉËÛÛœÙ[Y_JNÂˆ\ÜÙ\™\]X[
+‹œXÚÝ\™\]Y\ÝšY]ÊXÚÝ\œÛ˜\ÚÝ
+
+JK˜XÝ[Û‹	ÙY]ÜXÚÝ\	ÊNÂˆXÚÝ\œÙ]X[X[
+	Ô˜[XYHÝZ]\ÈØZ[Ø[ØIÊNÂˆÛÛœÝ™XYOT‹œXÚÝ\™\]Y\ÝšY]ÊXÚÝ\œÛ˜\ÚÝ
+
+JNÂˆ\ÜÙ\™\]X[
+™XYKœ™XYKYJNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\œ™XYK˜[YK\Ý[˜][ÛŽ‰Ó˜YHZ\œÜ	ßJNÂˆ\ÜÙ\™\]X[
+šYKœXÚÝ\	Ô˜[XYHÝZ]\ÈØZ[Ø[ØIÊNÂŸJNÂ\Ý
+	ØZ\œÜXÚÝ\™\]Z\™\È[ˆ^XÚ]X[X[ÛÛ™š\›X][Û‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆ\ÜÙ\™\]X[
+‹œXÚÝ\Z\œÜØÛÜJÜÛÝ\˜ÙN‰ÛX[X[	ËÛÛ™š\›YYZ\œÜY_JKYJNÂˆ›ÜŠÛÛœÝ[œ]ÙˆÂˆÜÛÝ\˜ÙN‰ÛX[X[	ËÛÛ™š\›YYZ\œÜ™˜[Ù_KˆÜÛÝ\˜ÙN‰ÙÙ[ÛØØ][Û‰ËÛÛ™š\›YYZ\œÜY_KˆÜÛÝ\˜ÙN‰Ù[\IËÛÛ™š\›YYZ\œÜY_KˆÜÛÝ\˜ÙN‰ÛX[X[	ËÛÛ™š\›YYZ\œÜ‰ÝYIßBˆJX\ÜÙ\™\]X[
+‹œXÚÝ\Z\œÜØÛÜJ[œ]
+K˜[ÙJNÂŸJNÂ\Ý
+	ÜÝÚ]Ú[™È[ˆZ\œÜXÚÝ\ÈÝ\œ™[ØØ][ÛˆÛX\œÈZ\œÜ\Ü]ÚØÛÜIË
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØÛÛœÝZ\œÜT—œXÚÝ\Z\œÜØÛÜW
+ÜÛÝ\˜ÙN‰ÙÙ[ÛØØ][Û‰ËÛÛ™š\›YYZ\œÜœÝ]W˜Z\œÜW
+NÚY—
+Z[˜[Y]PÝ\œ™[ÙX\˜Ú
+ÜXÚÝ\‰ùãï¹g*9g,	ËZ\œÜW
+W
+KÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÜÝ]W˜Z\œÜXZ\œÜ×	
+	ØZ\œÜ\XÚÝ\	×
+W˜ÚXÚÙYY˜[ÙN×	
+	ØZ\œÜXÚXÚÉ×
+W˜ÚXÚÙYY˜[ÙNËÊNÂˆÛÛœÝÔ‹_O\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	Ó˜YHZ\œÜ	ÊNÂˆ\ÜÙ[™Ù\ŠJNÜXÚÝ\œÙ]X[X[
+	Ó˜YHZ\œÜ	ÊNÂˆ]Z\œÜT‹œXÚÝ\Z\œÜØÛÜJÜÛÝ\˜ÙN‰ÛX[X[	ËÛÛ™š\›YYZ\œÜY_JNÂˆÛÛœÝš\œÝ[Kœ™\]Y\ÝšYJÜXÚÝ\œXÚÝ\œÛ˜\ÚÝ
+
+K˜[YK\Ý[˜][ÛŽ‰Ñ[˜\˜]IËZ\œÜJNÂˆ\ÜÙ\™\]X[
+š\œÝ˜Z\œÜYJNÂˆÛÛœÝØØ][™Ï\XÚÝ\˜™YÚ[“ØØ][ÛŠ
+KØØ]Y\XÚÝ\›ØØ][Û”ÝXØÙ\ÜÊØØ][™ËÚÙ[‹	ùãï¹g*9g,	ÊNÂˆ\ÜÙ\™\]X[
+ØØ]Y˜XØÙ\YYJNÂˆZ\œÜT‹œXÚÝ\Z\œÜØÛÜJÜÛÝ\˜ÙN›ØØ]YœÝ]KœÛÝ\˜ÙKÛÛ™š\›YYZ\œÜ˜Z\œÜJNÂˆÛÛœÝÙXÛÛ™[Kœ™\]Y\ÝšYJÜXÚÝ\›ØØ]YœÝ]K˜[YK\Ý[˜][ÛŽ‰Ñ[˜\˜]IËZ\œÜJNÂˆ\ÜÙ\™\]X[
+ÙXÛÛ™˜Z\œÜ˜[ÙJNØ\ÜÙ\™\]X[
+š\œÝœÝ]\Ë	ØØ[˜Ù[Y	ÊNØ\ÜÙ\™\]X[
+ÙXÛÛ™œÝ]\Ë	ØÛÛXÝ[™ÉÊNÂŸJNÂ\Ý
+	ÜXÚÝ\Y]Üˆ™\ÝÜ™\ÈÛ›HHXÝ]™HX[X[XÚÝ\[™]ÈZ\œÜÛÛ™š\›X][Û‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹œXÚÝ\Y]Ü•šY]ÊÜÛÝ\˜ÙN‰ÛX[X[	Ë˜[YN‰Ó˜YHZ\œÜ	ËZ\œÜY_J_KÝ˜[YN‰Ó˜YHZ\œÜ	ËZ\œÜYKXÙZÛ\Ž‰ù/¢ûï&¸àæøàá¸àêùd#xàîù¥¯z*+yd#IßJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹œXÚÝ\Y]Ü•šY]ÊÜÛÝ\˜ÙN‰ÙÙ[ÛØØ][Û‰Ë˜[YN‰ùãï¹g*9g,	ËZ\œÜY_J_KÝ˜[YN‰ÉËZ\œÜ™˜[ÙKXÙZÛ\Ž‰ùãï¹g*9g,8à¤¹/oùå*9.+xàiøàfxà ¹¥¯z*+yd#xàn9i"y¦í8àfxà¢ùh-9d"8àkùaiyb¦øàeøài¸àcøàh8àexàa8à ‰ßJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹œXÚÝ\Y]Ü•šY]ÊÜÛÝ\˜ÙN‰Ù[\IË˜[YN‰ÓÛÝ[	ËZ\œÜY_J_KÝ˜[YN‰ÉËZ\œÜ™˜[ÙKXÙZÛ\Ž‰ù/¢ûï&¸àæøàá¸àêùd#xàîù¥¯z*+yd#IßJNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙK×	
+	ÜXÚÝ\[Ü[‰×
+W›Û˜ÛXÚÈHÜ[”XÚÝ\Y]ÜŽËÊNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØÛÛœÝY]ÜT—œXÚÝ\Y]Ü•šY]×
+×——œXÚÝ\[œ]œÛ˜\ÚÝ
+
+KZ\œÜœÝ]W˜Z\œÜW
+NËÊNÂŸJNÂ\Ý
+	ÛÜ[š[™ÈHY]ÜˆY\ˆÝ\œ™[ØØ][ÛˆØ[››Ý™]š]™H[ˆÛZ\œÜXÚÝ\	Ë
+
+HOˆÂˆÛÛœÝÔ‹_O\Ù]\
+
+KXÚÝ\T‹˜Ü™X]TXÚÝ\[œ]ÛÛ›Û\Š	Ó˜YHZ\œÜ	ÊNÂˆ\ÜÙ[™Ù\ŠJNÜXÚÝ\œÙ]X[X[
+	Ó˜YHZ\œÜ	ÊNÂˆ]Z\œÜT‹œXÚÝ\Z\œÜØÛÜJÜÛÝ\˜ÙN‰ÛX[X[	ËÛÛ™š\›YYZ\œÜY_JNÂˆÛÛœÝØØ][™Ï\XÚÝ\˜™YÚ[“ØØ][ÛŠ
+KØØ]Y\XÚÝ\›ØØ][Û”ÝXØÙ\ÜÊØØ][™ËÚÙ[‹	ùãï¹g*9g,	ÊNÂˆZ\œÜT‹œXÚÝ\Z\œÜØÛÜJÜÛÝ\˜ÙN›ØØ]YœÝ]KœÛÝ\˜ÙKÛÛ™š\›YYZ\œÜ˜Z\œÜJNÂˆÛÛœÝY]ÜT‹œXÚÝ\Y]Ü•šY]ÊË‹‹›ØØ]YœÝ]KZ\œÜJNÂˆ\ÜÙ\™\]X[
+Y]Ü‹˜[YK	ÉÊNØ\ÜÙ\™\]X[
+Y]Ü‹˜Z\œÜ˜[ÙJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›Kœ™\]Y\ÝšYJÜXÚÝ\™Y]Ü‹˜[YK\Ý[˜][ÛŽ‰Ñ[˜\˜]IËZ\œÜ™Y]Ü‹˜Z\œÜJKù.eú.â¹g,9à®xàj9æë¹æ¡9g,ÊNÂˆXÚÝ\œÙ]X[X[
+	Ô˜Y\ÜÛÛˆ›H[˜\˜]IÊNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\œXÚÝ\œÛ˜\ÚÝ
+
+K˜[YK\Ý[˜][ÛŽ‰Ñ[˜\˜]IËZ\œÜ™Y]Ü‹˜Z\œÜJNÂˆ\ÜÙ\™\]X[
+šYKœXÚÝ\	Ô˜Y\ÜÛÛˆ›H[˜\˜]IÊNØ\ÜÙ\™\]X[
+šYK˜Z\œÜ˜[ÙJNÂŸJNÂ™[˜Ý[ÛˆÙ[XÝY
+
+HÂˆÛÛœÝÏ\Ù]\
+
+KÛ_O\ÎÂˆ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈKœÙ]Û›[™JYJNÂˆÛÛœÝÙ™™\[KœÝX›Z]Ù™™\ŠšYKšYÙ˜\™N‰ÌŒËL	Ë]N‰ÍÉßJNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈKœÙ[XÝÙ™™\ŠÙ™™\‹šY
+NÂˆ™]\›ˆË‹‹œËšYKÙ™™\ŸNÂŸB‹ËÈ[ˆHXÝX[™YÚ\Ý˜][ÛˆÓH[™\œÈÚ]]\›Z[š\ÝXÈ›Ü›HÛÛ›ÛË‚‹ËÈ\ÈÚXÚÜÈÝX›Z]›Ý][™Ë›Ý˜]]™Hœ›ÝÜÙ\ˆÙ^X›Ø\™ØÛÛœÝ˜Z[™Z]š[Ü‹‚™[˜Ý[Ûˆ™YÚ\Ý˜][Û•Ú^˜\™
+
+HÂˆÛÛœÝÛKŸO\Ù]\
+
+NÛK˜ÚÛÜÙT›ÛJ	Ùš]™\‰ÊNÂˆÛÛœÝ›Ù\Ï^ßKšY[Ï^ßK™\ÜÏV×KYÙ\ÏV×KY\ÜØYÙ\ÏV×NÂˆÛÛœÝÝ\šY[ÏVÖÉÛ˜[YIË	ÜÛ™IË	Ùš]™\“XÙ[˜ÙIË	ÜÝ”\›Z]	×KÉÜ]IË	Ý™ZXÛIË	Ý^T\›Z]	Ë	ÚÛ\‰Ë	Ø˜\ÙI×K×WNÂˆÛÛœÝ	ZYO››Ù\ÖÚYHHÚY[Ž™˜[Ù_NÂˆÝ\šY[Ë™›Ü‘XXÚ
+
+Ù^\ËÝ\
+OOžÂˆÛÛœÝ[\ÛÝ\˜ÙKœÜ]
+]ˆYHœ™YË\Ý\IÜÝ\H˜
+VÌWKœÜ]
+	ÏÙ]‰ÊVÌNÂˆÙ^\Ë™›Ü‘XXÚ
+Ù^OOžÂˆ\ÜÙ\›X]Ú
+[™]È™YÑ^
+˜[YOH‰ÚÙ^_H–×—Jœ™\]Z\™Y
+JNÂˆšY[ÖÚÙ^WO^Ý˜[YN‰ÉËÚXÚÕ˜[Y]J
+^Ü™]\›ˆH]\Ë˜[YKš[J
+NßK™\Ü˜[Y]J
+^Âˆ\ÜÙ\™\]X[
+	
+	Ü™YË\Ý\IÊÜÝ\
+KšY[‹˜[ÙK	Ú[˜[YšY[]\Ý™Hš\ÚX›IÊNÂˆ™\ÜËœ\Ú
+Ù^JNÜ™]\›ˆ\Ë˜ÚXÚÕ˜[Y]J
+NÂˆ_NÂˆJNÂˆ	
+	Ü™YË\Ý\IÊÜÝ\
+Kœ]Y\žTÙ[XÝÜ[J
+OOšÙ^\Ë›X\
+Ù^OO™šY[ÖÚÙ^WJNÂˆJNÂˆšY[Ë˜ÛÛœÙ[^ØÚXÚÙY™˜[Ù_NÂˆ	
+	Ü™YÚ\Ý\‹XZ\œÜ	ÊK˜ÚXÚÙYY˜[ÙNÂˆ	
+	Ü™YÚ\Ý˜][Û‹Y›Ü›IÊK™[[Y[ÏYšY[ÎÂˆ	
+	Ü›ÙÜ™\ÜÉÊK˜Ú[™[\Ý\šY[Ë›X\
+
+
+OOŠØÛ\ÜÓ\ÝžÝÙÙÛJ
+^ß__JJNÂˆÛÛœÝÝ]O^Ü™YÔÝ\ŒØÝ[Y[Îžß_NÂˆ]][\ÏLÂˆÛÛœÝØ[™›Þ]›K˜Ü™X]PÛÛ^
+ÉÝ]K‹˜[Y\ÎžßK\ØÎ”Ýš[™ËˆØÝ[Y[žÜ]Y\žTÙ[XÝÜ[Š
+OO–×K]Y\žTÙ[XÝÜŽŠ
+OO›[Kˆ[Ù[žÜÝ]N›KœÝ]K™YÚ\Ý\‘š]™\Š[œ]
+^Ø][\ÊÊÎÜ™]\›ˆKœ™YÚ\Ý\‘š]™\Š[œ]
+Nß_Kˆ™XÛÜ™Î›KœÝ]Kœ™XÛÜ™ËÚÝÎœYÙOOœYÙ\Ëœ\Ú
+YÙJKØ\Ý›Y\ÜØYÙOO›Y\ÜØYÙ\Ëœ\Ú
+Y\ÜØYÙJKˆ›Ü›Q]N˜Û\ÜÈØÛÛœÝXÝÜŠ›Ü›J^Ý\Ë™›Ü›OY›Ü›NßY[šY\Ê
+^Ü™]\›ˆØš™XÝ™[šY\Ê\Ë™›Ü›K™[[Y[ÊK™š[\Š
+Ú×JOOšÈOOIØÛÛœÙ[	ÊK›X\
+
+ÚËšY[JOO–ÚËšY[˜[YWJNß_BˆJNÂˆ›Kœ[’[ÛÛ^
+ÛÝ\˜ÙKœÛXÙJÛÝ\˜ÙKš[™^ÙŠ	Ù[˜Ý[ÛˆÝ\œ™[\\Ê
+IÊKÛÝ\˜ÙKš[™^ÙŠ	ËËÈÜ[Û˜[]™HX\‰ÊJKØ[™›Þ
+NÂˆØ[™›ÞœÙ]Ý\
+
+NÂˆ™]\›ˆÛK‹	šY[ËÝ]K™\ÜËYÙ\ËY\ÜØYÙ\Ë][\ÎŠ
+OO˜][\Ëˆ\ÜÝY\Î››ÝÏO’”ÓÓ‹œ\œÙJ”ÓÓ‹œÝš[™ÚYžJØ[™›Þœ™YÚ\Ý˜][Û‘ØÝ[Y[\ÜÝY\Ê›ÝÊJJKˆ\]Q™YY˜XÚÎšÙ^OOœØ[™›Þ\]QØÝ[Y[™YY˜XÚÊÙ^JKˆÝX›Z]
+
+^Û]™]™[YY˜[ÙNÉ
+	Ü™YÚ\Ý˜][Û‹Y›Ü›IÊK›ÛœÝX›Z]
+ØÝ\œ™[\™Ù]‰
+	Ü™YÚ\Ý˜][Û‹Y›Ü›IÊK™]™[Y˜][
+
+^Ü™]™[Y]YNß_JNØ\ÜÙ\™\]X[
+™]™[YYJNß_NÂŸB\Ý
+	Ü™YÚ\Ý˜][ÛˆÚ^˜\™ÝX›Z]Y˜[˜Ù\ÈXXÚÝ\™Y›Ü™HÜ™X][™ÈH[™[™Èš]™\‰Ë
+
+HOˆÂˆÛÛœÝÏ\™YÚ\Ý˜][Û•Ú^˜\™
+
+NÝË‰
+	Ùš[\Ø[\IÊK›Û˜ÛXÚÊ
+NÂˆ›ÜŠÛÛœÝÝ\ÙˆÌK—J^ÂˆËœÝX›Z]
+
+NØ\ÜÙ\™\]X[
+ËœÝ]Kœ™YÔÝ\Ý\
+NØ\ÜÙ\™\]X[
+Ë˜][\Ê
+K
+NÂˆ\ÜÙ\™\]X[
+Ë›KœÝ]Kœ›Ùš[\Ë™š]™\‹[
+NØ\ÜÙ\™Y\\]X[
+ËœYÙ\Ë×JNÂˆBˆ\ÜÙ\™\]X[
+Ë‰
+	Ü™YË\ÝX›Z]	ÊKšY[‹˜[ÙJNÂˆËœÝX›Z]
+
+NØ\ÜÙ\™\]X[
+Ë˜][\Ê
+KJNØ\ÜÙ\™Y\\]X[
+ËœYÙ\ËÉÙš]™\‹ZÛYI×JNÂˆ\ÜÙ\™\]X[
+Ë›KœÝ]Kœ›Ùš[KœÝ]\Ë	ÜÝX›Z]Y	ÊNØ\ÜÙ\™\]X[
+Ë›K™Ø]J
+K™[YÚX›K˜[ÙJNÂˆ\ÜÙ\›ÝÜÊ
+
+OOË›KœÙ]Û›[™JYJJNØ\ÜÙ\™\]X[
+Ë›K™š]™\”™\]Y\ÝÊ
+K›[™Ý
+NÂˆ\ÜÙ\›ÝÜÊ
+
+OOË›KœÝX›Z]Ù™™\Š	ÜØ[\KXÚ]IËÙ˜\™N‰ÌŒ	Ë]N‰ÍIßJJNÂŸJNÂ\Ý
+	Ü™YÚ\Ý˜][ÛˆÚ^˜\™™^[™ÝX›Z]›ÝÝÜÛˆZ\ÜÚ[™ÈÝ\œ™[\Ý\šY[ÉË
+
+HOˆÂˆ›ÜŠÛÛœÝXÝ[ÛˆÙˆÉÛ™^	Ë	ÜÝX›Z]	×J^ÂˆÛÛœÝÏ\™YÚ\Ý˜][Û•Ú^˜\™
+
+NÝË‰
+	Ùš[\Ø[\IÊK›Û˜ÛXÚÊ
+NÂˆË™šY[ËœÛ™K˜[YOIÉÎÂˆÛÛœÝY˜[˜ÙOJ
+OO˜XÝ[ÛOOIÛ™^	ÏÝË‰
+	Ü™YË[™^	ÊK›Û˜ÛXÚÊ
+NËœÝX›Z]
+
+NÂˆY˜[˜ÙJ
+NØ\ÜÙ\™\]X[
+ËœÝ]Kœ™YÔÝ\
+NØ\ÜÙ\™\]X[
+Ëœ™\ÜË˜]
+LJK	ÜÛ™IÊNÂˆË™šY[ËœÛ™K˜[YOIÊÍÎL	ÎØY˜[˜ÙJ
+NØ\ÜÙ\™\]X[
+ËœÝ]Kœ™YÔÝ\JNÂˆË™šY[Ëœ]K˜[YOIÉÎØY˜[˜ÙJ
+NØ\ÜÙ\™\]X[
+ËœÝ]Kœ™YÔÝ\JNÂˆ\ÜÙ\™\]X[
+Ëœ™\ÜË˜]
+LJK	Ü]IÊNØ\ÜÙ\™\]X[
+Ë˜][\Ê
+K
+NØ\ÜÙ\™Y\\]X[
+ËœYÙ\Ë×JNÂˆBŸJNÂ\Ý
+	Ü™YÚ\Ý˜][ÛˆÚ^˜\™š[˜[ÝX›Z]™]™X[È[˜[YX\›Y\ˆšY[ÈÚ]Ý]ÜÚ[™È[œ]	Ë
+
+HOˆÂˆ›ÜŠÛÛœÝÚÙ^KÝ\HÙˆÖÉÛ˜[YIËKÉÝ™ZXÛIËWWJ^ÂˆÛÛœÝÏ\™YÚ\Ý˜][Û•Ú^˜\™
+
+NÝË‰
+	Ùš[\Ø[\IÊK›Û˜ÛXÚÊ
+NÂˆË‰
+	Ü™YË[™^	ÊK›Û˜ÛXÚÊ
+NÝË‰
+	Ü™YË[™^	ÊK›Û˜ÛXÚÊ
+NÂˆÛÛœÝØÝ[Y[ÏR”ÓÓ‹œÝš[™ÚYžJËœÝ]K™ØÝ[Y[ÊKÛ™O]Ë™šY[ËœÛ™K˜[YNÂˆË™šY[ÖÚÙ^WK˜[YOIÉÎÝËœÝX›Z]
+
+NÂˆ\ÜÙ\™\]X[
+ËœÝ]Kœ™YÔÝ\Ý\
+NØ\ÜÙ\™\]X[
+Ë‰
+	Ü™YË\Ý\IÊÜÝ\
+KšY[‹˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ëœ™\ÜË˜]
+LJKÙ^JNØ\ÜÙ\™\]X[
+Ë˜][\Ê
+K
+NØ\ÜÙ\™Y\\]X[
+ËœYÙ\Ë×JNÂˆ\ÜÙ\™\]X[
+Ë™šY[ËœÛ™K˜[YKÛ™JNØ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJËœÝ]K™ØÝ[Y[ÊKØÝ[Y[ÊNÂˆBŸJNÂ\Ý
+	Ü™YÚ\Ý˜][ÛˆÚ^˜\™ÙY\Èš[˜[ØÝ[Y[[™ÛÛœÙ[™Z™XÝ[ÛˆÛˆH™]šY]ÈÝ\	Ë
+
+HOˆÂˆ›ÜŠÛÛœÝ[˜[YÙˆÉÙØÝ[Y[ÉË	ØÛÛœÙ[	×J^ÂˆÛÛœÝÏ\™YÚ\Ý˜][Û•Ú^˜\™
+
+NÝË‰
+	Ùš[\Ø[\IÊK›Û˜ÛXÚÊ
+NÂˆË‰
+	Ü™YË[™^	ÊK›Û˜ÛXÚÊ
+NÝË‰
+	Ü™YË[™^	ÊK›Û˜ÛXÚÊ
+NÂˆYŠ[˜[YOOIÙØÝ[Y[ÉÊ]ËœÝ]K™ØÝ[Y[Ï^ßNÙ[ÙHË™šY[Ë˜ÛÛœÙ[˜ÚXÚÙYY˜[ÙNÂˆËœÝX›Z]
+
+NØ\ÜÙ\™\]X[
+Ë˜][\Ê
+K[˜[YOOIÙØÝ[Y[ÉÏÌŒJNØ\ÜÙ\™\]X[
+ËœÝ]Kœ™YÔÝ\ŠNÂˆ\ÜÙ\™\]X[
+Ë‰
+	Ü™YÚ\Ý˜][Û‹Y\œ›Ü‰ÊKšY[‹˜[ÙJNØ\ÜÙ\™Y\\]X[
+ËœYÙ\Ë×JNÂˆ\ÜÙ\™\]X[
+Ë›KœÝ]Kœ›Ùš[\Ë™š]™\‹[
+NÂˆBŸJNÂ\Ý
+	Ü™YÚ\Ý˜][ÛˆÚ^˜\™˜[Y\ÈZ\ÜÚ[™Ë[˜[Y[™^\™YØÝ[Y[]šY[˜ÙH\ˆ][IË
+
+HOˆÂˆÛÛœÝÏ\™YÚ\Ý˜][Û•Ú^˜\™
+
+K›ÝÏQ]Kœ\œÙJ	ÌŒÌLKLLŒŒ‰ÊNÂˆË‰
+	Ü™YÚ\Ý\‹XZ\œÜ	ÊK˜ÚXÚÙY]YNÂˆËœÝ]K™ØÝ[Y[ÏSØš™XÝ™œ›ÛQ[šY\ÊË‹‹Ë•‹”‘TURT‘Q	ØZ\œÜØ]]Üš^˜][Û‰×K›X\
+ÏO–ÚËØ]XÚY[‰ÑSSËIÊÚÊÉËœ‰Ë^\™\Ð]‰ÌŒÌKLKLLŒŒ
+ÌLŽŒ	ßWJJNÂˆËœÝ]K™ØÝ[Y[Ë^WÜ\›Z]˜]XÚY[IÉÎÂˆËœÝ]K™ØÝ[Y[Ë™ZXÛWÛXÙ[˜ÙK™^\™\Ð]IÛ›ÝXKY]IÎÂˆËœÝ]K™ØÝ[Y[Ë™š]™\—ÛXÙ[˜ÙK™^\™\Ð]IÌŒŽKLKLLŒŒ
+ÌLŽŒ	ÎÂˆËœÝ]K™ØÝ[Y[ËœÝ—Ùš]™\—Ü\›Z]™^\™\Ð]IÉÎÂˆÛÛœÝ\ÜÝY\Ï]Ëš\ÜÝY\Ê›ÝÊNÂˆ\ÜÙ\™Y\\]X[
+\ÜÝY\Ë^WÜ\›Z]Éøàáøàè¹¦î:hg¸à¤¹­îù.æ8àeøài¸àcøàh8àexàa8à ‰×JNÂˆ\ÜÙ\™Y\\]X[
+\ÜÝY\Ë™ZXÛWÛXÙ[˜ÙKÉù§"yb®y§'úfd8à¤¹è®º*£xàeøài¸àcøàh8àexàa8à ‰×JNÂˆ\ÜÙ\™Y\\]X[
+\ÜÝY\Ë™š]™\—ÛXÙ[˜ÙKÉù§"yb®y§'úfd8àc9b!øà£8ài¸àa8ào¸àfxà ¹l!¹§ixàk¹¥éy.æ8à¤¹aiyb¦øàeøài¸àcøàh8àexàa8à ‰×JNÂˆ\ÜÙ\™Y\\]X[
+\ÜÝY\ËœÝ—Ùš]™\—Ü\›Z]Éù§"yb®y§'úfd8à¤¹aiyb¦øàeøài¸àcøàh8àexàa8à ‰×JNÂˆ\ÜÙ\™Y\\]X[
+\ÜÝY\Ë™š]™\ÜË×JNØ\ÜÙ\™Y\\]X[
+\ÜÝY\Ë˜Z\œÜØ]]Üš^˜][Û‹×JNÂŸJNÂ\Ý
+	Ü™YÚ\Ý˜][ÛˆÚ^˜\™ÚÝÜÈØÝ[Y[[]™[[\È[™XØÙ\ÈHÛÜœ™XÝY™]žIË
+
+HOˆÂˆÛÛœÝÏ\™YÚ\Ý˜][Û•Ú^˜\™
+
+NÝË‰
+	Ùš[\Ø[\IÊK›Û˜ÛXÚÊ
+NÂˆË‰
+	Ü™YË[™^	ÊK›Û˜ÛXÚÊ
+NÝË‰
+	Ü™YË[™^	ÊK›Û˜ÛXÚÊ
+NÂˆ[]HËœÝ]K™ØÝ[Y[Ë^WÜ\›Z]˜]XÚY[ÂˆËœÝ]K™ØÝ[Y[Ë™ZXÛWÛXÙ[˜ÙK™^\™\Ð]IÌŒŒLKLUŒŒ
+ÌLŽŒ	ÎÂˆËœÝX›Z]
+
+NÂˆ\ÜÙ\™\]X[
+Ë˜][\Ê
+K
+NØ\ÜÙ\™\]X[
+Ë‰
+	Ü™YÚ\Ý˜][Û‹Y\œ›Ü‰ÊKšY[‹˜[ÙJNÂˆ\ÜÙ\›X]Ú
+Ë‰
+	Ü™YÚ\Ý˜][Û‹Y\œ›Ü‰ÊK^ÛÛ[Ì¹.í¸àk¹¦î:hg‹ÊNÂˆ\ÜÙ\›X]Ú
+Ë‰
+	ÙØËYšY[ÉÊKš[›™\’SÚYH™ØËY\œ›Ü‹]^WÜ\›Z]–×—J™]KYØËY\œ›Üˆ›ÛOH˜[\‹ÊNÂˆ\ÜÙ\›X]Ú
+Ë‰
+	ÙØËYšY[ÉÊKš[›™\’Søàáøàè¹¦î:hg¸à¤¹­îù.æ8àeøài¸àcøàh8àexàaÊNÂˆ\ÜÙ\›X]Ú
+Ë‰
+	ÙØËYšY[ÉÊKš[›™\’Sù§"yb®y§'úfd8àc9b!øà£8ài¸àa8ào¸àfKÊNÂˆËœÝ]K™ØÝ[Y[Ë^WÜ\›Z]˜]XÚY[IÑSSË]^WÜ\›Z]œ‰ÎÝË\]Q™YY˜XÚÊ	Ý^WÜ\›Z]	ÊNÂˆ\ÜÙ\›X]Ú
+Ë‰
+	Ü™YÚ\Ý˜][Û‹Y\œ›Ü‰ÊK^ÛÛ[Ìy.í¸àk¹¦î:hg‹ÊNÂˆËœÝ]K™ØÝ[Y[Ë™ZXÛWÛXÙ[˜ÙK™^\™\Ð][™]È]J]K››ÝÊ
+JÎ
+KÒTÓÔÝš[™Ê
+NÝË\]Q™YY˜XÚÊ	Ý™ZXÛWÛXÙ[˜ÙIÊNÂˆ\ÜÙ\™\]X[
+Ë‰
+	Ü™YÚ\Ý˜][Û‹Y\œ›Ü‰ÊKšY[‹YJNÂˆË‰
+	Ùš[\Ø[\IÊK›Û˜ÛXÚÊ
+NÝËœÝX›Z]
+
+NÂˆ\ÜÙ\™\]X[
+Ë˜][\Ê
+KJNØ\ÜÙ\™Y\\]X[
+ËœYÙ\ËÉÙš]™\‹ZÛYI×JNÂˆ\ÜÙ\™\]X[
+Ë›KœÝ]Kœ›Ùš[KœÝ]\Ë	ÜÝX›Z]Y	ÊNØ\ÜÙ\™\]X[
+Ë›K™Ø]J
+K™[YÚX›K˜[ÙJNÂŸJNÂ\Ý
+	Ü›ÛH›Ý][™ÈÙY\È\ÜÙ[™Ù\ˆ[™š]™\ˆÛÛ›ÛÈÙ\\˜]IË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆ\ÜÙ\™\]X[
+‹œ›Ý]J[[	Ùš]™\‹ZÛYIÊK	Ü›ÛIÊNÂˆ\ÜÙ\™\]X[
+‹œ›Ý]J	Ü\ÜÙ[™Ù\‰Ë[	ÚÛYIÊK	Ü\ÜÙ[™Ù\‹\™YÚ\Ý\‰ÊNÂˆ\ÜÙ\™\]X[
+‹œ›Ý]J	Ùš]™\‰Ë[	Ùš]™\‹ZÛYIÊK	Ü™YÚ\Ý\‰ÊNÂˆ\ÜÙ\™\]X[
+‹œ›Ý]J	Ü\ÜÙ[™Ù\‰ËßK	Ùš]™\‹ZÛYIÊK	ÚÛYIÊNÂˆ\ÜÙ\™\]X[
+‹œ›Ý]J	Ùš]™\‰ËßK	ÛÙ™™\œÉÊK	Ùš]™\‹ZÛYIÊNÂŸJNÂ\Ý
+	ØÛÛ[X[™™YY˜XÚÈ\Ù\ÈÙ\\˜]H\ÜÙ[™Ù\ˆ[™š]™\ˆÛÜ™[™ÉË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆÛÛœÝ\ÜÙ[™Ù\T‹˜ÛÛ[X[™™YY˜XÚÊ	Ü\ÜÙ[™Ù\‰Ë	Ü[™[™ÉÊNÂˆÛÛœÝš]™\T‹˜ÛÛ[X[™™YY˜XÚÊ	Ùš]™\‰Ë	Ü[™[™ÉÊNÂˆ\ÜÙ\›X]Ú
+\ÜÙ[™Ù\‹]Kù/§zh/ÊNÂˆ\ÜÙ\›X]Ú
+š]™\‹]Kú`bú(cÊNÂˆ\ÜÙ\››Ý\]X[
+\ÜÙ[™Ù\‹]Kš]™\‹]JNÂˆ\ÜÙ\™\]X[
+\ÜÙ[™Ù\‹™\ØX›PÛÛ[X[™ËYJNÂˆ\ÜÙ\™\]X[
+š]™\‹™\ØX›PÛÛ[X[™ËYJNÂŸJNÂ\Ý
+	ØH[™[™ÈÛÛ[X[™™Z™XÝÈ\XØ]H]ÛˆXÝ]˜][Û‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝš\œÝ]ZK˜™YÚ[Š	Ü\ÜÙ[™Ù\‰ÊK\XØ]O]ZK˜™YÚ[Š	Ü\ÜÙ[™Ù\‰ÊNÂˆ\ÜÙ\™\]X[
+š\œÝ˜XØÙ\YYJNÂˆ\ÜÙ\™\]X[
+\XØ]K˜XØÙ\Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+\XØ]KœÝ]K›Ý]ÛÛYK	Ü[™[™ÉÊNÂˆ\ÜÙ\™\]X[
+\XØ]KœÝ]K™\ØX›PÛÛ[X[™ËYJNÂŸJNÂ\Ý
+	ØÛÛ™š\›YYÛÛ[X[™™YY˜XÚÈ[›ØÚÜÈÝ]KXÚ[™Ú[™ÈÛÛ›ÛÉË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊNÂˆZK˜™YÚ[Š	Ùš]™\‰ÊNØÛÛœÝÛÛ™š\›YY]ZK™š[š\Ú
+	ØÛÛ™š\›YY	ÊNÂˆ\ÜÙ\™\]X[
+ÛÛ™š\›YYœ›ÛK	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+ÛÛ™š\›YY›Ý]ÛÛYK	ØÛÛ™š\›YY	ÊNÂˆ\ÜÙ\™\]X[
+ÛÛ™š\›YY™\ØX›PÛÛ[X[™Ë˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÛÛ™š\›YY˜XÝ[Û‹[
+NÂŸJNÂ\Ý
+	Ø[ˆ[œ™\ÛÛ™YÛÛ[X[™Ý^\ÈØÚÙY[[^XÚ]]\Ý\Ý]HXÚÛ›ÝÛYÙ[Y[	Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ü\ÜÙ[™Ù\‰ÊNÂˆZK˜™YÚ[Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝ[œ™\ÛÛ™Y]ZK™š[š\Ú
+	Ý[œ™\ÛÛ™Y	ÊNÂˆ\ÜÙ\™\]X[
+[œ™\ÛÛ™Y™\ØX›PÛÛ[X[™ËYJNÂˆ\ÜÙ\™\]X[
+[œ™\ÛÛ™Y˜XÝ[Û‹	Ü™Yœ™\Ú	ÊNÂˆ\ÜÙ\™\]X[
+ZK˜™YÚ[Š	Ü\ÜÙ[™Ù\‰ÊK˜XØÙ\Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+ZK˜ÛX\Š
+K›Ý]ÛÛYK	ÚYIÊNÂˆ\ÜÙ\™\]X[
+ZK˜™YÚ[Š	Ü\ÜÙ[™Ù\‰ÊK˜XØÙ\YYJNÂŸJNÂ\Ý
+	ÜÙ\ÜÚ[Ûˆ^\žH™\Ù[È™X]][XØ][Ûˆ[œÝXYÙˆ[›Ý\ˆÛÛ[X[™][\	Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊNÂˆZK˜™YÚ[Š	Ùš]™\‰ÊNØÛÛœÝ^\™Y]ZK™š[š\Ú
+	Ü™X]]	ÊNÂˆ\ÜÙ\™\]X[
+^\™Y™\ØX›PÛÛ[X[™ËYJNÂˆ\ÜÙ\™\]X[
+^\™Y˜XÝ[Û‹	Ü™X]]	ÊNÂˆ\ÜÙ\›X]Ú
+^\™Y]Kùa£xàëxà¬8à©8àìËÊNÂˆ\ÜÙ\™\]X[
+ZK˜™YÚ[Š	Ùš]™\‰ÊK˜XØÙ\Y˜[ÙJNÂŸJNÂ\Ý
+	Ü›ÛHÝÚ]Ú[™ÈÛX\œÈÛÛÛ[X[™™YY˜XÚÈ™Y›Ü™HÚÝÚ[™ÈHÝ\ˆ›ÛIË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ü\ÜÙ[™Ù\‰ÊNÂˆZK˜™YÚ[Š	Ü\ÜÙ[™Ù\‰ÊNÝZK™š[š\Ú
+	Ý[œ™\ÛÛ™Y	ÊNÂˆÛÛœÝÝÚ]ÚY]ZKœÙ]›ÛJ	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+ÝÚ]ÚYœ›ÛK	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+ÝÚ]ÚY›Ý]ÛÛYK	ÚYIÊNÂˆ\ÜÙ\™\]X[
+ÝÚ]ÚY™\ØX›PÛÛ[X[™Ë˜[ÙJNÂŸJNÂ™[˜Ý[ÛˆY[[ÜžTÝÜ˜YÙJÙYY^ßJHÂˆÛÛœÝ˜[Y\Ï[™]ÈX\
+Øš™XÝ™[šY\ÊÙYY
+JNÂˆ™]\›ˆÙÙ]][NšÙ^OO˜[Y\Ëš\ÊÙ^JOÝ˜[Y\Ë™Ù]
+Ù^JN›[Ù]][NŠÙ^K˜[YJOO˜[Y\ËœÙ]
+Ù^KÝš[™Ê˜[YJJK™[[Ý™R][NšÙ^OO˜[Y\Ë™[]JÙ^JK˜[YNšÙ^OO˜[Y\Ë™Ù]
+Ù^J_NÂŸB\Ý
+	Ü™\Ý\ÝX\™\œÚ\ÝÈÛ›HHZ[š[X[[ÝÛ\ÝYX\šÙ\‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+KÝX\™T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒLJNÂˆ\ÜÙ\™\]X[
+ÝX\™›X\šÊ	Ü\ÜÙ[™Ù\‰Ë	Ü[™[™ÉÊKYJNÂˆÛÛœÝX\šÙ\R”ÓÓ‹œ\œÙJÝÜ˜YÙK˜[YJÝX\™šÙ^JJNÂˆ\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\ÊX\šÙ\ŠKœÛÜ
+
+KÉÛÝ]ÛÛYIË	Ü›ÛIË	ÜØ]™Y]	Ë	Ý™\œÚ[Û‰×JNÂˆ\ÜÙ\™Y\\]X[
+X\šÙ\‹Ý™\œÚ[ÛŽŒK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ]ÛÛYN‰Ü[™[™ÉËØ]™Y]ŒLJNÂˆ›ÜŠÛÛœÝ›Ü˜šY[ˆÙˆÉØÛÛ[X[™	Ë	ØXÝ[Û‰Ë	ÜšYRY	Ë	ØXØÛÝ[Y	Ë	ÝÚÙ[‰Ë	ÚY[\Ý[˜ÞRÙ^I×JX\ÜÙ\™\]X[
+›Ü˜šY[ˆ[ˆX\šÙ\‹˜[ÙJNÂŸJNÂ\Ý
+	Ü™\Ý\ÝX\™ÛÛ™\È[ˆ[\œ\YÛÛ[X[™[ÈØÚÙY™XÛÛ˜Ú[X][ÛˆÚ]Ý]™\^IË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+KÜš]\T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒLJNÂˆÜš]\‹›X\šÊ	Ùš]™\‰Ë	Ü[™[™ÉÊNÂˆÛÛœÝ™\ÝÜ™YT‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒMLJKœ™\ÝÜ™J
+NÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Yœ›ÛK	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Y›Ý]ÛÛYK	Ý[œ™\ÛÛ™Y	ÊNÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Yœ™\Ý[YYœ›ÛK	Ü[™[™ÉÊNÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Y˜]]Ô™\Ù[™˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Y™™YY˜XÚË™\ØX›PÛÛ[X[™ËYJNÂˆ\ÜÙ\›X]Ú
+™\ÝÜ™Y™™YY˜XÚË]Kùè®º*£xàiøàcxào¸àføà¤ËÊNÂŸJNÂ\Ý
+	Ü™\Ý\ÝX\™\ØØ\™È[ˆ^\™YX\šÙ\‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+KÜš]\T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒLX^YÙS\ÎLJNÂˆÜš]\‹›X\šÊ	Ü\ÜÙ[™Ù\‰Ë	Ý[œ™\ÛÛ™Y	ÊNÂˆÛÛœÝ™\ÝÜ™YT‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒMLKX^YÙS\ÎLJKœ™\ÝÜ™J
+NÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Y[
+NÂˆ\ÜÙ\™\]X[
+ÝÜ˜YÙK˜[YJÜš]\‹šÙ^JK[™Yš[™Y
+NÂŸJNÂ\Ý
+	Ü™\Ý\ÝX\™™Z™XÝÈX[›Ü›YYÜˆ^[™YX\šÙ\œÈ[œÝXYÙˆ\Ý[™È[IË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+KÝX\™T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒLJNÂˆÝÜ˜YÙKœÙ]][JÝX\™šÙ^K”ÓÓ‹œÝš[™ÚYžJÝ™\œÚ[ÛŽŒK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ]ÛÛYN‰Ü[™[™ÉËØ]™Y]ŽLšYRY‰Üš]˜]K\šYIßJJNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂˆ\ÜÙ\™\]X[
+ÝÜ˜YÙK˜[YJÝX\™šÙ^JK[™Yš[™Y
+NÂˆÝÜ˜YÙKœÙ]][JÝX\™šÙ^K	Û›ÝZœÛÛ‰ÊNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂŸJNÂ\Ý
+	Ü™\Ý\ÝX\™ÙY\È\ÜÙ[™Ù\ˆ[™š]™\ˆ™XÛÝ™\žHÛÜ™[™ÈÙ\\˜]IË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+KÝX\™T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒLJNÂˆÝX\™›X\šÊ	Ùš]™\‰Ë	ØÛÛ™›XÝ	ÊNÂˆÛÛœÝ™\ÝÜ™YYÝX\™œ™\ÝÜ™J
+NÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Yœ›ÛK	Ùš]™\‰ÊNÂˆ\ÜÙ\›X]Ú
+™\ÝÜ™Y™™YY˜XÚË›Y\ÜØYÙKù§ 9¥¬9â­¹¡bËÊNÂˆ\ÜÙ\››Ý\]X[
+™\ÝÜ™Y™™YY˜XÚËœ›ÛK	Ü\ÜÙ[™Ù\‰ÊNÂŸJNÂ\Ý
+	Ü™\Ý\ÝX\™ÛX\œÈX\šÙ\œÈ[™˜Z[ÈØY™[HÚ[ˆÝÜ˜YÙH\È[˜]˜Z[X›IË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+KÝX\™T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒLJNÂˆÝX\™›X\šÊ	Ü\ÜÙ[™Ù\‰Ë	Ü[™[™ÉÊNÂˆ\ÜÙ\™\]X[
+ÝX\™˜ÛX\Š
+KYJNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂˆÛÛœÝœ›ÚÙ[^ÙÙ]][J
+^Ý›ÝÈ\œ›ÜŠ	Ø›ØÚÙY	ÊNßKÙ]][J
+^Ý›ÝÈ\œ›ÜŠ	Ø›ØÚÙY	ÊNßK™[[Ý™R][J
+^Ý›ÝÈ\œ›ÜŠ	Ø›ØÚÙY	ÊNß_NÂˆÛÛœÝ[˜]˜Z[X›OT‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+œ›ÚÙ[‹Û›ÝÎŠ
+OOŒLJNÂˆ\ÜÙ\™\]X[
+[˜]˜Z[X›K›X\šÊ	Ü\ÜÙ[™Ù\‰Ë	Ü[™[™ÉÊK˜[ÙJNÂˆ\ÜÙ\™\]X[
+[˜]˜Z[X›Kœ™\ÝÜ™J
+K[
+NÂŸJNÂ™[˜Ý[ÛˆÝ\œ™[šYUšY]Ê›ÛKÝ™\œšY\Ï^ßJHÂˆ™]\›ˆÚY‘’VT‘Kœ™\]Y\ÝYÝ]\Îœ›ÛOOOIÙš]™\‰ÏÉØ\ÜÚYÛ™Y	Î‰ØÛÛXÝ[™ÉË™]š\Ú[ÛŽŒ‹šY]Ù\”›ÛNœ›ÛK™^XÝ[ÛŽœ›ÛOOOIÙš]™\‰ÏÉÜÝ\ÜXÚÝ\	Î‰ØÛÛ\\™WÛÙ™™\œÉË\]Y]‰ÌŒ‹LKLMÕÎŒŒŒ‰Ë‹‹›Ý™\œšY\ßNÂŸB™[˜Ý[ÛˆÝ\\™XÛÝ™\žJ‹›ÛK™XYÝ\œ™[šYKš[˜Ú\[^ØXØÛÝ[™YŽ˜[[ËIÜ›Û_KXXØÛÝ[šY]Ù\”›ÛNœ›Û_JHÂˆÛÛœÝÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+KÝX\™T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒLJNÂˆÝX\™›X\šÊ›ÛK	Ü[™[™ÉÊNÂˆ™]\›ˆÜÝÜ˜YÙKÝX\™ÛÛ›Û\Ž”‹˜Ü™X]TÝ\\™XÛÝ™\žPÛÛ›Û\ŠÙÝX\™›ÛKš[˜Ú\[™XYÝ\œ™[šY_J_NÂŸB\Ý
+	ÜÝ\\™]ÛÜšÈ˜Z[\™H™]Z[œÈHX\šÙ\ˆÚ]Ý]™\^Z[™ÈHÛÛ[X[™	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÝ›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNßJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œ™\]Y\ÝYYJNÂˆ\ÜÙ\™\]X[
+™XYËJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	Ý[œ™\ÛÛ™Y	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›X\šÙ\”™]Z[™YYJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K˜Ø[”™]žKYJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K˜]]ÐÛÛ[X[™™\^K˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+Kœ›ÛK	Ü\ÜÙ[™Ù\‰ÊNÂŸJNÂ\Ý
+	ØÛÛ›™XÝ]š]H™XÛÝ™\žH\›Z]ÈÛ™H^XÚ]Ý]H™\™XY[™[ˆÛX\œÈHX\šÙ\‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ùš]™\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰Ê_NßJNÂˆ]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆÛÛœÝ™XÛÝ™\™YX]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J	ØÛÛ›™XÝ]š]IÊNÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ™\]Y\ÝYYJNÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™YœÝ]K›Ý]ÛÛYK	ØÛÛ™š\›YY	ÊNÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™YœÝ]K›X\šÙ\”™]Z[™Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+™XYËŠNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J	ØÛÛ›™XÝ]š]IÊJKœ™\]Y\ÝY˜[ÙJNÂŸJNÂ\Ý
+	Ø]][XØ][Ûˆ™XÛÝ™\žHØZ]È›Üˆ^XÚ]™X]][XØ][Ûˆ[™™\™XYÈÛ˜ÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOŠÊÜ™XYÏOOLOÞÜÝ]\Î_NžÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNÂˆÛÛœÝ^\™YX]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+^\™YœÝ]K›Ý]ÛÛYK	Ü™X]]	ÊNÂˆ\ÜÙ\™\]X[
+^\™YœÝ]K›X\šÙ\”™]Z[™YYJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J	ØÛÛ›™XÝ]š]IÊJKœ™\]Y\ÝY˜[ÙJNÂˆ\ÜÙ\™\]X[
+™XYËJNÂˆÛÛœÝ™XÛÝ™\™YX]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J	Ü™X]]	ÊNÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™YœÝ]K›Ý]ÛÛYK	ØÛÛ™š\›YY	ÊNÂˆ\ÜÙ\™\]X[
+™XYËŠNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂŸJNÂ\Ý
+	ÜÝ\\™XÛÝ™\žHÛX\œÈHÛÛ˜ÙX[Y›ÝY›Ý[™™\Ý[Ú]Ý]™]žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ùš]™\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎNßJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	Ü™Z™XÝY	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›X\šÙ\”™]Z[™Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K˜Ø[”™]žK˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J	ØÛÛ›™XÝ]š]IÊJKœ™\]Y\ÝY˜[ÙJNÂˆ\ÜÙ\™\]X[
+™XYËJNÂŸJNÂ\Ý
+	ÜÝ\\™XÛÝ™\žHÙ\È›Ý™X]H›Ù[\ÜÈÌ\È™\ÝÜ™YÝ]IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOŠÜÝ]\ÎŒÌJJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	Ý[œ™\ÛÛ™Y	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›X\šÙ\”™]Z[™YYJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K˜Ø[”™]žKYJNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+Kœ›ÛK	Ü\ÜÙ[™Ù\‰ÊNÂŸJNÂ\Ý
+	ÜÝ\\™XÛÝ™\žH\ØØ\™ÈHX\šÙ\ˆ›Üˆ[›Ý\ˆ›ÛH™Y›Ü™H[žH™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+KÝX\™T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒLJNÛ]™XYÏLÂˆÝX\™›X\šÊ	Ü\ÜÙ[™Ù\‰Ë	Ü[™[™ÉÊNÂˆÛÛœÝÛÛ›Û\T‹˜Ü™X]TÝ\\™XÛÝ™\žPÛÛ›Û\ŠÙÝX\™›ÛN‰Ùš]™\‰Ëš[˜Ú\[žØXØÛÝ[™YŽ‰Ù[[ËYš]™\‹XXØÛÝ[	ËšY]Ù\”›ÛN‰Ùš]™\‰ßK™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰Ê_Nß_JNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œ™\]Y\ÝY˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›X\šÙ\”™]Z[™Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+™XYË
+NÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂŸJNÂ\Ý
+	ÜÝ\\™XÛÝ™\žH™Z™XÝÈ\XØ]H™XYÈÚ[HÛ™H\È[ˆ›YÚ	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™[X\ÙK™XYÏLÂˆÛÛœÝØÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë
+
+OOžÜ™XYÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNßJNÂˆÛÛœÝš\œÝXÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆÛÛœÝ\XØ]OX]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+\XØ]Kœ™\]Y\ÝY˜[ÙJNÂˆ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	Ú[—Ù›YÚ	ÊNÂˆ\ÜÙ\™\]X[
+™XYËJNÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNÂˆ\ÜÙ\™\]X[
+
+]ØZ]š\œÝ
+KœÝ]K›Ý]ÛÛYK	ØÛÛ™š\›YY	ÊNÂŸJNÂ\Ý
+	ÜÝ\\\ØÛÝ™\žH™\ÝÜ™\ÈH\ÜÙ[™Ù\ˆšYHÈH\ÜÙ[™Ù\ˆ\ÝÜžHÚ]Ý]HØ[\‹\Ý\YYšYHY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K™\]Y\ÝÏV×NÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜È™\]Y\ÝOžÜ™\]Y\ÝËœ\Ú
+™\]Y\Ý
+NÜ™]\›ˆÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_NßJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\]Y\ÝË›[™ÝJNÂˆ\ÜÙ\™\]X[
+™\]Y\ÝÖÌK›Y]Ù	ÑÑU	ÊNÂˆ\ÜÙ\™\]X[
+™\]Y\ÝÖÌKœ]	ËÝŒKÜšY\ËØÝ\œ™[	ÊNÂˆ\ÜÙ\™\]X[
+™\]Y\ÝÖÌKœ™X\ÛÛ‹	ÜÝ\\	ÊNÂˆ\ÜÙ\™\]X[
+™\]Y\ÝÖÌKœÚYÛ˜[˜X›ÜY˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	ØÛÛ™š\›YY	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËšÚ[™	ÜšYIÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœYÙK	Ü\ÜÙ[™Ù\‹Z\ÝÜžIÊNÂˆ\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\Ê™\Ý[šY]ËœšYJKÉÚY	Ë	ÜÝ]\ÉË	Ü™]š\Ú[Û‰Ë	ÝšY]Ù\”›ÛIË	Û™^XÝ[Û‰Ë	Ý\]Y]	×JNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœšYKšY]Ù\”›ÛK	Ü\ÜÙ[™Ù\‰ÊNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂˆ\ÜÙ\™\]X[
+Øš™XÝš\ÓÝÛŠ™\]Y\ÝÖÌK	ÜšYRY	ÊK˜[ÙJNÂˆ\ÜÙ\™\]X[
+Øš™XÝš\ÓÝÛŠ™\]Y\ÝÖÌK	Ü›ÛIÊK˜[ÙJNÂˆ\ÜÙ\™\]X[
+Øš™XÝš\ÓÝÛŠ™\]Y\ÝÖÌK	ØXØÛÝ[™Y‰ÊK˜[ÙJNÂŸJNÂ\Ý
+	ÜÝ\\\ØÛÝ™\žH™\ÝÜ™\È[ˆ\ÜÚYÛ™Yš]™\ˆšYHÈHš]™\ˆš\ÈØÜ™Y[‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ùš]™\‰Ë\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰ËÜÝ]\Î‰Ø\œš]š[™ÉË™^XÝ[ÛŽ‰ÜÝ\Ýš\	ßJ_JJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	ØÛÛ™š\›YY	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËšÚ[™	ÜšYIÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœYÙK	Ùš]™\‹]š\ÉÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœšYKšY]Ù\”›ÛK	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœšYKœÝ]\Ë	Ø\œš]š[™ÉÊNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂŸJNÂ\Ý
+	ÜÝ\\\ØÛÝ™\žHÛX\œÈH™XÛÝ™\žHØÚÈ[™™]\›œÈXXÚ›ÛHÈ]ÈÝÛˆÛYHÚ[ˆ›ÈšYH^\ÝÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆ›ÜŠÛÛœÝÜ›ÛKYÙWHÙˆÖÉÜ\ÜÙ[™Ù\‰Ë	ÚÛYI×KÉÙš]™\‰Ë	Ùš]™\‹ZÛYI×WJ^ÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹›ÛK\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	Ù[\IÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›X\šÙ\”™]Z[™Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËšÚ[™	Ù[\IÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœYÙKYÙJNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœšYK[
+NÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂˆBŸJNÂ\Ý
+	ÜÝ\\\ØÛÝ™\žHÙY\ÈÛÛ[X[™ÈØÚÙYÚ[ˆÝ\œ™[\šYHÛÚÝ\\È[XšYÝ[Ý\ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K›ÙO^ØÛÙN‰Ø[XšYÝ[Ý\×ØÝ\œ™[ÜšYIËY\ÜØYÙN‰ÐÝ\œ™[šYH\È[XšYÝ[Ý\ÉË™\]Y\ÝY‰Ý˜XÙK[Û›IßNÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOŠÜÝ]\ÎK›Ù_JJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	ØÛÛ™›XÝ	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›X\šÙ\”™]Z[™YYJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K˜Ø[”™]žK˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËšÚ[™	Ø›ØÚÙY	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœYÙK[
+NÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœšYK[
+NÂˆ\ÜÙ\™\]X[
+™\Ý[šY]Ëœ™X\ÛÛ‹	Ø[XšYÝ[Ý\×ØÝ\œ™[ÜšYIÊNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+Kœ™\Ý[YYœ›ÛK	ØÛÛ™›XÝ	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+JKœ™\]Y\ÝY˜[ÙJNÂˆ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJ™\Ý[
+Kš[˜ÛY\Ê’VT‘Kœ™\]Y\ÝY
+K˜[ÙJNÂŸJNÂ\Ý
+	ÜÝ\\\ØÛÝ™\žH™Z™XÝÈ^[™YÝ\œ™[\šYH›ÙY\È[œÝXYÙˆ^ÜÚ[™Èš]˜]HšY[ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K^[™Y^Ë‹‹˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ÊK\ÜÚYÛ™Yš]™\’Y‰Üš]˜]KYš]™\‰ßNÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒ›ÙN™^[™YJJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	ØÛÛ™›XÝ	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›X\šÙ\”™]Z[™YYJNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËšÚ[™	Ø›ØÚÙY	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœYÙK[
+NÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœšYK[
+NÂˆ\ÜÙ\™\]X[
+™\Ý[šY]Ëœ™X\ÛÛ‹	Ú[˜[YØÝ\œ™[ÜšYIÊNÂˆ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJ™\Ý[
+Kš[˜ÛY\Ê	Üš]˜]KYš]™\‰ÊK˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+Kœ™\Ý[YYœ›ÛK	ØÛÛ™›XÝ	ÊNÂŸJNÂ\Ý
+	ÜÝ\\\ØÛÝ™\žH™Z™XÝÈH˜[YÚ\H›ÜˆHÝ\ˆ›ÛHÚ]Ý]˜]šYØ][™ÈÜˆ^ÜÚ[™ÈHšYIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰Ê_JJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	ØÛÛ™›XÝ	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËšÚ[™	Ø›ØÚÙY	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœYÙK[
+NÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœšYK[
+NÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+Kœ›ÛK	Ü\ÜÙ[™Ù\‰ÊNÂŸJNÂ\Ý
+	ÛÙÛÝ]X›ÜÈÝ\\\ØÛÝ™\žH[™H[^YYÝXØÙ\ÜÈØ[››Ý™\ÝÜ™HH\ÜÙ[™Ù\ˆØÜ™Y[‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™[X\ÙK™\]Y\ÝÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë˜[YOOžÜ™\]Y\Ý]˜[YNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNßJNÂˆÛÛœÝ[™[™ÏXÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆÛÛœÝÙÙÙYÝ]XÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+[
+NÂˆ\ÜÙ\™\]X[
+™\]Y\ÝœÚYÛ˜[˜X›ÜYYJNÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]œÙ\ÜÚ[ÛXÝ]™K˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]›X\šÙ\”™]Z[™Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]›Ý]ÛÛYK	ÜÙ\ÜÚ[Û—ØÚ[™ÙY	ÊNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNÂˆÛÛœÝ[^YYX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+[^YYœ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YYšY]Ë[
+NÂˆ\ÜÙ\™\]X[
+[^YYœÝ]K›Ý]ÛÛYK	ÜÙ\ÜÚ[Û—ØÚ[™ÙY	ÊNÂŸJNÂ\Ý
+	Ü›ÛHÝÚ]Ú[™È™Z™XÝÈH[^YY\ÜÙ[™Ù\ˆ\ØÛÝ™\žH]™[ˆÚ[ˆH™\ÜÛœÙH\ÈÝ\Ú\ÙH˜[Y	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™[X\ÙNÂˆÛÛœÝØÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë
+
+OO›™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJJNÂˆÛÛœÝ[™[™ÏXÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆÛÛœÝÝÚ]ÚYXÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+ØXØÛÝ[™YŽ‰Ù[[ËYš]™\‹XXØÛÝ[	ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÂˆ\ÜÙ\™\]X[
+ÝÚ]ÚYœ›ÛK	Ü\ÜÙ[™Ù\‰ÊNÂˆ\ÜÙ\™\]X[
+ÝÚ]ÚYœÙ\ÜÚ[ÛXÝ]™K˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÝÚ]ÚYœÙ\ÜÚ[Û‘Ù[™\˜][Û‹ŠNÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNÂˆÛÛœÝ[^YYX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+[^YYœ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YYšY]Ë[
+NÂˆ\ÜÙ\™\]X[
+[^YYœÝ]K›X\šÙ\”™]Z[™Y˜[ÙJNÂŸJNÂ\Ý
+	ØXØÛÝ[ÝÚ]Ú[™È™Z™XÝÈH[^YY\ØÛÝ™\žH›ÜˆHØ[YH›ÛHÚ]Ý]^ÜÚ[™ÈXØÛÝ[™Y™\™[˜Ù\ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™[X\ÙK™\]Y\ÝÂˆÛÛœÝØÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë˜[YOOžÜ™\]Y\Ý]˜[YNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNßKØXØÛÝ[™YŽ‰Ü\ÜÙ[™Ù\‹XIËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰ßJNÂˆÛÛœÝ[™[™ÏXÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆÛÛœÝÝÚ]ÚYXÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+ØXØÛÝ[™YŽ‰Ü\ÜÙ[™Ù\‹X‰ËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰ßJNÂˆ\ÜÙ\™\]X[
+ÝÚ]ÚYœÙ\ÜÚ[ÛXÝ]™KYJNÂˆ\ÜÙ\™\]X[
+ÝÚ]ÚYœÙ\ÜÚ[Û‘Ù[™\˜][Û‹ŠNÂˆ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÝÚ]ÚY
+Kš[˜ÛY\Ê	Ü\ÜÙ[™Ù\‹XIÊK˜[ÙJNÂˆ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÝÚ]ÚY
+Kš[˜ÛY\Ê	Ü\ÜÙ[™Ù\‹X‰ÊK˜[ÙJNÂˆ\ÜÙ\™\]X[
+Øš™XÝš\ÓÝÛŠ™\]Y\Ý	ØXØÛÝ[™Y‰ÊK˜[ÙJNÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNÂˆÛÛœÝ[^YYX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+[^YYœ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YYšY]Ë[
+NÂˆ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJ[^YY
+Kš[˜ÛY\Ê	Ü\ÜÙ[™Ù\‹XIÊK˜[ÙJNÂŸJNÂ\Ý
+	ØH[^YY›ËXÝ\œ™[\šYH™\ÜÛœÙHØ[››Ý˜]šYØ]HH™]ÈÙ\ÜÚ[ÛˆÛYIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™[X\ÙNÂˆÛÛœÝØÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ùš]™\‰Ë
+
+OO›™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJJNÂˆÛÛœÝ[™[™ÏXÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+ØXØÛÝ[™YŽ‰ÛÝ\‹Yš]™\‹XXØÛÝ[	ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÂˆ™[X\ÙJÜÝ]\ÎŒŒJNÂˆÛÛœÝ[^YYX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+[^YYœ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YYšY]Ë[
+NÂˆ\ÜÙ\™\]X[
+[^YYœÝ]K›Ý]ÛÛYK	ÜÙ\ÜÚ[Û—ØÚ[™ÙY	ÊNÂŸJNÂ\Ý
+	Ø[ˆÛ™]ÛÜšÈ˜Z[\™HØ[››Ý™XÜ™X]HH™\Ý\X\šÙ\ˆY\ˆHÙ\ÜÚ[ÛˆÚ[™Ù\ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™Z™XÝÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë
+
+OO›™]È›ÛZ\ÙJ
+™\ÛÛ™K™Z™XÝ™XY
+OOžÜ™Z™XÝ\™Z™XÝ™XYßJJNÂˆÛÛœÝ[™[™ÏXÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+[
+NÂˆ™Z™XÝ
+\œ›ÜŠ	ÛÙ™›[™HY\ˆÙÛÝ]	ÊJNÂˆÛÛœÝ[^YYX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+[^YYœ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YYœÝ]K›X\šÙ\”™]Z[™Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+JKœ™\]Y\ÝY˜[ÙJNÂŸJNÂ\Ý
+	ØH™]ÈXØÛÝ[Ý\ÈÛ™Hœ™\Ú\ØÛÝ™\žHY\ˆX›Ü[™ÈHÛXØÛÝ[™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K[™[™ÏV×NÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë™\]Y\ÝO›™]È›ÛZ\ÙJ™\ÛÛ™OOœ[™[™Ëœ\Ú
+Ü™\]Y\Ý™\ÛÛ™_JJKØXØÛÝ[™YŽ‰Ü\ÜÙ[™Ù\‹XIËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰ßJNÂˆÛÛœÝÛ™XYXÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆÛÛœÝ[š]X[^™YXÛÛ›Û\‹˜™YÚ[”Ù\ÜÚ[Û”™XÛÝ™\žJØXØÛÝ[™YŽ‰Ü\ÜÙ[™Ù\‹X‰ËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰ßJNÂˆ\ÜÙ\™\]X[
+[š]X[^™YœÝ\YYJNÂˆ\ÜÙ\™\]X[
+[š]X[^™Yœ™X\ÛÛ‹	Ú[š]X[^™Y	ÊNÂˆ\ÜÙ\™\]X[
+[š]X[^™YœÝ]KœÙ\ÜÚ[Û‘Ù[™\˜][Û‹ŠNÂˆ\ÜÙ\™\]X[
+[š]X[^™YœÝ]KœÙ\ÜÚ[Û”™XÛÝ™\žR[š]X[^™YYJNÂˆ\ÜÙ\™\]X[
+[š]X[^™YœÝ]K›X\šÙ\”™]Z[™YYJNÂˆ\ÜÙ\™\]X[
+[™[™ÖÌKœ™\]Y\ÝœÚYÛ˜[˜X›ÜYYJNÂˆÛÛœÝ™]Ô™XYXÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+[™[™Ë›[™ÝŠNÂˆ\ÜÙ\™\]X[
+[™[™ÖÌWKœ™\]Y\ÝœÚYÛ˜[˜X›ÜY˜[ÙJNÂˆ[™[™ÖÌKœ™\ÛÛ™JÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNÂˆÛÛœÝÝ[OX]ØZ]Û™XYÂˆ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+Ý[KšY]Ë[
+NÂˆÛÛœÝ\XØ]OX]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+\XØ]Kœ™\]Y\ÝY˜[ÙJNÂˆ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	Ú[—Ù›YÚ	ÊNÂˆ\ÜÙ\™\]X[
+[™[™Ë›[™ÝŠNÂˆ[™[™ÖÌWKœ™\ÛÛ™JÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNÂˆÛÛœÝ™XÛÝ™\™YX]ØZ]™]Ô™XYÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™YœÝ]K›Ý]ÛÛYK	ØÛÛ™š\›YY	ÊNÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™YšY]ËœYÙK	Ü\ÜÙ[™Ù\‹Z\ÝÜžIÊNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂŸJNÂ\Ý
+	ÝHØ[YHÙ\ÜÚ[ÛˆØ[››Ý[š]X[^™HÝ\\\ØÛÝ™\žHÚXÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝØÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ùš]™\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNßJNÂˆ]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆÛÛœÝ\XØ]OXÛÛ›Û\‹˜™YÚ[”Ù\ÜÚ[Û”™XÛÝ™\žJØXØÛÝ[™YŽ‰Ù[[ËYš]™\‹XXØÛÝ[	ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÂˆ\ÜÙ\™\]X[
+\XØ]KœÝ\Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	Ø[™XYWÚ[š]X[^™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+JKœ™\]Y\ÝY˜[ÙJNÂˆ\ÜÙ\™\]X[
+™XYËJNÂŸJNÂ\Ý
+	ØH›ÛK\ÜXÚYšXÈÛÛ›Û\ˆ™Y\Ù\ÈÈ[š]X[^™H™XÛÝ™\žH›ÜˆHÝ\ˆ›ÛIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNßJNÂˆÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+[
+NÂˆÛÛœÝZ\ÛX]ÚYXÛÛ›Û\‹˜™YÚ[”Ù\ÜÚ[Û”™XÛÝ™\žJØXØÛÝ[™YŽ‰Ùš]™\‹XXØÛÝ[	ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÂˆ\ÜÙ\™\]X[
+Z\ÛX]ÚYœÝ\Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+Z\ÛX]ÚYœ™X\ÛÛ‹	Ü›ÛWÛZ\ÛX]Ú	ÊNÂˆ\ÜÙ\™\]X[
+Z\ÛX]ÚYœÝ]KœÙ\ÜÚ[ÛXÝ]™K˜[ÙJNÂˆ\ÜÙ\™\]X[
+Z\ÛX]ÚYœÝ]K›X\šÙ\”™]Z[™Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+JKœ™\]Y\ÝY˜[ÙJNÂˆ\ÜÙ\™\]X[
+™XYË
+NÂŸJNÂ\Ý
+	Ùœ™\ÚÙ\ÜÚ[Ûˆ™XÛÝ™\žHÜš]\ÈH™]ÈZ[š[X[X\šÙ\ˆÚ]Ý]š[˜Ú\[]IË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+NÛ]›ÝÏLLÂˆÛÛœÝÝX\™T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OO››ÝßJNÂˆÝX\™›X\šÊ	Ü\ÜÙ[™Ù\‰Ë	Ü[™[™ÉÊNÂˆÛÛœÝÛÛ›Û\T‹˜Ü™X]TÝ\\™XÛÝ™\žPÛÛ›Û\ŠÙÝX\™›ÛN‰Ü\ÜÙ[™Ù\‰Ëš[˜Ú\[žØXØÛÝ[™YŽ‰Ü\ÜÙ[™Ù\‹XIËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰ßK™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JNÂˆÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+[
+NÛ›ÝÏLŒÂˆÛÛœÝ[š]X[^™YXÛÛ›Û\‹˜™YÚ[”Ù\ÜÚ[Û”™XÛÝ™\žJØXØÛÝ[™YŽ‰Ü\ÜÙ[™Ù\‹X‰ËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰ßJNÂˆÛÛœÝœ™\ÚR”ÓÓ‹œ\œÙJÝÜ˜YÙK˜[YJÝX\™šÙ^JJNÂˆ\ÜÙ\™\]X[
+[š]X[^™YœÝ\YYJNÂˆ\ÜÙ\™Y\\]X[
+œ™\ÚÝ™\œÚ[ÛŽŒK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ]ÛÛYN‰Ý[œ™\ÛÛ™Y	ËØ]™Y]ŒŒJNÂˆ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJœ™\Ú
+Kš[˜ÛY\Ê	Ü\ÜÙ[™Ù\‹XIÊK˜[ÙJNÂˆ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJœ™\Ú
+Kš[˜ÛY\Ê	Ü\ÜÙ[™Ù\‹X‰ÊK˜[ÙJNÂŸJNÂ\Ý
+	ØH™]ÛH[š]X[^™Yš]™\ˆÙ\ÜÚ[Ûˆ™]\›œÈÛ›HÈHš]™\ˆÛYHÚ[ˆ›ÈšYH^\ÝÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™\]Y\ÝÏLÂˆÛÛœÝÙÝX\™ÛÛ›Û\ŸO\Ý\\™XÛÝ™\žJ‹	Ùš]™\‰Ë\Þ[˜È™\]Y\ÝOžÜ™\]Y\ÝÊÏLNØ\ÜÙ\™\]X[
+Øš™XÝš\ÓÝÛŠ™\]Y\Ý	ØXØÛÝ[™Y‰ÊK˜[ÙJNÜ™]\›ˆÜÝ]\ÎŒŒNßJNÂˆÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+[
+NÂˆÛÛœÝ[š]X[^™YXÛÛ›Û\‹˜™YÚ[”Ù\ÜÚ[Û”™XÛÝ™\žJØXØÛÝ[™YŽ‰Û™]ËYš]™\‰ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÂˆÛÛœÝ™\Ý[X]ØZ]ÛÛ›Û\‹œ™XÛÛ˜Ú[J
+NÂˆ\ÜÙ\™\]X[
+[š]X[^™YœÝ\YYJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]K›Ý]ÛÛYK	Ù[\IÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœYÙK	Ùš]™\‹ZÛYIÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šY]ËœšYK[
+NÂˆ\ÜÙ\™\]X[
+™\]Y\ÝËJNÂˆ\ÜÙ\™\]X[
+ÝX\™œ™\ÝÜ™J
+K[
+NÂŸJNÂ™[˜Ý[Ûˆ™XÛÝ™\žUZJ‹›ÛOIÜ\ÜÙ[™Ù\‰ËÙ[™\˜][ÛLJHÂˆÛÛœÝYÙ\ÏV×KÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š›ÛJNÂˆÛÛ[X[™ZK™š[š\Ú
+	Ý[œ™\ÛÛ™Y	ÊNÂˆ™]\›ˆÜYÙ\ËÛÛ[X[™ZKY\\Ž”‹˜Ü™X]TÝ\\™XÛÝ™\žUZPY\\ŠÜ›ÛKÙ\ÜÚ[Û‘Ù[™\˜][ÛŽ™Ù[™\˜][Û‹˜]šYØ]NœYÙOOœYÙ\Ëœ\Ú
+YÙJKÛÛ[X[™Z_J_NÂŸB™[˜Ý[Ûˆ™XÛÝ™\žT™\Ý[
+›ÛKÝ]ÛÛYKšY]ËÝ™\œšY\Ï^ßJHÂˆ™]\›ˆÜ™\]Y\ÝYYKÝ]NžÜ›ÛKÝ]ÛÛYK][\ÎŒKÙ\ÜÚ[Û‘Ù[™\˜][ÛŽŒK‹‹›Ý™\œšY\ßKšY]ßNÂŸB\Ý
+	Ü\ÜÙ[™Ù\ˆÝ\\™XÛÝ™\žH˜]šYØ]\È[™[›ØÚÜÈ^XÝHÛ˜ÙIË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÜYÙ\ËÛÛ[X[™ZKY\\ŸO\™XÛÝ™\žUZJŠNÂˆÛÛœÝšY]Ï^ÚÚ[™‰ÜšYIËYÙN‰Ü\ÜÙ[™Ù\‹Z\ÝÜžIËšYN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ÊK™X\ÛÛŽ‰ØÝ\œ™[ÜšYIßNÂˆÛÛœÝš\œÝXY\\‹˜\J™XÛÝ™\žT™\Ý[
+	Ü\ÜÙ[™Ù\‰Ë	ØÛÛ™š\›YY	ËšY]ÊJNÂˆÛÛœÝ\XØ]OXY\\‹˜\J™XÛÝ™\žT™\Ý[
+	Ü\ÜÙ[™Ù\‰Ë	ØÛÛ™š\›YY	ËšY]ÊJNÂˆ\ÜÙ\™\]X[
+š\œÝ˜\YYYJNØ\ÜÙ\™\]X[
+š\œÝœ™X\ÛÛ‹	ÜšYWÜ™\ÝÜ™Y	ÊNÂˆ\ÜÙ\™Y\\]X[
+YÙ\ËÉÜ\ÜÙ[™Ù\‹Z\ÝÜžI×JNÂˆ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™Ë˜[ÙJNÂˆ\ÜÙ\™\]X[
+\XØ]K˜\YY˜[ÙJNØ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	Ø[™XYWÜÙ]Y	ÊNÂŸJNÂ\Ý
+	Ùš]™\ˆ[\H™XÛÝ™\žH™]\›œÈÛ›HÈš]™\ˆÛYIË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÜYÙ\ËY\\ŸO\™XÛÝ™\žUZJ‹	Ùš]™\‰ÊNÂˆÛÛœÝ™\Ý[XY\\‹˜\J™XÛÝ™\žT™\Ý[
+	Ùš]™\‰Ë	Ù[\IËÚÚ[™‰Ù[\IËYÙN‰Ùš]™\‹ZÛYIËšYN›[™X\ÛÛŽ‰Û›×ØÝ\œ™[ÜšYIßJJNÂˆ\ÜÙ\™\]X[
+™\Ý[˜\YYYJNØ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	ÚÛYWÜ™\ÝÜ™Y	ÊNÂˆ\ÜÙ\™Y\\]X[
+YÙ\ËÉÙš]™\‹ZÛYI×JNØ\ÜÙ\™\]X[
+™\Ý[œÝ]K˜ÛÛ[X[™œ›ÛK	Ùš]™\‰ÊNÂŸJNÂ\Ý
+	ÜÝ[HÙ\ÜÚ[Ûˆ™XÛÝ™\žHØ[››Ý˜]šYØ]HÜˆ[›ØÚÈHÝ\œ™[Ù\ÜÚ[Û‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÜYÙ\ËÛÛ[X[™ZKY\\ŸO\™XÛÝ™\žUZJ‹	Ü\ÜÙ[™Ù\‰ËŠNÂˆÛÛœÝÝ[O\™XÛÝ™\žT™\Ý[
+	Ü\ÜÙ[™Ù\‰Ë	ØÛÛ™š\›YY	ËÚÚ[™‰ÜšYIËYÙN‰Ü\ÜÙ[™Ù\‹Z\ÝÜžIËšYN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_KÜÙ\ÜÚ[Û‘Ù[™\˜][ÛŽŒ_JNÂˆ\ÜÙ\™\]X[
+Y\\‹˜\JÝ[JK˜\YY˜[ÙJNÂˆ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™ËYJNÂŸJNÂ\Ý
+	ØH™]ÈRHÙ\ÜÚ[ÛˆYÛ›Ü™\È[ˆÛÛÛ\][Ûˆ[™XØÙ\È]ÈÝÛˆ™\Ý[Û˜ÙIË
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÜYÙ\ËY\\ŸO\™XÛÝ™\žUZJ‹	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+Y\\‹˜™YÚ[”Ù\ÜÚ[ÛŠŠKœÝ\YYJNÂˆÛÛœÝÛ\™XÛÝ™\žT™\Ý[
+	Ùš]™\‰Ë	Ù[\IËÚÚ[™‰Ù[\IËYÙN‰Ùš]™\‹ZÛYIËšYN›[KÜÙ\ÜÚ[Û‘Ù[™\˜][ÛŽŒ_JNÂˆ\ÜÙ\™\]X[
+Y\\‹˜\JÛ
+K˜\YY˜[ÙJNÂˆÛÛœÝœ™\Ú\™XÛÝ™\žT™\Ý[
+	Ùš]™\‰Ë	Ù[\IËÚÚ[™‰Ù[\IËYÙN‰Ùš]™\‹ZÛYIËšYN›[KÜÙ\ÜÚ[Û‘Ù[™\˜][ÛŽŒŸJNÂˆ\ÜÙ\™\]X[
+Y\\‹˜\Jœ™\Ú
+K˜\YYYJNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÙš]™\‹ZÛYI×JNÂˆ\ÜÙ\™\]X[
+Y\\‹˜™YÚ[”Ù\ÜÚ[ÛŠŠKœÝ\Y˜[ÙJNÂŸJNÂ\Ý
+	Ü™X]][XØ][Ûˆ[™[œ™\ÛÛ™Y™\Ý[È\]HH›ÛHØÚÈÚ]Ý]˜]šYØ][Û‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÜYÙ\ËÛÛ[X[™ZKY\\ŸO\™XÛÝ™\žUZJ‹	Ùš]™\‰ÊNÂˆÛÛœÝ™X]]XY\\‹˜\J™XÛÝ™\žT™\Ý[
+	Ùš]™\‰Ë	Ü™X]]	Ë[
+JNÂˆ\ÜÙ\™\]X[
+™X]]˜\YYYJNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹	Ü™X]]	ÊNÂˆÛÛœÝ[œ™\ÛÛ™YXY\\‹˜\J™XÛÝ™\žT™\Ý[
+	Ùš]™\‰Ë	Ý[œ™\ÛÛ™Y	Ë[Ø][\ÎŒŸJJNÂˆ\ÜÙ\™\]X[
+[œ™\ÛÛ™Y˜\YYYJNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹	Ü™Yœ™\Ú	ÊNÂˆ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNÂŸJNÂ\Ý
+	ØÜ›ÜÜË\›ÛHÜˆ[™^XÝY™XÛÝ™\žHšY]ÜÈ˜Z[ÛÜÙY	Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÜYÙ\ËÛÛ[X[™ZKY\\ŸO\™XÛÝ™\žUZJ‹	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÜ›Û™Ô›ÛO\™XÛÝ™\žT™\Ý[
+	Ùš]™\‰Ë	ØÛÛ™š\›YY	ËÚÚ[™‰ÜšYIËYÙN‰Ùš]™\‹]š\ÉËšYN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰Ê_JNÂˆ\ÜÙ\™\]X[
+Y\\‹˜\JÜ›Û™Ô›ÛJK˜\YY˜[ÙJNÂˆÛÛœÝÜ›Û™ÔYÙO\™XÛÝ™\žT™\Ý[
+	Ü\ÜÙ[™Ù\‰Ë	ØÛÛ™š\›YY	ËÚÚ[™‰ÜšYIËYÙN‰Ùš]™\‹]š\ÉËšYN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNÂˆÛÛœÝ›ØÚÙYXY\\‹˜\JÜ›Û™ÔYÙJNÂˆ\ÜÙ\™\]X[
+›ØÚÙY˜\YYYJNØ\ÜÙ\™\]X[
+›ØÚÙYœ™X\ÛÛ‹	Ú[˜[YÝšY]ÉÊNÂˆ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K›Ý]ÛÛYK	ØÛÛ™›XÝ	ÊNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™ËYJNÂŸJNÂ™[˜Ý[Ûˆ™XÛÝ™\žQ›ÝÊ‹›ÛK™XYÝ\œ™[šYKš[˜Ú\[^ØXØÛÝ[™YŽ˜[[ËIÜ›Û_KXXØÛÝ[šY]Ù\”›ÛNœ›Û_KÜ[ÛœÏ^ßJHÂˆÛÛœÝÝÜ˜YÙO[Y[[ÜžTÝÜ˜YÙJ
+KÝX\™T‹˜Ü™X]PÛÛ[X[™™\Ý\ÝX\™
+ÝÜ˜YÙKÛ›ÝÎŠ
+OOŒLJNÙÝX\™›X\šÊ›ÛK	Ü[™[™ÉÊNÂˆÛÛœÝÛÛ›Û\T‹˜Ü™X]TÝ\\™XÛÝ™\žPÛÛ›Û\ŠÙÝX\™›ÛKš[˜Ú\[™XYÝ\œ™[šY_JNÂˆÛÛœÝYÙ\ÏV×KÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š›ÛJNØÛÛ[X[™ZK™š[š\Ú
+	Ý[œ™\ÛÛ™Y	ÊNÂˆÛÛœÝZPY\\T‹˜Ü™X]TÝ\\™XÛÝ™\žUZPY\\ŠÜ›ÛKÙ\ÜÚ[Û‘Ù[™\˜][ÛŽ˜ÛÛ›Û\‹œÛ˜\ÚÝ
+
+KœÙ\ÜÚ[Û‘Ù[™\˜][Û‹˜]šYØ]NœYÙOOœYÙ\Ëœ\Ú
+YÙJKÛÛ[X[™Z_JNÂˆÛÛœÝ›ÝÏT‹˜Ü™X]TÝ\\™XÛÝ™\žQ›ÝÊÜ›ÛKÛÛ›Û\‹ZPY\\‹‹‹›Ü[ÛœßJNÂˆ™]\›ˆÜÝÜ˜YÙKÝX\™ÛÛ›Û\‹YÙ\ËÛÛ[X[™ZKZPY\\‹›ÝßNÂŸB\Ý
+	ÜÝ\\ØÜ™Y[ˆ›ÝÈ\Y\È\ÜÙ[™Ù\ˆ™XÛÝ™\žHÈ˜]šYØ][Ûˆ[™ØÚÈÛ˜ÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÙ›ÝËYÙ\ËÛÛ[X[™Z_O\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JJNÂˆÛÛœÝ™XÛÝ™\™YX]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ™X\ÛÛ‹	ÜšYWÜ™\ÝÜ™Y	ÊNÂˆ\ÜÙ\™Y\\]X[
+YÙ\ËÉÜ\ÜÙ[™Ù\‹Z\ÝÜžI×JNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™Ë˜[ÙJNÂˆÛÛœÝ\XØ]OX]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NÂˆ\ÜÙ\™\]X[
+\XØ]Kœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+\XØ]Kœ™\Ý[œ™X\ÛÛ‹	Û›×Ü™XÛÝ™\žIÊNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÜ\ÜÙ[™Ù\‹Z\ÝÜžI×JNÂŸJNÂ\Ý
+	ØÛÛ›™XÝ]š]H™XÛÝ™\žHXÝ[Ûˆ™\™XYÈÛ˜ÙH[™[ˆ[›ØÚÜÈHÛÜœ™XÝ›ÛIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙ›ÝËYÙ\ËÛÛ[X[™Z_O\™XÛÝ™\žQ›ÝÊ‹	Ùš]™\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰Ê_NßJNÂˆÛÛœÝÙ™›[™OX]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NÂˆ\ÜÙ\™\]X[
+Ù™›[™Kœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹	Ü™Yœ™\Ú	ÊNØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNÂˆÛÛœÝ™\ÝÜ™YX]ØZ]›ÝËœ™\Ý[YJ	ØÛÛ›™XÝ]š]IÊNÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÙš]™\‹]š\É×JNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™Ë˜[ÙJNØ\ÜÙ\™\]X[
+™XYËŠNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝËœ™\Ý[YJ	ØÛÛ›™XÝ]š]IÊJKœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+™XYËŠNÂŸJNÂ\Ý
+	Ü™X]][XØ][ÛˆXÝ[ÛˆÙY\ÈÛÛ[X[™ÈØÚÙY[[H]]Üš^™Y™\™XYÝXØÙYYÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙ›ÝËYÙ\ËÛÛ[X[™Z_O\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆ™XYÏOOLOÞÜÝ]\Î_NžÜÝ]\ÎŒŒNßJNÂˆ]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹	Ü™X]]	ÊNØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNÂˆÛÛœÝ™\ÝÜ™YX]ØZ]›ÝËœ™\Ý[YJ	Ü™X]]	ÊNÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÚÛYI×JNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™Ë˜[ÙJNÂŸJNÂ\Ý
+	ØH™]È]][XØ]YÙ\ÜÚ[Ûˆ\È[š]X[^™Y[™\YY›ÝYÚÛ™H›ÝÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙ›ÝËÛÛ›Û\‹YÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ùš]™\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNßKØXØÛÝ[™YŽ‰Ùš]™\‹XIËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÂˆÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+[
+NÂˆÛÛœÝÝ\YX]ØZ]›ÝË˜™YÚ[”Ù\ÜÚ[ÛŠØXØÛÝ[™YŽ‰Ùš]™\‹X‰ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÂˆ\ÜÙ\™\]X[
+Ý\Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+Ý\Yœ™X\ÛÛ‹	ÚÛYWÜ™\ÝÜ™Y	ÊNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÙš]™\‹ZÛYI×JNØ\ÜÙ\™\]X[
+™XYËJNÂˆÛÛœÝ\XØ]OX]ØZ]›ÝË˜™YÚ[”Ù\ÜÚ[ÛŠØXØÛÝ[™YŽ‰Ùš]™\‹X‰ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÂˆ\ÜÙ\™\]X[
+\XØ]Kœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	Ø[™XYWÚ[š]X[^™Y	ÊNØ\ÜÙ\™\]X[
+™XYËJNÂŸJNÂ\Ý
+	Ù\ÜÜÚ[™ÈH›ÛH›ÝÈX›ÜÈ]È™XY[™™Z™XÝÈH[^YYÛÛ\][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™\ÛÛ™NÂˆÛÛœÝÙ›ÝËYÙ\ËÛÛ[X[™Z_O\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë
+
+OO›™]È›ÛZ\ÙJÛ™OOžÜ™\ÛÛ™OYÛ™NßJJNÂˆÛÛœÝ[™[™ÏY›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NÂˆÛÛœÝ\ÜÜÙYY›ÝË™\ÜÜÙJ
+NØ\ÜÙ\™\]X[
+\ÜÜÙY™\ÜÜÙYYJNÂˆ™\ÛÛ™JÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNÂˆÛÛœÝÝ[OX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+Ý[Kœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	Ù›Ý×ÜÝ[IÊNØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™ËYJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝËœ™\Ý[YJ	ØÛÛ›™XÝ]š]IÊJKœ™X\ÛÛ‹	Ù›Ý×Ù\ÜÜÙY	ÊNÂŸJNÂ\Ý
+	Ü›ÛHZ\ÛX]Ú[™[˜[Y™XÛÝ™\žHXÝ[ÛœÈÙ[™›È\ØÛÝ™\žH™\]Y\Ý	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNßJNÂˆÛÛœÝÜ›Û™ÏX]ØZ]›ÝË˜™YÚ[”Ù\ÜÚ[ÛŠØXØÛÝ[™YŽ‰Ùš]™\‹XXØÛÝ[	ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÂˆ\ÜÙ\™\]X[
+Ü›Û™Ëœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ü›Û™Ëœ™X\ÛÛ‹	Ü›ÛWÛZ\ÛX]Ú	ÊNÂˆÛÛœÝ[˜[YX]ØZ]›ÝËœ™\Ý[YJ	Ø]]ÛX]XÉÊNÂˆ\ÜÙ\™\]X[
+[˜[Yœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+[˜[Yœ™X\ÛÛ‹	Ú[˜[YÜ™\Ý[YWÜ™X\ÛÛ‰ÊNØ\ÜÙ\™\]X[
+™XYË
+NØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNÂŸJNÂ\Ý
+	ØHY[ˆÝ\\ØÜ™Y[ˆÙ[™È›È™XY[[]™XÛÛY\Èš\ÚX›IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNßK[™Yš[™YÚ[š]X[Uš\ÚX›N™˜[Ù_JNÂˆÛÛœÝY[X]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NÂˆ\ÜÙ\™\]X[
+Y[‹œ™X\ÛÛ‹	ÜØÜ™Y[—ÚY[‰ÊNØ\ÜÙ\™\]X[
+™XYË
+NØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNÂˆÛÛœÝš\ÚX›OX]ØZ]›ÝËœÙ]š\ÚX›JYJNÂˆ\ÜÙ\™\]X[
+š\ÚX›Kœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+š\ÚX›Kœ™X\ÛÛ‹	ÚÛYWÜ™\ÝÜ™Y	ÊNØ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÚÛYI×JNÂŸJNÂ\Ý
+	ØH™\Ý[ÛÛ\]YÚ[HY[ˆ\ÈY™\œ™Y[™\YYÛ˜ÙHÛˆ™]\›‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™\ÛÛ™NÂˆÛÛœÝÙ›ÝËYÙ\ËÛÛ[X[™Z_O\™XÛÝ™\žQ›ÝÊ‹	Ùš]™\‰Ë
+
+OO›™]È›ÛZ\ÙJÛ™OOžÜ™\ÛÛ™OYÛ™NßJJNÂˆÛÛœÝ[™[™ÏY›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NØ]ØZ]›ÝËœÙ]š\ÚX›J˜[ÙJNÂˆ™\ÛÛ™JÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰Ê_JNÂˆÛÛœÝY™\œ™YX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+Y™\œ™Yœ™X\ÛÛ‹	ÚY[—Ü™\Ý[ÙY™\œ™Y	ÊNØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™ËYJNÂˆÛÛœÝ™\ÝÜ™YX]ØZ]›ÝËœÙ]š\ÚX›JYJNÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÙš]™\‹]š\É×JNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™Ë˜[ÙJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝËœÙ]š\ÚX›JYJJKœ™X\ÛÛ‹	Ýš\ÚXš[]WÝ[˜Ú[™ÙY	ÊNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÙš]™\‹]š\É×JNÂŸJNÂ\Ý
+	ØHY[ˆÛÛ›™XÝ]š]HXÝ[ÛˆÙ\È›ÝÛÛœÝ[YHHÛ™H[ÝÙY™\™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆÜÝ]\ÎŒŒNßJNÂˆ]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NØ]ØZ]›ÝËœÙ]š\ÚX›J˜[ÙJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝËœ™\Ý[YJ	ØÛÛ›™XÝ]š]IÊJKœ™X\ÛÛ‹	ÜØÜ™Y[—ÚY[‰ÊNØ\ÜÙ\™\]X[
+™XYËJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝËœÙ]š\ÚX›JYJJKœ™X\ÛÛ‹	Ýš\ÚX›WÛ›ÛÜ	ÊNØ\ÜÙ\™\]X[
+™XYËJNÂˆÛÛœÝ™\ÝÜ™YX]ØZ]›ÝËœ™\Ý[YJ	ØÛÛ›™XÝ]š]IÊNÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÚÛYI×JNÂŸJNÂ\Ý
+	Ü˜\YYH[™ÚÝÈ\š[™ÈÛ™H™XYÙ\È›ÝÝ\[›Ý\ˆ™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™\ÛÛ™K™XYÏLÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ùš]™\‰Ë
+
+OOžÜ™XYÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJÛ™OOžÜ™\ÛÛ™OYÛ™NßJNßJNÂˆÛÛœÝ[™[™ÏY›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NØ]ØZ]›ÝËœÙ]š\ÚX›J˜[ÙJNØ]ØZ]›ÝËœÙ]š\ÚX›JYJNÂˆ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™\]X[
+›ÝËœÛ˜\ÚÝ
+
+K˜ÛÛ›Û\‹˜\ÞKYJNÂˆ™\ÛÛ™JÜÝ]\ÎŒŒJNØÛÛœÝ™\ÝÜ™YX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+™\ÝÜ™Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÙš]™\‹ZÛYI×JNÂŸJNÂ\Ý
+	ØHÙ\ÜÚ[Ûˆ[š]X[^™YÚ[HY[ˆ\™›Ü›\ÈÛ™H\ØÛÝ™\žHÚ[ˆÚÝÛ‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝÙ›ÝËÛÛ›Û\‹YÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNßKØXØÛÝ[™YŽ‰Ü\ÜÙ[™Ù\‹XIËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰ßKÚ[š]X[Uš\ÚX›N™˜[Ù_JNÂˆÛÛ›Û\‹œ™\XÙTš[˜Ú\[
+[
+NÂˆÛÛœÝY[X]ØZ]›ÝË˜™YÚ[”Ù\ÜÚ[ÛŠØXØÛÝ[™YŽ‰Ü\ÜÙ[™Ù\‹X‰ËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰ßJNÂˆ\ÜÙ\™\]X[
+Y[‹œ™X\ÛÛ‹	ÜØÜ™Y[—ÚY[‰ÊNØ\ÜÙ\™\]X[
+™XYË
+NÂˆÛÛœÝš\ÚX›OX]ØZ]›ÝËœÙ]š\ÚX›JYJNÂˆ\ÜÙ\™\]X[
+š\ÚX›Kœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÚÛYI×JNÂŸJNÂ\Ý
+	Ù\ÜÜÚ[™ÈHY[ˆ›ÝÈ\ØØ\™È]ÈY™\œ™Y™\Ý[\›X[™[IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™\ÛÛ™NÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë
+
+OO›™]È›ÛZ\ÙJÛ™OOžÜ™\ÛÛ™OYÛ™NßJJNÂˆÛÛœÝ[™[™ÏY›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NØ]ØZ]›ÝËœÙ]š\ÚX›J˜[ÙJNÜ™\ÛÛ™JÜÝ]\ÎŒŒJNÂˆ\ÜÙ\™\]X[
+
+]ØZ][™[™ÊKœ™X\ÛÛ‹	ÚY[—Ü™\Ý[ÙY™\œ™Y	ÊNØ\ÜÙ\™\]X[
+›ÝËœÛ˜\ÚÝ
+
+K™Y™\œ™Y™\Ý[YJNÂˆ›ÝË™\ÜÜÙJ
+NØ\ÜÙ\™\]X[
+›ÝËœÛ˜\ÚÝ
+
+K™Y™\œ™Y™\Ý[˜[ÙJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝËœÙ]š\ÚX›JYJJKœ™X\ÛÛ‹	Ù›Ý×Ù\ÜÜÙY	ÊNØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNÂŸJNÂ™[˜Ý[Ûˆ™XÛÝ™\žQ]™[\™Ù]
+
+HÂˆÛÛœÝ\Ý[™\œÏ[™]ÈX\
+
+KYÏ[™]ÈX\
+
+NÂˆ™]\›ˆÂˆY]™[\Ý[™\Š\K[™\Š^ÚYŠ[\Ý[™\œËš\Ê\JJ[\Ý[™\œËœÙ]
+\K™]ÈÙ]
+
+JNÛ\Ý[™\œË™Ù]
+\JK˜Y
+[™\ŠNØYËœÙ]
+\K
+YË™Ù]
+\J_
+JÌJNßKˆ™[[Ý™Q]™[\Ý[™\Š\K[™\Š^Û\Ý[™\œË™Ù]
+\JOË™[]J[™\ŠNßKˆ\Ü]Ú
+\K]™[^ßJ^Ù›ÜŠÛÛœÝ[™\ˆÙˆË‹‹Š\Ý[™\œË™Ù]
+\J_×JWJZ[™\ŠÝ\K‹‹™]™[JNßKˆ\Ý[™\ÛÝ[
+\J^Ü™]\›ˆ\Ý[™\œË™Ù]
+\JOËœÚ^™_ßKˆYÛÝ[
+\J^Ü™]\›ˆYË™Ù]
+\J_ßBˆNÂŸB™[˜Ý[Ûˆ™YY˜XÚÑÛQ[[Y[Ê
+HÂˆÛÛœÝ\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[J
+OOŠÚY[Ž™˜[ÙK\ØX›Y™˜[ÙK^ÛÛ[‰ÉËÛ\ÜÓ˜[YN‰ÉË]šX]\ÎžßKÙ]]šX]J˜[YK˜[YJ^Ý\Ë˜]šX]\ÖÛ˜[YWOTÝš[™Ê˜[YJNß_JKXÝ[ÛSØš™XÝ˜\ÜÚYÛŠ[[Y[
+
+K\™Ù]
+NÂˆ™]\›ˆØ›Þ™[[Y[
+
+K]N™[[Y[
+
+KY\ÜØYÙN™[[Y[
+
+KXÝ[Û‹ÛÛ[X[™]ÛœÎ–Ù[[Y[
+
+K[[Y[
+
+W_NÂŸB\Ý
+	ÜÝ\\™XÛÝ™\žH]™[œšYÙH]XÚ\ÈXXÚY™XÞXÛH\Ý[™\ˆÛ˜ÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßNÂˆÛÛœÝÙ›ÝßO\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJJNÂˆÛÛœÝœšYÙOT‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]ØÝ[Y[Ý]_JNÂˆ\ÜÙ\™\]X[
+œšYÙKœÝ\
+
+KœÝ\YYJNØ\ÜÙ\™\]X[
+œšYÙKœÝ\
+
+Kœ™X\ÛÛ‹	Ø[™XYWØ]XÚY	ÊNØ]ØZ]œšYÙKšYJ
+NÂˆ›ÜŠÛÛœÝ\HÙˆÉÝš\ÚXš[]XÚ[™ÙIË	ÜYÙ\ÚÝÉË	ÛÛ›[™I×J^Ø\ÜÙ\™\]X[
+\™Ù]›\Ý[™\ÛÝ[
+\JKJNØ\ÜÙ\™\]X[
+\™Ù]˜YÛÝ[
+\JKJNßBˆ\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\ÊœšYÙKœÛ˜\ÚÝ
+
+JKœÛÜ
+
+KÉØ]XÚY	Ë	Ø\ÞIË	Ù]XÚY	Ë	Ú[™Y]™[ÉË	Û\Ý]™[	×JNÂŸJNÂ\Ý
+	Ýš\ÚXš[]XÚ[™ÙH[™YÙ\ÚÝÈ™\ÝÜ™HHY[ˆÝ\\ØÜ™Y[ˆÚ]Û™H™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰ÚY[‰ßNÛ]™XYÏLÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ùš]™\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNßK[™Yš[™YÚ[š]X[Uš\ÚX›N™˜[Ù_JNÂˆÛÛœÝœšYÙOT‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]ØÝ[Y[Ý]_JNØœšYÙKœÝ\
+
+NØ]ØZ]œšYÙKšYJ
+NÂˆ\™Ù]™\Ü]Ú
+	ÜYÙ\ÚÝÉÊNØ]ØZ]œšYÙKšYJ
+NØ\ÜÙ\™\]X[
+™XYË
+NÂˆØÝ[Y[Ý]Kš\ÚXš[]TÝ]OIÝš\ÚX›IÎÝ\™Ù]™\Ü]Ú
+	Ýš\ÚXš[]XÚ[™ÙIÊNÝ\™Ù]™\Ü]Ú
+	ÜYÙ\ÚÝÉÊNØ]ØZ]œšYÙKšYJ
+NÂˆ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÙš]™\‹ZÛYI×JNØ\ÜÙ\™\]X[
+›ÝËœÛ˜\ÚÝ
+
+Kš\ÚX›KYJNÂŸJNÂ\Ý
+	Ù\XØ]HÛ›[™H]™[ÈÛØ[\ØÙH[ÈHÚ[™ÛH\›Z]YÛÛ›™XÝ]š]H™\™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßNÛ]™XYÏL™[X\ÙNÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNßJNÂˆ]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NØÛÛœÝœšYÙOT‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]ØÝ[Y[Ý]_JNØœšYÙKœÝ\
+
+NØ]ØZ]œšYÙKšYJ
+NÂˆ\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNÝ\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ\ÜÙ\™\]X[
+™XYËŠNÝ\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ\ÜÙ\™\]X[
+™XYËŠNÂˆ™[X\ÙJÜÝ]\ÎŒŒJNØ]ØZ]œšYÙKšYJ
+NØ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÚÛYI×JNÂŸJNÂ\Ý
+	ÛÛ›[™HÙ\È›ÝÝXœÝ]]H›ÜˆH^XÚ]™X]][XØ][Ûˆ™XÛÝ™\žHXÝ[Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßNÛ]™XYÏLÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ùš]™\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\Î_NßJNÂˆ]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NØÛÛœÝœšYÙOT‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]ØÝ[Y[Ý]_JNØœšYÙKœÝ\
+
+NØ]ØZ]œšYÙKšYJ
+NÂˆ\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]œšYÙKšYJ
+NØ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNØ\ÜÙ\™\]X[
+›ÝËœÛ˜\ÚÝ
+
+K˜ÛÛ›Û\‹›Ý]ÛÛYK	Ü™X]]	ÊNÂŸJNÂ\Ý
+	ÚY[™È\š[™È[ˆÛ›[™H™\™XYY™\œÈ]È™\Ý[[[YÙ\ÚÝÈÚ]Ý][›Ý\ˆ™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßNÛ]™XYÏL™[X\ÙNÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ùš]™\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNßJNÂˆ]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NØÛÛœÝœšYÙOT‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]ØÝ[Y[Ý]_JNØœšYÙKœÝ\
+
+NØ]ØZ]œšYÙKšYJ
+NÂˆ\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ\ÜÙ\™\]X[
+™XYËŠNÂˆØÝ[Y[Ý]Kš\ÚXš[]TÝ]OIÚY[‰ÎÝ\™Ù]™\Ü]Ú
+	Ýš\ÚXš[]XÚ[™ÙIÊNØ\ÜÙ\™\]X[
+›ÝËœÛ˜\ÚÝ
+
+Kš\ÚX›K˜[ÙJNÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰Ê_JNØ]ØZ]œšYÙKšYJ
+NØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNØ\ÜÙ\™\]X[
+›ÝËœÛ˜\ÚÝ
+
+K™Y™\œ™Y™\Ý[YJNÂˆØÝ[Y[Ý]Kš\ÚXš[]TÝ]OIÝš\ÚX›IÎÝ\™Ù]™\Ü]Ú
+	ÜYÙ\ÚÝÉÊNØ]ØZ]œšYÙKšYJ
+NØ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™Y\\]X[
+YÙ\ËÉÙš]™\‹]š\É×JNÂŸJNÂ\Ý
+	Ù]XÚ[™ÈH]™[œšYÙH™[[Ý™\È\Ý[™\œÈ[™™]™[È]HÜˆ]\™H˜]šYØ][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßNÛ]™XYÏL™[X\ÙNÂˆÛÛœÝÙ›ÝËYÙ\ßO\™XÛÝ™\žQ›ÝÊ‹	Ü\ÜÙ[™Ù\‰Ë\Þ[˜Ê
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNßJNÂˆ]ØZ]›ÝËœ™XÛÝ™\“Û”Ý\\
+
+NØÛÛœÝœšYÙOT‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]ØÝ[Y[Ý]_JNØœšYÙKœÝ\
+
+NØ]ØZ]œšYÙKšYJ
+NÂˆ\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ\ÜÙ\™\]X[
+™XYËŠNÂˆ\ÜÙ\™\]X[
+œšYÙK™]XÚ
+
+K™]XÚYYJNÙ›ÜŠÛÛœÝ\HÙˆÉÝš\ÚXš[]XÚ[™ÙIË	ÜYÙ\ÚÝÉË	ÛÛ›[™I×JX\ÜÙ\™\]X[
+\™Ù]›\Ý[™\ÛÝ[
+\JK
+NÂˆ™[X\ÙJÜÝ]\ÎŒŒJNØ]ØZ]œšYÙKšYJ
+NÝ\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNÝ\™Ù]™\Ü]Ú
+	ÜYÙ\ÚÝÉÊNØ]ØZ]œšYÙKšYJ
+NÂˆ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™Y\\]X[
+YÙ\Ë×JNØ\ÜÙ\™\]X[
+›ÝËœÛ˜\ÚÝ
+
+K™\ÜÜÙYYJNØ\ÜÙ\™\]X[
+œšYÙKœÝ\
+
+Kœ™X\ÛÛ‹	ØœšYÙWÙ]XÚY	ÊNÂŸJNÂ™[˜Ý[Ûˆ›ÛSY™XÞXÛQš^\™J‹Ý\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK™XYÝ\œ™[šY_O^ßJHÂˆÛÛœÝ[™\ÏV×KœšYÙ\ÏV×NÂˆÛÛœÝY™XÞXÛOT‹˜Ü™X]T›ÛT™XÛÝ™\žSY™XÞXÛJÂˆÜ™X]T›ÛQ›ÝÊÜ›ÛKÙ[™\˜][ÛŸJ^ÂˆÛÛœÝ[™O\™XÛÝ™\žQ›ÝÊ‹›ÛK™\]Y\ÝOœ™XYÝ\œ™[šYJÜ›ÛKÙ[™\˜][Û‹™\]Y\ÝJKØXØÛÝ[™YŽ˜	Ü›Û_KIÙÙ[™\˜][ÛŸXšY]Ù\”›ÛNœ›Û_KÚ[š]X[Uš\ÚX›N™ØÝ[Y[Ý]Kš\ÚXš[]TÝ]HOOIÚY[‰ßJNÂˆ[™\Ëœ\Ú
+Ë‹‹˜[™K›ÛKÙ[™\˜][ÛŸJNÜ™]\›ˆ[™K™›ÝÎÂˆKˆÜ™X]Q]™[œšYÙJÙ›ÝË›ÛKÙ[™\˜][Û‹™\]Y\Ý™XÛÝ™\ž_J^ÂˆÛÛœÝœšYÙOT‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]ØÝ[Y[Ý]K™\]Y\Ý™XÛÝ™\ž_JNØœšYÙ\Ëœ\Ú
+ØœšYÙK›ÛKÙ[™\˜][ÛŸJNÜ™]\›ˆœšYÙNÂˆBˆJNÂˆ™]\›ˆÛY™XÞXÛK\™Ù]ØÝ[Y[Ý]K[™\ËœšYÙ\ßNÂŸB™[˜Ý[Ûˆ›ÛQ™YY˜XÚÓY™XÞXÛQš^\™J‹Û›ÝYšXØ][Û”™XYX\Þ[˜Ê
+OOŠÜÝ]\ÎŒÌJKÛ”™X]][XØ]OJ
+OOŠÜ™\]Y\ÝYY_JK›ÝYšXØ][Û”ÝXœØÜšX™O[[O^ßJHÂˆÛÛœÝÝ\\\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K›ÝYšXØ][Û•\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK™YY˜XÚÜÏV×K›ÝYšXØ][ÛœšYÙ\ÏV×K]™[ÏV×NÛ]Y™XÞXÛNÂˆY™XÞXÛOT‹˜Ü™X]T›ÛT™XÛÝ™\žSY™XÞXÛJÂˆÜ™X]T›ÛQ›ÝÊÜ›ÛKÙ[™\˜][ÛŸJ^Ü™]\›ˆ™XÛÝ™\žQ›ÝÊ‹›ÛK\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJKØXØÛÝ[™YŽ˜	Ü›Û_KIÙÙ[™\˜][ÛŸXšY]Ù\”›ÛNœ›Û_JK™›ÝÎßKˆÜ™X]Q]™[œšYÙJÙ›ÝË™\]Y\Ý™XÛÝ™\ž_J^Ü™]\›ˆ‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]œÝ\\\™Ù]ØÝ[Y[Ý]K™\]Y\Ý™XÛÝ™\ž_JNßKˆÜ™X]Q™YY˜XÚÐœšYÙJÜ›ÛKÙ[™\˜][ÛŸJ^ÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê›ÛKÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛK›ÛKÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Žš[O››ÝYšXØ][Û”™XY
+Ü›ÛKÙ[™\˜][Û‹[J_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š›ÛJK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛK™XÛÝ™\žKÛÛ[X[™ZKÛ”™X]][XØ]N˜ÛÛ^O›Û”™X]][XØ]JË‹‹˜ÛÛ^Ù[™\˜][ÛŸJ_JK\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K™[™\œÏV×NÂˆÛÛœÝ[›™\T‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]™[™\ŽšY]ÏOœ™[™\œËœ\Ú
+šY]Ê_JNÂˆÛÛœÝœšYÙO^ÜÛ˜\ÚÝŠ
+OOš[›™\‹œÛ˜\ÚÝ
+
+K]XÚ
+
+^Ù]™[Ëœ\Ú
+]XÚ‰Ü›Û_N‰ÙÙ[™\˜][ÛŸX
+NÜ™]\›ˆ[›™\‹˜]XÚ
+
+NßKXÝ]˜]NŠ
+OOš[›™\‹˜XÝ]˜]J
+K[™S›ÝYšXØ][ÛŽš[Oš[›™\‹š[™S›ÝYšXØ][ÛŠ[
+K]XÚ
+
+^Ù]™[Ëœ\Ú
+]XÚ‰Ü›Û_N‰ÙÙ[™\˜][ÛŸX
+NÜ™]\›ˆ[›™\‹™]XÚ
+
+NßKYNŠ
+OOš[›™\‹šYJ
+_NÂˆ™YY˜XÚÜËœ\Ú
+Ü›ÛKÙ[™\˜][Û‹Ý\œ™[™XÛÝ™\žKÛÛ[X[™ZK›ÝË\™Ù]™[™\œËœšYÙK[›™\ŸJNÜ™]\›ˆœšYÙNÂˆKˆÜ™X]S›ÝYšXØ][ÛœšYÙJÜ›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™ËÛ’[J^ÂˆÛÛœÝ[›™\[›ÝYšXØ][Û”ÝXœØÜšX™OÔ‹˜Ü™X]P\Þ[˜Ó›ÝYšXØ][Û”ÝXœØÜš\[ÛœšYÙJÜÝXœØÜšX™NŠÜÚYÛ˜[Û’[™[]™\ŸJOO››ÝYšXØ][Û”ÝXœØÜšX™JÜ›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™ËÚYÛ˜[Û’[™[]™\ŸJKÛ’[JN”‹˜Ü™X]S›ÝYšXØ][Û’[]™[œšYÙJÙ]™[\™Ù]››ÝYšXØ][Û•\™Ù]Û’[JNÂˆ›ÝYšXØ][ÛœšYÙ\Ëœ\Ú
+Ü›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë[›™\ŸJNÜ™]\›ˆ[›™\ŽÂˆBˆJNÂˆ™]\›ˆÛY™XÞXÛK™YY˜XÚÜË›ÝYšXØ][ÛœšYÙ\Ë]™[ËÝ\\\™Ù]›ÝYšXØ][Û•\™Ù]NÂŸB™[˜Ý[Ûˆ›ÛTÝXœØÜš\[Û“Y™XÞXÛQš^\™J‹Ý™\šYžS]\ÝX\Þ[˜Ê
+OOŠÝ™\šYšYYY_JKÛ”™X]][XØ]OX\Þ[˜Ê
+OOŠÜ™\]Y\ÝYY_J_O^ßJHÂˆÛÛœÝÝ\\\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßKÝXœØÜš\[ÛœÏV×NÛ]Y™XÞXÛNÂˆY™XÞXÛOT‹˜Ü™X]T›ÛT™XÛÝ™\žSY™XÞXÛJÂˆÜ™X]T›ÛQ›ÝÊÜ›ÛKÙ[™\˜][ÛŸJ^Ü™]\›ˆ™XÛÝ™\žQ›ÝÊ‹›ÛK\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJKØXØÛÝ[™YŽ˜	Ü›Û_KIÙÙ[™\˜][ÛŸXšY]Ù\”›ÛNœ›Û_JK™›ÝÎßKˆÜ™X]Q]™[œšYÙJÙ›ÝË™\]Y\Ý™XÛÝ™\ž_J^Ü™]\›ˆ‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]œÝ\\\™Ù]ØÝ[Y[Ý]K™\]Y\Ý™XÛÝ™\ž_JNßKˆÜ™X]TÝXœØÜš\[ÛœšYÙJÜ›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™ßJ^ÂˆÛÛœÝ™XÛÜ™^Ü›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™ËÛÛ›™XÝÎŒ[œÝXœØÜšX™\ÎŒ\ØÛÛ›™XÝ›[™[™\œÎ–×_NÂˆÛÛœÝœšYÙOT‹˜Ü™X]T™XÛÝ™\˜X›S›ÝYšXØ][Û”ÝXœØÜš\[ÛœšYÙJÂˆ›ÛKˆÝXœØÜšX™N˜\Þ[˜È[œ]OžÜ™XÛÜ™˜ÛÛ›™XÝÊÏLNÜ™XÛÜ™™\ØÛÛ›™XÝZ[œ]›Û‘\ØÛÛ›™XÝÜ™]\›Š
+OOžÜ™XÛÜ™[œÝXœØÜšX™\ÊÏLNßNßKˆÛ’[˜\Þ[˜Ê
+OOŠÜ›ØÙ\ÜÙYY_JKˆ™\šYžS]\ÝŠ
+OO™\šYžS]\Ý
+Ü›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë™XÛÜ™JKˆÛ”™X]][XØ]NŠ
+OO›Û”™X]][XØ]JÜ›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë™XÛÜ™JKˆ™[™\Ž˜[YOOœ™XÛÜ™œ™[™\œËœ\Ú
+˜[YJBˆJNÂˆ™XÛÜ™˜œšYÙOXœšYÙNÜÝXœØÜš\[ÛœËœ\Ú
+™XÛÜ™
+NÜ™]\›ˆœšYÙNÂˆBˆJNÂˆ™]\›ˆÛY™XÞXÛKÝXœØÜš\[ÛœËÝ\\\™Ù]NÂŸB™[˜Ý[Ûˆ›ÛTÝXœØÜš\[Û‘™YY˜XÚÓY™XÞXÛQš^\™J‹ÜÝXœØÜšX™K™\šYžS]\ÝX\Þ[˜Ê
+OOŠÝ™\šYšYYY_JKÛ”™X]][XØ]OX\Þ[˜Ê
+OOŠÜ™\]Y\ÝYY_J_O^ßJHÂˆÛÛœÝÝ\\\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßKÝXœØÜš\[ÛœÏV×NÛ]Y™XÞXÛNÂˆY™XÞXÛOT‹˜Ü™X]T›ÛT™XÛÝ™\žSY™XÞXÛJÂˆÜ™X]T›ÛQ›ÝÊÜ›ÛKÙ[™\˜][ÛŸJ^Ü™]\›ˆ™XÛÝ™\žQ›ÝÊ‹›ÛK\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJKØXØÛÝ[™YŽ˜	Ü›Û_KIÙÙ[™\˜][ÛŸXšY]Ù\”›ÛNœ›Û_JK™›ÝÎßKˆÜ™X]Q]™[œšYÙJÙ›ÝË™\]Y\Ý™XÛÝ™\ž_J^Ü™]\›ˆ‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]œÝ\\\™Ù]ØÝ[Y[Ý]K™\]Y\Ý™XÛÝ™\ž_JNßKˆÜ™X]TÝXœØÜš\[ÛœšYÙJÜ›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™ßJ^ÂˆÛÛœÝ\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š›ÛJK™XÛÜ™^Ü›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë\™Ù]ÛÛ[X[™ZK™[™\œÎ–×KÛÛ›™XÝÎŒ[œÝXœØÜšX™\ÎŒ\ØÛÛ›™XÝ›[NÂˆÛÛœÝœšYÙOT‹˜Ü™X]S›ÝYšXØ][Û”ÝXœØÜš\[Û‘™YY˜XÚÐœšYÙJÂˆ›ÛKÙ[™\˜][Û‹Y™XÞXÛKÛÛ[X[™ZK]™[\™Ù]\™Ù]ˆÝXœØÜšX™N˜\Þ[˜È[œ]OžÜ™XÛÜ™˜ÛÛ›™XÝÊÏLNÜ™XÛÜ™™\ØÛÛ›™XÝZ[œ]›Û‘\ØÛÛ›™XÝÚYŠÝXœØÜšX™J\™]\›ˆÝXœØÜšX™JË‹‹š[œ]›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë™XÛÜ™JNÜ™]\›Š
+OOžÜ™XÛÜ™[œÝXœØÜšX™\ÊÏLNßNßKˆÛ’[˜\Þ[˜Ê
+OOŠÜ›ØÙ\ÜÙYY_JK™\šYžS]\ÝŠ
+OO™\šYžS]\Ý
+Ü›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë™XÛÜ™JKÛ”™X]][XØ]NŠ
+OO›Û”™X]][XØ]JÜ›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë™XÛÜ™JK™[™\ŽšY]ÏOœ™XÛÜ™œ™[™\œËœ\Ú
+šY]ÊBˆJNÂˆ™XÛÜ™˜œšYÙOXœšYÙNÜÝXœØÜš\[ÛœËœ\Ú
+™XÛÜ™
+NÜ™]\›ˆœšYÙNÂˆBˆJNÂˆ™]\›ˆÛY™XÞXÛKÝXœØÜš\[ÛœËÝ\\\™Ù]NÂŸB™[˜Ý[Ûˆ›ÛTÝXœØÜš\[Û‘ÛSY™XÞXÛQš^\™J‹ÜÝXœØÜšX™K™\šYžS]\ÝX\Þ[˜Ê
+OOŠÝ™\šYšYYY_JKÛ”™X]][XØ]OX\Þ[˜Ê
+OOŠÜ™\]Y\ÝYY_J_O^ßJHÂˆÛÛœÝÝ\\\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KØÝ[Y[Ý]O^Ýš\ÚXš[]TÝ]N‰Ýš\ÚX›IßKÝXœØÜš\[ÛœÏV×NÛ]Y™XÞXÛNÂˆY™XÞXÛOT‹˜Ü™X]T›ÛT™XÛÝ™\žSY™XÞXÛJÂˆÜ™X]T›ÛQ›ÝÊÜ›ÛKÙ[™\˜][ÛŸJ^Ü™]\›ˆ™XÛÝ™\žQ›ÝÊ‹›ÛK\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJKØXØÛÝ[™YŽ˜	Ü›Û_KIÙÙ[™\˜][ÛŸXšY]Ù\”›ÛNœ›Û_JK™›ÝÎßKˆÜ™X]Q]™[œšYÙJÙ›ÝË™\]Y\Ý™XÛÝ™\ž_J^Ü™]\›ˆ‹˜Ü™X]TÝ\\™XÛÝ™\žQ]™[œšYÙJÙ›ÝË]™[\™Ù]œÝ\\\™Ù]ØÝ[Y[Ý]K™\]Y\Ý™XÛÝ™\ž_JNßKˆÜ™X]TÝXœØÜš\[ÛœšYÙJÜ›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™ßJ^ÂˆÛÛœÝ[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K™XÛÜ™^Ü›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë[[Y[ËÛÛ›™XÝÎŒ\ØÛÛ›™XÝ›[™[™\œÎ–×_NÂˆÛÛœÝœšYÙOT‹˜Ü™X]S›ÝYšXØ][Û”ÝXœØÜš\[Û‘ÛPœšYÙJÜ›ÛKÙ[™\˜][Û‹Y™XÞXÛK[[Y[ËˆÝXœØÜšX™N˜\Þ[˜È[œ]OžÜ™XÛÜ™˜ÛÛ›™XÝÊÏLNÜ™XÛÜ™™\ØÛÛ›™XÝZ[œ]›Û‘\ØÛÛ›™XÝÚYŠÝXœØÜšX™J\™]\›ˆÝXœØÜšX™JË‹‹š[œ]›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë™XÛÜ™JNÜ™]\›Š
+OOžßNßKˆÛ’[˜\Þ[˜Ê
+OOŠÜ›ØÙ\ÜÙYY_JK™\šYžS]\ÝŠ
+OO™\šYžS]\Ý
+Ü›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë™XÛÜ™JKÛ”™X]][XØ]NŠ
+OO›Û”™X]][XØ]JÜ›ÛKÙ[™\˜][Û‹Ù\ÜÚ[Ûš[™[™Ë™XÛÜ™JK™[™\ŽšY]ÏOœ™XÛÜ™œ™[™\œËœ\Ú
+šY]ÊBˆJNÂˆ™XÛÜ™˜œšYÙOXœšYÙNÜÝXœØÜš\[ÛœËœ\Ú
+™XÛÜ™
+NÜ™]\›ˆœšYÙNÂˆBˆJNÂˆ™]\›ˆÛY™XÞXÛKÝXœØÜš\[ÛœËÝ\\\™Ù]NÂŸB™[˜Ý[Ûˆ[ÝÙY›ÛTÙ\šXÙ\ÊÝ™\œšY\Ï^ßJHÂˆ™]\›ˆÂˆÛÛ™šYÝ\™YYKˆÙ\ÜÚ[Û‘›Ü”›ÛN›Ý™\œšY\ËœÙ\ÜÚ[Û‘›Ü”›Û_
+
+
+OOŠØXØÛÝ[™YŽ‰Ù[[ËXXØÛÝ[	ËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰ßJJKˆ™XYÝ\œ™[šYN›Ý™\œšY\Ëœ™XYÝ\œ™[šY_
+\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJJKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ›Ý™\œšY\ËœÝXœØÜšX™S›ÝYšXØ][Ûœß
+\Þ[˜Ê
+OOŠ
+OOžßJKˆ™\šYžS]\Ý›Ý™\œšY\Ë™\šYžS]\Ý
+\Þ[˜Ê
+OOŠÝ™\šYšYYY_JJKˆ[™S›ÝYšXØ][Û’[›Ý™\œšY\Ëš[™S›ÝYšXØ][Û’[
+\Þ[˜Ê
+OOŠÜ›ØÙ\ÜÙYY_JJKˆ™X]][XØ]N›Ý™\œšY\Ëœ™X]][XØ]_
+\Þ[˜Ê
+OOŠÜ™\]Y\ÝYY_JJBˆNÂŸB\Ý
+	Ü›ÛHØÜ™Y[ˆ[žHÜ™X]\ÈÛ™H›ÝÈ[™œšYÙHÚ]Ý]\XØ]HÝ\\™XYÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNß_JNÂˆÛÛœÝ[\™YX]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØ\ÜÙ\™\]X[
+[\™Y™[\™YYJNØ\ÜÙ\™\]X[
+™XYËJNÂˆÛÛœÝ\XØ]OX]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	Ø[™XYWÙ[\™Y	ÊNØ\ÜÙ\™\]X[
+™XYËJNÂˆ\ÜÙ\™\]X[
+š^\™K˜[™\Ë›[™ÝJNØ\ÜÙ\™\]X[
+š^\™K˜œšYÙ\Ë›[™ÝJNÂˆ›ÜŠÛÛœÝ\HÙˆÉÝš\ÚXš[]XÚ[™ÙIË	ÜYÙ\ÚÝÉË	ÛÛ›[™I×JX\ÜÙ\™\]X[
+š^\™K\™Ù]›\Ý[™\ÛÝ[
+\JKJNÂŸJNÂ\Ý
+	ÜÝÚ]Ú[™È›ÛHØÜ™Y[œÈ\ÜÜÙ\ÈHÛ[žH™Y›Ü™HXØÙ\[™ÈH™]È›ÛIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™[X\ÙT\ÜÙ[™Ù\ŽÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠÜ›Û_JOOœ›ÛOOOIÜ\ÜÙ[™Ù\‰ÏÛ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙT\ÜÙ[™Ù\\™\ÛÛ™NßJN”›ÛZ\ÙKœ™\ÛÛ™JÜÝ]\ÎŒŒJ_JNÂˆÛÛœÝ\ÜÙ[™Ù\Yš^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆÛÛœÝš]™\X]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+š]™\‹™[\™YYJNÂˆ™[X\ÙT\ÜÙ[™Ù\ŠÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNØÛÛœÝÛX]ØZ]\ÜÙ[™Ù\ŽÂˆ\ÜÙ\™\]X[
+Ûœ™X\ÛÛ‹	ÜÝ[WÙ[žIÊNØ\ÜÙ\™\]X[
+š^\™K˜[™\ÖÌK™›ÝËœÛ˜\ÚÝ
+
+K™\ÜÜÙYYJNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\Ë×JNÂˆ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌWKœYÙ\ËÉÙš]™\‹ZÛYI×JNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNÂˆ›ÜŠÛÛœÝ\HÙˆÉÝš\ÚXš[]XÚ[™ÙIË	ÜYÙ\ÚÝÉË	ÛÛ›[™I×JX\ÜÙ\™\]X[
+š^\™K\™Ù]›\Ý[™\ÛÝ[
+\JKJNÂŸJNÂ\Ý
+	ÛX]š[™ÈH›ÛHØÜ™Y[ˆ™[[Ý™\È]™\žH\Ý[™\ˆ[™YÛ›Ü™\È]\ˆ]™[ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNß_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ùš]™\‰ÊNØÛÛœÝYYš^\™K›Y™XÞXÛK›X]™J
+NØ\ÜÙ\™\]X[
+Y›YYJNØ\ÜÙ\™\]X[
+Yœ›ÛK	Ùš]™\‰ÊNÂˆ›ÜŠÛÛœÝ\HÙˆÉÝš\ÚXš[]XÚ[™ÙIË	ÜYÙ\ÚÝÉË	ÛÛ›[™I×JX\ÜÙ\™\]X[
+š^\™K\™Ù]›\Ý[™\ÛÝ[
+\JK
+NÂˆš^\™K\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNÙš^\™K\™Ù]™\Ü]Ú
+	ÜYÙ\ÚÝÉÊNØ]ØZ]š^\™K›Y™XÞXÛKšYJ
+NØ\ÜÙ\™\]X[
+™XYËJNÂˆ\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\Êš^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+JKœÛÜ
+
+KÉØXÝ]™T›ÛIË	Ø\ÞIË	Ù[\™Y	Ë	ÙÙ[™\˜][Û‰Ë	Û\ÝXÝ[Û‰×JNÂŸJNÂ\Ý
+	Ü™KY[\š[™ÈHØ[YH›ÛHY\ˆX]š[™ÈÜ™X]\ÈHœ™\Ú\ÛÛ]YÙ[™\˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNß_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝš\œÝYš^\™K˜[™\ÖÌNÙš^\™K›Y™XÞXÛK›X]™J
+NÂˆÛÛœÝÙXÛÛ™[žOX]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝÙXÛÛ™Yš^\™K˜[™\ÖÌWNÂˆ\ÜÙ\™\]X[
+ÙXÛÛ™[žK™[\™YYJNØ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\››Ý\]X[
+š\œÝ™›ÝËÙXÛÛ™™›ÝÊNØ\ÜÙ\™\]X[
+š\œÝ™›ÝËœÛ˜\ÚÝ
+
+K™\ÜÜÙYYJNÂˆ\ÜÙ\™\]X[
+š\œÝ™Ù[™\˜][ÛŠÌKÙXÛÛ™™Ù[™\˜][ÛŠNØ\ÜÙ\™\]X[
+š^\™K\™Ù]›\Ý[™\ÛÝ[
+	ÛÛ›[™IÊKJNÂŸJNÂ\Ý
+	Ù[\š[™ÈHY[ˆ›ÛHØÜ™Y[ˆØZ]È›ÜˆYÙ\ÚÝÈ™Y›Ü™H]Èš\œÝ\ØÛÝ™\žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹ÙØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰ÚY[‰ßK™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNß_JNÂˆÛÛœÝ[\™YX]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+[\™YœÝ\\œ™X\ÛÛ‹	ÜØÜ™Y[—ÚY[‰ÊNØ\ÜÙ\™\]X[
+™XYË
+NÂˆš^\™K™ØÝ[Y[Ý]Kš\ÚXš[]TÝ]OIÝš\ÚX›IÎÙš^\™K\™Ù]™\Ü]Ú
+	ÜYÙ\ÚÝÉÊNØ]ØZ]š^\™K›Y™XÞXÛKšYJ
+NÂˆ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\ËÉÙš]™\‹ZÛYI×JNÂŸJNÂ\Ý
+	ØH[^YYÛ›[™H™\Ý[œ›ÛHH\\Y[žHØ[››ÝY™™XÝH™KY[\™Y›ÛIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]\ÙOL™[X\ÙSÛÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠÙÙ[™\˜][ÛŸJOOžÂˆYŠÙ[™\˜][ÛOOLJ^Ü\ÙJÏLNÚYŠ\ÙOOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙSÛ\™\ÛÛ™NßJNßBˆ™]\›ˆ›ÛZ\ÙKœ™\ÛÛ™JÜÝ]\ÎŒŒJNÂˆ_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNÙš^\™K\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆš^\™K›Y™XÞXÛK›X]™J
+NØÛÛœÝ™Y[\™YX]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØ\ÜÙ\™\]X[
+™Y[\™Y™[\™YYJNÂˆ™[X\ÙSÛ
+ÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNØ]ØZ]š^\™K˜œšYÙ\ÖÌK˜œšYÙKšYJ
+NÂˆ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\Ë×JNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌWKœYÙ\ËÉÚÛYI×JNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹ŠNÂŸJNÂ\Ý
+	Ü\ÜÙ[™Ù\ˆ›ÝÛH˜]šYØ][Ûˆ[™™YÚ\Ý˜][ÛˆÙY\Û™H™XÛÝ™\žHÙ[™\˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊJKœ™X\ÛÛ‹	Ü›ÛWÙ[\™Y	ÊNÂˆ›ÜŠÛÛœÝYÙHÙˆÉÛÙ™™\œÉË	Ý™\šYžIË	Ü\ÜÙ[™Ù\‹Z\ÝÜžIË	Ü\ÜÙ[™Ù\‹XXØÛÝ[	Ë	Ü\ÜÙ[™Ù\‹\™YÚ\Ý\‰×JX\ÜÙ\™\]X[
+
+]ØZ]›Ý[™\žK›˜]šYØ]JYÙK	Ü\ÜÙ[™Ù\‰ÊJKœ™X\ÛÛ‹	ÝÚ][—Ü›ÛIÊNÂˆ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™\]X[
+š^\™K˜[™\Ë›[™ÝJNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹JNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ü\ÜÙ[™Ù\‹\™YÚ\Ý\‰ÊNÂŸJNÂ\Ý
+	Ùš]™\ˆ›ÝÛH˜]šYØ][Ûˆ[™[™[™È™YÚ\Ý˜][ÛˆÙY\Û™H™XÛÝ™\žHÙ[™\˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆ›ÜŠÛÛœÝYÙHÙˆÉÙš]™\‹\™\]Y\ÝÉË	Ùš]™\‹]š\ÉË	Ùš]™\‹XXØÛÝ[	Ë	Ü™YÚ\Ý\‰Ë	Ùš]™\‹ZÛYI×JX]ØZ]›Ý[™\žK›˜]šYØ]JYÙK	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™\]X[
+š^\™K˜[™\Ë›[™ÝJNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹JNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÂŸJNÂ\Ý
+	Ü™]\›š[™ÈÈH›ÛHÚÛÜÙ\ˆ]XÚ\È™XÛÝ™\žH[™›ØÚÜÈH[^YYYÙH™\ÝÜ˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠ
+OO›™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆÛÛœÝ[\š[™ÏX›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆÛÛœÝÚÛÜÙ\X]ØZ]›Ý[™\žK›˜]šYØ]J	Ü›ÛIÊNØ\ÜÙ\™\]X[
+ÚÛÜÙ\‹œ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ü›ÛIÊNÂˆ›ÜŠÛÛœÝ\HÙˆÉÝš\ÚXš[]XÚ[™ÙIË	ÜYÙ\ÚÝÉË	ÛÛ›[™I×JX\ÜÙ\™\]X[
+š^\™K\™Ù]›\Ý[™\ÛÝ[
+\JK
+NÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰Ê_JNØ\ÜÙ\™\]X[
+
+]ØZ][\š[™ÊKœ™X\ÛÛ‹	ÜÝ[WÛ˜]šYØ][Û‰ÊNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ü›ÛIÊNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\Ë×JNÂŸJNÂ\Ý
+	Ü›Ý][™Èœ›ÛH\ÜÙ[™Ù\ˆÈš]™\ˆÜ™X]\ÈH™]ÈÙ[™\˜][ÛˆY\ˆ]XÚ[™È\ÜÙ[™Ù\‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝ\ÜÙ[™Ù\Yš^\™K˜[™\ÖÌNÂˆÛÛœÝš]™\X]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+š]™\‹œ™X\ÛÛ‹	Ü›ÛWÙ[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™\]X[
+\ÜÙ[™Ù\‹™›ÝËœÛ˜\ÚÝ
+
+K™\ÜÜÙYYJNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹ŠNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÂˆ›ÜŠÛÛœÝ\HÙˆÉÝš\ÚXš[]XÚ[™ÙIË	ÜYÙ\ÚÝÉË	ÛÛ›[™I×JX\ÜÙ\™\]X[
+š^\™K\™Ù]›\Ý[™\ÛÝ[
+\JKJNÂŸJNÂ\Ý
+	Ü˜\YØ[YK\›ÛH›Ý]HÚ[™Ù\È\š[™ÈÝ\\ÙY\H\ÝYÙHÚ]Ý][›Ý\ˆ™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠ
+OOžÜ™XYÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆÛÛœÝÛYOX›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆÛÛœÝ\ÝÜžOX]ØZ]›Ý[™\žK›˜]šYØ]J	Ü\ÜÙ[™Ù\‹Z\ÝÜžIË	Ü\ÜÙ[™Ù\‰ÊNØ\ÜÙ\™\]X[
+\ÝÜžKœ™X\ÛÛ‹	ÝÚ][—Ü›ÛIÊNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ü\ÜÙ[™Ù\‹Z\ÝÜžIÊNØ\ÜÙ\™\]X[
+™XYËJNÂˆ™[X\ÙJÜÝ]\ÎŒŒJNØ\ÜÙ\™\]X[
+
+]ØZ]ÛYJKœ™X\ÛÛ‹	ÜÝ[WÛ˜]šYØ][Û‰ÊNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ü\ÜÙ[™Ù\‹Z\ÝÜžIÊNØ\ÜÙ\™\]X[
+™XYËJNÂŸJNÂ\Ý
+	Ý[šÛ›ÝÛˆYÙ\È[™Ü›ÜÜË\›ÛH›Ý]H[È˜Z[Ú]Ý]Ú[™Ú[™ÈHXÝ]™H›ÛIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝÙ[™\˜][ÛYš^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][ÛŽÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý[™\žK›˜]šYØ]J	ØYZ[‰Ë	Ü\ÜÙ[™Ù\‰ÊJKœ™X\ÛÛ‹	Ý[šÛ›ÝÛ—ÜYÙIÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹]š\ÉË	Ü\ÜÙ[™Ù\‰ÊJKœ™X\ÛÛ‹	Ü›ÛWÛZ\ÛX]Ú	ÊNÂˆ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ü\ÜÙ[™Ù\‰ÊNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹Ù[™\˜][ÛŠNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	ÚÛYIÊNÂŸJNÂ\Ý
+	Û]\Ý\Ý]HXÝ[Ûˆ\È[Z]YÈÛ™H™\]Y\Ý[ˆHXÝ]™H\ÜÙ[™Ù\ˆÙ[™\˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠ
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝÙ[™\˜][ÛYš^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][ÛŽÂˆÛÛœÝš\œÝX›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ\ÜÙ\™\]X[
+™XYËŠNÂˆÛÛœÝ\XØ]OX]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNØ\ÜÙ\™\]X[
+\XØ]Kœ™XÛÝ™\™Y˜[ÙJNØ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	Ü™XÛÝ™\žWÚ[—Ü›ÙÜ™\ÜÉÊNØ\ÜÙ\™\]X[
+™XYËŠNÂˆ™[X\ÙJÜÝ]\ÎŒŒJNØÛÛœÝ™XÛÝ™\™YX]ØZ]š\œÝÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ™XÛÝ™\™YYJNØ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ™X\ÛÛ‹	Ü™XÛÝ™\™Y	ÊNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹Ù[™\˜][ÛŠNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\ËÉÚÛYI×JNÂŸJNÂ\Ý
+	Ü™X]][XØ][ÛˆXÝ[Ûˆ™\™XYÈÛ˜ÙH[œÚYHHXÝ]™Hš]™\ˆÙ[™\˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆ™XYÏOOLOÞÜÝ]\Î_NžÜÝ]\ÎŒŒNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNØÛÛœÝÙ[™\˜][ÛYš^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][ÛŽÂˆÛÛœÝ™XÛÝ™\™YX]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™X]]	ÊNÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ™XÛÝ™\™YYJNØ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹Ù[™\˜][ÛŠNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\ËÉÙš]™\‹ZÛYI×JNÂŸJNÂ\Ý
+	Ü™XÛÝ™\žHXÝ[ÛœÈÚ]Ý][ˆXÝ]™H›ÛHÜˆÚ][ˆ[šÛ›ÝÛˆXÝ[ÛˆÙ[™›È™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊJKœ™X\ÛÛ‹	Û›×ØXÝ]™WÜ›ÛIÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™]žKY]™\ž][™ÉÊJKœ™X\ÛÛ‹	Ú[˜[YÜ™XÛÝ™\žWØXÝ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+™XYË
+NØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹
+NØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ü›ÛIÊNÂŸJNÂ\Ý
+	ÛX]š[™È›Üˆ›ÛHÙ[XÝ[ÛˆXZÙ\È[ˆ[‹Y›YÚ]\Ý\Ý]H™\Ý[Ý[IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠ
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝ™XÛÝ™\žOX›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	Ü›ÛIÊNÜ™[X\ÙJÜÝ]\ÎŒŒJNØÛÛœÝÝ[OX]ØZ]™XÛÝ™\žNÂˆ\ÜÙ\™\]X[
+Ý[Kœ™XÛÝ™\™Y˜[ÙJNØ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÜ™XÛÝ™\žIÊNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ü›ÛIÊNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK[
+NØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\Ë×JNÂŸJNÂ\Ý
+	Ü›ÛHÝÚ]Ú\›Z]ÈHœ™\ÚXÝ[ÛˆÚ[HH\\Y›ÛHXÝ[Ûˆ\ÈÝ[[™[™ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NØÛÛœÝ™XYÏ^Ü\ÜÙ[™Ù\ŽŒš]™\ŽŒNÛ]™[X\ÙT\ÜÙ[™Ù\ŽÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠÜ›Û_JOOžÂˆ™XYÖÜ›ÛWJÏLNÂˆYŠ›ÛOOOIÜ\ÜÙ[™Ù\‰É‰œ™XYËœ\ÜÙ[™Ù\OOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÂˆYŠ›ÛOOOIÜ\ÜÙ[™Ù\‰Ê\™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙT\ÜÙ[™Ù\\™\ÛÛ™NßJNÂˆYŠ™XYË™š]™\OOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÂˆ™]\›ˆ›ÛZ\ÙKœ™\ÛÛ™JÜÝ]\ÎŒŒJNÂˆ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝÛXÝ[ÛX›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNØÛÛœÝœ™\ÚX]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNÂˆ\ÜÙ\™\]X[
+œ™\Úœ™XÛÝ™\™YYJNØ\ÜÙ\™Y\\]X[
+™XYËÜ\ÜÙ[™Ù\ŽŒ‹š]™\ŽŒŸJNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌWKœYÙ\ËÉÙš]™\‹ZÛYI×JNÂˆ™[X\ÙT\ÜÙ[™Ù\ŠÜÝ]\ÎŒŒJNØÛÛœÝÝ[OX]ØZ]ÛXÝ[ÛŽÂˆ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÜ™XÛÝ™\žIÊNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\Ë×JNÂŸJNÂ\Ý
+	ÛY™XÞXÛH™Z™XÝÈHÝ[H›ÛHÜˆÙ[™\˜][Ûˆ™Y›Ü™HÝ\[™È™XÛÝ™\žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÝ›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNß_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝÙ[™\˜][ÛYš^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][ÛŽÂˆ\ÜÙ\™\]X[
+
+]ØZ]š^\™K›Y™XÞXÛKœ™\]Y\Ý™XÛÝ™\žJÜ›ÛN‰Ùš]™\‰ËÙ[™\˜][Û‹™X\ÛÛŽ‰ØÛÛ›™XÝ]š]IßJJKœ™X\ÛÛ‹	ÜÝ[WÜ›ÛWÙÙ[™\˜][Û‰ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]š^\™K›Y™XÞXÛKœ™\]Y\Ý™XÛÝ™\žJÜ›ÛN‰Ü\ÜÙ[™Ù\‰ËÙ[™\˜][ÛŽ™Ù[™\˜][Û‹LK™X\ÛÛŽ‰ØÛÛ›™XÝ]š]IßJJKœ™X\ÛÛ‹	ÜÝ[WÜ›ÛWÙÙ[™\˜][Û‰ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]š^\™K›Y™XÞXÛKœ™\]Y\Ý™XÛÝ™\žJÜ›ÛN‰Ü\ÜÙ[™Ù\‰ËÙ[™\˜][Û‹™X\ÛÛŽ‰Ù›Ü˜ÙIßJJKœ™X\ÛÛ‹	Ú[˜[YÜ™XÛÝ™\žWÜ™X\ÛÛ‰ÊNÂˆ\ÜÙ\™\]X[
+™XYËJNÂŸJNÂ\Ý
+	ÛX[X[]\Ý\Ý]H™XÛÝ™\žHÚ[œÈÝ™\ˆHÚ[][[™[Ý\ÈÛ›[™H]™[Ú]Û™H™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠ
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝX[X[X›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆš^\™K\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]š^\™K˜œšYÙ\ÖÌK˜œšYÙKšYJ
+NØ\ÜÙ\™\]X[
+™XYËŠNÂˆ™[X\ÙJÜÝ]\ÎŒŒJNØÛÛœÝ™XÛÝ™\™YX]ØZ]X[X[Âˆ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ™XÛÝ™\™YYJNØ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\ËÉÚÛYI×JNÂŸJNÂ\Ý
+	ÛÛ›[™H™XÛÝ™\žHÚ[œÈÝ™\ˆHÚ[][[™[Ý\ÈX[X[\Ú]Û™H™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠ
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÙš^\™K\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ\ÜÙ\™\]X[
+™XYËŠNÂˆÛÛœÝX[X[X]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNØ\ÜÙ\™\]X[
+X[X[œ™XÛÝ™\™Y˜[ÙJNØ\ÜÙ\™\]X[
+X[X[œ™X\ÛÛ‹	Ü™XÛÝ™\žWÚ[—Ü›ÙÜ™\ÜÉÊNØ\ÜÙ\™\]X[
+™XYËŠNÂˆ™[X\ÙJÜÝ]\ÎŒŒJNØ]ØZ]š^\™K˜œšYÙ\ÖÌK˜œšYÙKšYJ
+NØ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\ËÉÚÛYI×JNÂŸJNÂ\Ý
+	ÚY[™È\š[™È[šYšYYÛ›[™H™XÛÝ™\žHY™\œÈÛ™H™\Ý[[™›ØÚÜÈHX[X[\XØ]IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠ
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÙš^\™K\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆš^\™K™ØÝ[Y[Ý]Kš\ÚXš[]TÝ]OIÚY[‰ÎÙš^\™K\™Ù]™\Ü]Ú
+	Ýš\ÚXš[]XÚ[™ÙIÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊJKœ™X\ÛÛ‹	Ü™XÛÝ™\žWÚ[—Ü›ÙÜ™\ÜÉÊNØ\ÜÙ\™\]X[
+™XYËŠNÂˆ™[X\ÙJÜÝ]\ÎŒŒJNØ]ØZ]š^\™K˜œšYÙ\ÖÌK˜œšYÙKšYJ
+NØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\Ë×JNØ\ÜÙ\™\]X[
+š^\™K˜[™\ÖÌK™›ÝËœÛ˜\ÚÝ
+
+K™Y™\œ™Y™\Ý[YJNÂˆš^\™K™ØÝ[Y[Ý]Kš\ÚXš[]TÝ]OIÝš\ÚX›IÎÙš^\™K\™Ù]™\Ü]Ú
+	ÜYÙ\ÚÝÉÊNØ]ØZ]š^\™K˜œšYÙ\ÖÌK˜œšYÙKšYJ
+NØ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\ËÉÙš]™\‹ZÛYI×JNÂŸJNÂ\Ý
+	ÛÛ›[™H™]™\ˆÛÛœÝ[Y\ÈH^XÚ]™X]][XØ][ÛˆXÝ[Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆ™XYÏOOLOÞÜÝ]\Î_NžÜÝ]\ÎŒŒNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÙš^\™K\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]š^\™K˜œšYÙ\ÖÌK˜œšYÙKšYJ
+NØ\ÜÙ\™\]X[
+™XYËJNÂˆÛÛœÝ™X]][XØ]YX]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™X]]	ÊNØ\ÜÙ\™\]X[
+™X]][XØ]Yœ™XÛÝ™\™YYJNØ\ÜÙ\™\]X[
+™XYËŠNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\ËÉÙš]™\‹ZÛYI×JNÂŸJNÂ\Ý
+	ÜÝÚ]Ú[™È›Û\È\š[™ÈÛ›[™H™XÛÝ™\žH[ÝÜÈÛ™H[™\[™[XÝ[Ûˆ[ˆH™]È›ÛIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NØÛÛœÝ™XYÏ^Ü\ÜÙ[™Ù\ŽŒš]™\ŽŒNÛ]™[X\ÙT\ÜÙ[™Ù\ŽÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠÜ›Û_JOOžÂˆ™XYÖÜ›ÛWJÏLNÂˆYŠ›ÛOOOIÜ\ÜÙ[™Ù\‰É‰œ™XYËœ\ÜÙ[™Ù\OOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÂˆYŠ›ÛOOOIÜ\ÜÙ[™Ù\‰Ê\™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙT\ÜÙ[™Ù\\™\ÛÛ™NßJNÂˆYŠ™XYË™š]™\OOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÂˆ™]\›ˆ›ÛZ\ÙKœ™\ÛÛ™JÜÝ]\ÎŒŒJNÂˆ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÙš^\™K\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNØÛÛœÝœ™\ÚX]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNÂˆ\ÜÙ\™\]X[
+œ™\Úœ™XÛÝ™\™YYJNØ\ÜÙ\™Y\\]X[
+™XYËÜ\ÜÙ[™Ù\ŽŒ‹š]™\ŽŒŸJNØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌWKœYÙ\ËÉÙš]™\‹ZÛYI×JNÂˆ™[X\ÙT\ÜÙ[™Ù\ŠÜÝ]\ÎŒŒJNØ]ØZ]š^\™K˜œšYÙ\ÖÌK˜œšYÙKšYJ
+NØ\ÜÙ\™Y\\]X[
+š^\™K˜[™\ÖÌKœYÙ\Ë×JNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÂŸJNÂ\Ý
+	ØHZ[š[X[›ÝYšXØ][Ûˆ[\Y\ÈÛ›H[ˆ]]Üš^™Y›ÛK\ØÛÜY™XÛÝ™\žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™XÙZ]™YÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	Ë™^XÝ[ÛŽ‰Ý˜XÚ×Ùš]™\‰ßJNÂˆÛÛœÝ›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜È[OžØØ[ÊÏLNÜ™XÙZ]™YZ[Ü™]\›ˆÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽKÝ]\Î‰ÛÛ—Ýš\	Ë™^XÝ[ÛŽ‰ÜÚÝ×ÛÛ—Ýš\	ßJ_Nß_JNÂˆÛÛœÝ™\Ý[X]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNÂˆ\ÜÙ\™\]X[
+™\Ý[œ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ü™XÛÝ™\™Y	ÊNØ\ÜÙ\™\]X[
+Ø[ËJNØ\ÜÙ\™\]X[
+™XÙZ]™Y\K	ÜšYK˜Ú[™ÙY	ÊNØ\ÜÙ\™\]X[
+™XÙZ]™YœšYRYÝ\œ™[šY
+NØ\ÜÙ\™\]X[
+™XÙZ]™Yœ™]š\Ú[Û‹JNÂˆÛÛœÝÛ˜\ÚÝ[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+Û˜\ÚÝœ›ÛK	Ü\ÜÙ[™Ù\‰ÊNØ\ÜÙ\™\]X[
+Û˜\ÚÝš\ÔšYKYJNØ\ÜÙ\™\]X[
+Û˜\ÚÝœ™]š\Ú[Û‹JNØ\ÜÙ\™\]X[
+Û˜\ÚÝœÝ]\Ë	ÛÛ—Ýš\	ÊNØ\ÜÙ\™\]X[
+Û˜\ÚÝ˜\ÞK˜[ÙJNØ\ÜÙ\™\]X[
+Û˜\ÚÝ›\Ý™X\ÛÛ‹	Û›ÝYšXØ][Û—Ü™XÛÝ™\™Y	ÊNÂŸJNÂ\Ý
+	Üš]˜]K›Ü™ZYÛˆ[™Ý[H›ÝYšXØ][Ûˆ[ÈÝÜ™Y›Ü™H]]Üš^™Y™XÛÝ™\žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	Ë™^XÝ[ÛŽ‰ÜÝ\ÜXÚÝ\	ßJNÂˆÛÛœÝ›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆÜÝ]\ÎLNß_JNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽK]N‰ÑSSÈIßJJKœ™X\ÛÛ‹	Ú[˜[YÚ[	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ù›Ü™ZYÛ‰Ë™]š\Ú[ÛŽŽ_JJKœ™X\ÛÛ‹	Ù›Ü™ZYÛ—Ú[	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽJJKœ™X\ÛÛ‹	ÜÝ[WÛÜ—Ù\XØ]WÚ[	ÊNÂˆ\ÜÙ\™\]X[
+Ø[Ë
+NØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ™]š\Ú[Û‹
+NÂŸJNÂ\Ý
+	Û›ÝYšXØ][Û‹Yš\œÝ™XÛÝ™\žH™Z™XÝÈHÚ[][[™[Ý\ÈX[X[™Yœ™\ÚÚ]Ý][›Ý\ˆ™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]›ÝYšXØ][ÛØ[ÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJNÂˆÛÛœÝ›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\ŽŠ
+OOžÛ›ÝYšXØ][ÛØ[ÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JNÂˆÛÛœÝ[™[™Ï[›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆÛÛœÝX[X[X]ØZ]›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNØ\ÜÙ\™\]X[
+X[X[œ™X\ÛÛ‹	Ü™XÛÝ™\žWÚ[—Ü›ÙÜ™\ÜÉÊNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛØ[ËJNÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽKÝ]\Î‰ÛÛ—Ýš\	ßJ_JNØ\ÜÙ\™\]X[
+
+]ØZ][™[™ÊKœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛØ[ËJNÂŸJNÂ\Ý
+	ÛX[X[Yš\œÝ™XÛÝ™\žH™Z™XÝÈH›ÝYšXØ][ÛˆÚ]Ý]Ø[[™È]È™XY\‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏL™[X\ÙSX[X[›ÝYšXØ][ÛØ[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYNŠ
+OOžÜ™XYÊÏLNÚYŠ™XYÏOOLJ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙSX[X[\™\ÛÛ™NßJNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžÛ›ÝYšXØ][ÛØ[ÊÏLNÜ™]\›ˆÜÝ]\ÎLNß_JNÂˆÛÛœÝX[X[X›Ý[™\žKœ™XÛÝ™\Š	Ü™Yœ™\Ú	ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆÛÛœÝ›ÝYšXØ][ÛX]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ\ÜÙ\™\]X[
+›ÝYšXØ][Û‹œ™X\ÛÛ‹	Ü™XÛÝ™\žWÚ[—Ü›ÙÜ™\ÜÉÊNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛØ[Ë
+NØ\ÜÙ\™\]X[
+™XYËŠNÂˆ™[X\ÙSX[X[
+ÜÝ]\ÎŒŒJNØ\ÜÙ\™\]X[
+
+]ØZ]X[X[
+Kœ™XÛÝ™\™YYJNÂŸJNÂ\Ý
+	Û›ÝYšXØ][Û‹Yš\œÝ™XÛÝ™\žHÛØ[\ØÙ\ÈHÚ[][[™[Ý\ÈÛ›[™H]™[	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ý\\™XYÏL›ÝYšXØ][ÛØ[ÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOžÜÝ\\™XYÊÏLNÝ›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNß_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\ŽŠ
+OOžÛ›ÝYšXØ][ÛØ[ÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JNÂˆÛÛœÝ[™[™Ï[›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÙš^\™K\™Ù]™\Ü]Ú
+	ÛÛ›[™IÊNØ]ØZ]š^\™K˜œšYÙ\ÖÌK˜œšYÙKšYJ
+NÂˆ\ÜÙ\™\]X[
+Ý\\™XYËJNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛØ[ËJNÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽKÝ]\Î‰ÛÛ—Ýš\	ßJ_JNØ\ÜÙ\™\]X[
+
+]ØZ][™[™ÊKœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+Ý\\™XYËJNÂŸJNÂ\Ý
+	ØH›ÝYšXØ][Ûˆ™\Ý[\œš]š[™ÈY\ˆH›ÛHÝÚ]ÚØ[››Ý\]HHÛ›ÛHÝ]IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\ŽŠ
+OO›™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJ_JNÂˆÛÛœÝ[™[™Ï[›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽKÝ]\Î‰ÛÛ—Ýš\	ßJ_JNØÛÛœÝÝ[OX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+Ý[Kœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÜ™XÛÝ™\žIÊNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ™]š\Ú[Û‹
+NØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+›Ý[™\žKœÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÂŸJNÂ\Ý
+	Û™]Ù\ˆ[È\š[™ÈH›ÝYšXØ][Ûˆ™XYÙY\Û›HHX^[][H™]š\Ú[Ûˆ[™YÛ™H›ÛÝË]\	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KØ[ÏV×K™[X\Ù\ÏV×NÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Žš[OžØØ[Ëœ\Ú
+[
+NÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOœ™[X\Ù\Ëœ\Ú
+™\ÛÛ™JJNß_JNÂˆÛÛœÝ[™[™Ï[›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—ØÛØ[\ØÙY	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜XØÙ\Ü×ØÚ[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLŸJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—ØÛØ[\ØÙY	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒL_JJKœ™X\ÛÛ‹	ÜÝ[WÛÜ—Ù\XØ]WÚ[	ÊNÂˆ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ[™[™Ô™]š\Ú[Û‹LŠNØ\ÜÙ\™\]X[
+Ø[Ë›[™ÝJNÂˆ™[X\Ù\ÖÌJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽKÝ]\Î‰Ø\œš]š[™ÉßJ_JNÂˆ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÂˆ\ÜÙ\™\]X[
+Ø[Ë›[™ÝŠNØ\ÜÙ\™\]X[
+Ø[ÖÌWK\K	ÜšYK˜Ú[™ÙY	ÊNØ\ÜÙ\™\]X[
+Ø[ÖÌWKœšYRYÝ\œ™[šY
+NØ\ÜÙ\™\]X[
+Ø[ÖÌWKœ™]š\Ú[Û‹LŠNÂˆ™[X\Ù\ÖÌWJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŒL‹Ý]\Î‰ÛÛ—Ýš\	ßJ_JNÂˆÛÛœÝ™XÛÝ™\™YX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+™XÛÝ™\™Y™›ÛÝÝ\YJNØ\ÜÙ\™\]X[
+Ø[Ë›[™ÝŠNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ™]š\Ú[Û‹LŠNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ[™[™Ô™]š\Ú[Û‹[
+NÂŸJNÂ\Ý
+	ØHš\œÝ›ÝYšXØ][Ûˆ™XY][™XYH™XXÚ\ÈH]Y]YYX^[][HÙ[™È›È›ÛÝË]\	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\ŽŠ
+OOžØØ[ÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JNÂˆÛÛœÝ[™[™Ï[›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLŸJNÜ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŒL‹Ý]\Î‰ÛÛ—Ýš\	ßJ_JNÂˆÛÛœÝ™XÛÝ™\™YX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+™XÛÝ™\™Y™›ÛÝÝ\˜[ÙJNØ\ÜÙ\™\]X[
+Ø[ËJNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ™]š\Ú[Û‹LŠNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ[™[™Ô™]š\Ú[Û‹[
+NÂŸJNÂ\Ý
+	ØH™]Ù\ˆ[\š[™ÈHÚ[™ÛH›ÛÝË]\\È™]Z[™YÚ]Ý]Ý\[™ÈH\™™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K™[X\Ù\ÏV×NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\ŽŠ
+OOžØØ[ÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOœ™[X\Ù\Ëœ\Ú
+™\ÛÛ™JJNß_JNÂˆÛÛœÝ[™[™Ï[›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLŸJNÜ™[X\Ù\ÖÌJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽKÝ]\Î‰Ø\œš]š[™ÉßJ_JNÂˆ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÂˆ\ÜÙ\™\]X[
+Ø[ËŠNØ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLßJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—ØÛØ[\ØÙY	ÊNÂˆ™[X\Ù\ÖÌWJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŒL‹Ý]\Î‰ÛÛ—Ýš\	ßJ_JNÂˆÛÛœÝ™XÛÝ™\™YX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Yœ™X\ÛÛ‹	Ù^XÚ]Ü™Yœ™\ÚÜ™\]Z\™Y	ÊNØ\ÜÙ\™\]X[
+™XÛÝ™\™Y™›ÛÝÝ\YJNØ\ÜÙ\™\]X[
+Ø[ËŠNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ™]š\Ú[Û‹LŠNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ[™[™Ô™]š\Ú[Û‹LÊNÂŸJNÂ\Ý
+	Ú[˜[Y[™›Ü™ZYÛˆ[È\™H›Ý]Y]YY™Z[™H›ÝYšXØ][Ûˆ™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\ŽŠ
+OOžØØ[ÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JNÂˆÛÛœÝ[™[™Ï[›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒL˜\™NŒŒJJKœ™X\ÛÛ‹	Ú[˜[YÚ[	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ø[›Ý\‹\šYIË™]š\Ú[ÛŽŒL_JJKœ™X\ÛÛ‹	Ù›Ü™ZYÛ—Ú[	ÊNÂˆ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ[™[™Ô™]š\Ú[Û‹[
+NØ\ÜÙ\™\]X[
+Ø[ËJNÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽKÝ]\Î‰Ø\œš]š[™ÉßJ_JNØ]ØZ][™[™ÎØ\ÜÙ\™\]X[
+Ø[ËJNÂŸJNÂ\Ý
+	Ü›ÛHÝÚ]Ú[™È\ØØ\™ÈH]Y]YYX^[][H™]š\Ú[ÛˆÚ]Ý]H›ÛÝË]\™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\ŽŠ
+OOžØØ[ÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JNÂˆÛÛœÝ[™[™Ï[›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLŸJNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆ™[X\ÙJÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽKÝ]\Î‰Ø\œš]š[™ÉßJ_JNØÛÛœÝÝ[OX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÜ™XÛÝ™\žIÊNØ\ÜÙ\™\]X[
+Ø[ËJNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ™]š\Ú[Û‹
+NØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ[™[™Ô™]š\Ú[Û‹[
+NÂŸJNÂ\Ý
+	Ü\ÜÙ[™Ù\ˆRHØÚÜÈY\ˆH›Ý[™Y›ÛÝË]\Z\ÜÙ\ÈH›ÝYšYY™]š\Ú[Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆÜÝ]\ÎŒÌNß_JNÂˆÛÛœÝ™\Ý[X]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JKÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	Ù^XÚ]Ü™Yœ™\ÚÜ™\]Z\™Y	ÊNØ\ÜÙ\™\]X[
+Ø[ËŠNØ\ÜÙ\™\]X[
+Ý]K›™YYÔ™Yœ™\ÚYJNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙYYJNØ\ÜÙ\™\]X[
+Ý]K˜XÝ[Û‹	Ü™Yœ™\Ú	ÊNØ\ÜÙ\›X]Ú
+Ý]K™™YY˜XÚË]Kù/§zh/ÊNØ\ÜÙ\›X]Ú
+Ý]K™™YY˜XÚË›Y\ÜØYÙKù§ 9¥¬9â­¹¡bøà¤¹è®º*£xàfxà¢ËÊNÂŸJNÂ\Ý
+	Ùš]™\ˆRH\Ù\ÈÜ\˜][ÛˆÛÜ™[™ÈÚ[ˆ›ÝYšXØ][Ûˆ™XÛÝ™\žH™[XZ[œÈ™Z[™	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJ_Nß_JNÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLJNØÛÛœÝÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+Ø[ËŠNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙYYJNØ\ÜÙ\™\]X[
+Ý]K˜XÝ[Û‹	Ü™Yœ™\Ú	ÊNØ\ÜÙ\›X]Ú
+Ý]K™™YY˜XÚË]Kú`bú(cÊNØ\ÜÙ\™\]X[
+Ý]Kœ[™[™Ô™]š\Ú[Û‹L
+NÂŸJNÂ\Ý
+	Ù^XÚ]]\Ý\Ý]H™Yœ™\ÚØ]Ú\ÈH™]Z[™YX^[][H[™[›ØÚÜÈÛÛ[X[™ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜È[OžØØ[ÊÏLNÜ™]\›ˆØ[ÏÏÞÜÝ]\ÎŒÌNžÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽš[œ™]š\Ú[Û‹Ý]\Î‰ÛÛ—Ýš\	ßJ_Nß_JNÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLŸJJKœ™X\ÛÛ‹	Ù^XÚ]Ü™Yœ™\ÚÜ™\]Z\™Y	ÊNØ\ÜÙ\™\]X[
+Ø[ËŠNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+Kœ[™[™Ô™]š\Ú[Û‹LŠNÂˆÛÛœÝ™Yœ™\ÚYX]ØZ]›ÝYšXØ][ÛœËœ™Yœ™\Ú
+
+KÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+™Yœ™\ÚYœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+™Yœ™\ÚY›X[X[YJNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+Ý]Kœ™]š\Ú[Û‹LŠNØ\ÜÙ\™\]X[
+Ý]Kœ[™[™Ô™]š\Ú[Û‹[
+NØ\ÜÙ\™\]X[
+Ý]K›™YYÔ™Yœ™\Ú˜[ÙJNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ý]K˜XÝ[Û‹[
+NÂŸJNÂ\Ý
+	Ø[ˆ^XÚ]™Yœ™\Ú]\ÈÝ[™Z[™Ý^\ÈØÚÙYÚ]Ý][ˆ]]ÛX]XÈÛÜ	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒL_JNØÛÛœÝ™Yœ™\ÚYX]ØZ]›ÝYšXØ][ÛœËœ™Yœ™\Ú
+
+KÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+™Yœ™\ÚYœ™X\ÛÛ‹	Ù^XÚ]Ü™Yœ™\ÚÜ™\]Z\™Y	ÊNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙYYJNØ\ÜÙ\™\]X[
+Ý]Kœ[™[™Ô™]š\Ú[Û‹LJNØ\ÜÙ\™\]X[
+Ý]K˜XÝ[Û‹	Ü™Yœ™\Ú	ÊNÂŸJNÂ\Ý
+	Ü›ÛH^]ÛX\œÈHØÚÙY›ÝYšXØ][Ûˆ\™Ù][™™Z™XÝÈ]È^XÚ]™Yœ™\Ú	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ\ÜÙ\™\]X[
+›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+K˜ÛÛ[X[™ÓØÚÙYYJNÂˆ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNØÛÛœÝ™Z™XÝYX]ØZ]›ÝYšXØ][ÛœËœ™Yœ™\Ú
+
+KÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+™Z™XÝYœ™X\ÛÛ‹	Ú[˜XÝ]™WÜ›ÛIÊNØ\ÜÙ\™\]X[
+Ø[ËŠNØ\ÜÙ\™\]X[
+Ý]Kœ[™[™Ô™]š\Ú[Û‹[
+NØ\ÜÙ\™\]X[
+Ý]K›™YYÔ™Yœ™\Ú˜[ÙJNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙY˜[ÙJNÂŸJNÂ\Ý
+	ØH™]ÛÜšÈ˜Z[\™H\š[™È^XÚ]™Yœ™\ÚÙY\ÈH\ÜÙ[™Ù\ˆ™\]Y\ÝØY™[HØÚÙY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÚYŠØ[ÏOOLÊ]›ÝÈ\œ›ÜŠ	ÛÙ™›[™IÊNÜ™]\›ˆÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝ˜Z[YX]ØZ]›ÝYšXØ][ÛœËœ™Yœ™\Ú
+
+KÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+˜Z[Yœ™X\ÛÛ‹	ØÛÛ›™XÝ]š]WÜ™\]Z\™Y	ÊNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+Ý]K™ÝZY[˜ÙK	ØÛÛ›™XÝ]š]IÊNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙYYJNØ\ÜÙ\™\]X[
+Ý]K˜XÝ[Û‹	Ü™Yœ™\Ú	ÊNØ\ÜÙ\™\]X[
+Ý]Kœ[™[™Ô™]š\Ú[Û‹JNØ\ÜÙ\›X]Ú
+Ý]K™™YY˜XÚË]Kù/§zh/ÊNØ\ÜÙ\›X]Ú
+Ý]K™™YY˜XÚË›Y\ÜØYÙKú`&¹/èKÊNÂŸJNÂ\Ý
+	ØHLÈ^XÚ]™Yœ™\ÚÙY\ÈHš]™\ˆÜ\˜][ÛˆØÚÙYÚ]Ý]™]žZ[™ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆØ[ÏOOLÏÞÜÝ]\ÎLßNžÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLJNØÛÛœÝ˜Z[YX]ØZ]›ÝYšXØ][ÛœËœ™Yœ™\Ú
+
+KÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+˜Z[Yœ™X\ÛÛ‹	ØÛÛ›™XÝ]š]WÜ™\]Z\™Y	ÊNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙYYJNØ\ÜÙ\™\]X[
+Ý]Kœ[™[™Ô™]š\Ú[Û‹L
+NØ\ÜÙ\›X]Ú
+Ý]K™™YY˜XÚË]Kú`bú(cÊNÂŸJNÂ\Ý
+	ÍH[™È^XÚ]™Yœ™\Ú\ÈÛX\ˆØXÚYÝ]H[™™\]Z\™H™X]][XØ][Û‰Ë\Þ[˜È
+
+HOˆÂˆ›ÜŠÛÛœÝÝ]\ÈÙˆÍK×J^ÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆØ[ÏOOLÏÞÜÝ]\ßNžÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝ˜Z[YX]ØZ]›ÝYšXØ][ÛœËœ™Yœ™\Ú
+
+KÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+˜Z[Yœ™X\ÛÛ‹	Ü™X]][XØ][Û—Ü™\]Z\™Y	ÊNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+Ý]Kš\ÔšYK˜[ÙJNØ\ÜÙ\™\]X[
+Ý]K™ÝZY[˜ÙK	Ü™X]]	ÊNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙYYJNØ\ÜÙ\™\]X[
+Ý]K˜XÝ[Û‹	Ü™X]]	ÊNØ\ÜÙ\™\]X[
+Ý]Kœ[™[™Ô™]š\Ú[Û‹[
+NØ\ÜÙ\›X]Ú
+Ý]K™™YY˜XÚË›Y\ÜØYÙKù/§zh/ÊNÂˆBŸJNÂ\Ý
+	ØH^XÚ]™Yœ™\ÚÛX\œÈHÝ[HšYH[™™]\›œÈÈ[ˆ[›ØÚÙY[\HÝ]IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆØ[ÏOOLÏÞÜÝ]\ÎNžÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝ[\OX]ØZ]›ÝYšXØ][ÛœËœ™Yœ™\Ú
+
+KÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+[\Kœ™X\ÛÛ‹	ÜšYWÛ›ÝÙ›Ý[™	ÊNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+Ý]Kš\ÔšYK˜[ÙJNØ\ÜÙ\™\]X[
+Ý]K™ÝZY[˜ÙK	Ù[\IÊNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ý]K˜XÝ[Û‹[
+NØ\ÜÙ\™\]X[
+Ý]Kœ[™[™Ô™]š\Ú[Û‹[
+NØ\ÜÙ\›X]Ú
+Ý]K™™YY˜XÚË]Kú`bú(cÊNÂŸJNÂ\Ý
+	Û™]È[ÈY\ˆHÛÛ›™XÝ]š]H˜Z[\™H\]HÛ›HH™]Z[™YX^[][IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK›ÝYšXØ][ÛœÏT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆØ[ÏOOLÏÞÜÝ]\ÎLßNžÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÝYšXØ][ÛœËœ™Yœ™\Ú
+
+NÂˆÛÛœÝ]Y]YYX]ØZ]›ÝYšXØ][ÛœËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŒLŸJKÝ]O[›ÝYšXØ][ÛœËœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+]Y]YYœ™X\ÛÛ‹	Ù^XÚ]Ü™Yœ™\ÚÜ™\]Z\™Y	ÊNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+Ý]Kœ[™[™Ô™]š\Ú[Û‹LŠNØ\ÜÙ\™\]X[
+Ý]K™ÝZY[˜ÙK	ØÛÛ›™XÝ]š]IÊNØ\ÜÙ\™\]X[
+Ý]K˜ÛÛ[X[™ÓØÚÙYYJNÂŸJNÂ\Ý
+	Û›ÝYšXØ][Ûˆ™XÛÝ™\žH™YY˜XÚÈ\È\YYÈH^\Ý[™È\ÜÙ[™Ù\ˆÛÛ[X[™˜[›™\‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆÜÝ]\ÎŒÌNß_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ü\ÜÙ[™Ù\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ü\ÜÙ[™Ù\‰Ë™XÛÝ™\žKÛÛ[X[™Z_JNÂˆÛÛœÝ™\Ý[X]ØZ]›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JKšY]ÏXÛÛ[X[™ZKœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+Ø[ËŠNØ\ÜÙ\™\]X[
+šY]Ë›Ý]ÛÛYK	Ý[œ™\ÛÛ™Y	ÊNØ\ÜÙ\™\]X[
+šY]Ë˜XÝ[Û‹	Ü™Yœ™\Ú	ÊNØ\ÜÙ\™\]X[
+šY]Ë™\ØX›PÛÛ[X[™ËYJNØ\ÜÙ\›X]Ú
+šY]Ë]Kù/§zh/ÊNØ\ÜÙ\›X]Ú
+šY]Ë›Y\ÜØYÙKù§ 9¥¬9â­¹¡bøà¤¹è®º*£xàfxà¢ËÊNÂŸJNÂ\Ý
+	Û›ÝYšXØ][Ûˆ™YY˜XÚÈ[ÝÜÈÛ™H^XÚ]™Yœ™\Ú[™™Z™XÝÈHÝX›H\	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜È[OžØØ[ÊÏLNÚYŠØ[ÏÊ\™]\›ˆÜÝ]\ÎŒÌNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙOJ
+OOœ™\ÛÛ™JÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽš[œ™]š\Ú[Û‹Ý]\Î‰ÛÛ—Ýš\	ßJ_JNßJNß_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ü\ÜÙ[™Ù\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ü\ÜÙ[™Ù\‰Ë™XÛÝ™\žKÛÛ[X[™Z_JNÂˆ]ØZ]›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝš\œÝY›ÝËšYÙÙ\Š	Ü™Yœ™\Ú	ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆÛÛœÝ\XØ]OX]ØZ]›ÝËšYÙÙ\Š	Ü™Yœ™\Ú	ÊNØ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	ØXÝ[Û—Ú[—Ü›ÙÜ™\ÜÉÊNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™ËYJNÂˆ™[X\ÙJ
+NØÛÛœÝÛÛ\]YX]ØZ]š\œÝØ\ÜÙ\™\]X[
+ÛÛ\]Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™Ë˜[ÙJNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹[
+NØ\ÜÙ\™\]X[
+Ø[ËÊNÂŸJNÂ\Ý
+	ØH›ÛHÝÚ]Ú™]™[È[^YY›ÝYšXØ][Ûˆ™YY˜XÚÈœ›ÛHÝ™\Üš][™ÈH™]È›ÛIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜È[OžØØ[ÊÏLNÚYŠØ[ÏÊ\™]\›ˆÜÝ]\ÎŒÌNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙOJ
+OOœ™\ÛÛ™JÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽš[œ™]š\Ú[Û‹Ý]\Î‰ÛÛ—Ýš\	ßJ_JNßJNß_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ü\ÜÙ[™Ù\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ü\ÜÙ[™Ù\‰Ë™XÛÝ™\žKÛÛ[X[™Z_JNÂˆ]ØZ]›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝ[™[™ÏY›ÝËšYÙÙ\Š	Ü™Yœ™\Ú	ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØÛÛ[X[™ZKœÙ]›ÛJ	Ùš]™\‰ÊNÜ™[X\ÙJ
+NØÛÛœÝÝ[OX]ØZ][™[™ËšY]ÏXÛÛ[X[™ZKœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÜ›ÛWÙÙ[™\˜][Û‰ÊNØ\ÜÙ\™\]X[
+šY]Ëœ›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+šY]Ë›Ý]ÛÛYK	ÚYIÊNØ\ÜÙ\™\]X[
+šY]Ë™\ØX›PÛÛ[X[™Ë˜[ÙJNÂŸJNÂ\Ý
+	Ü™X]][XØ][Ûˆ™YY˜XÚÈ[›ÚÙ\ÈH›ÛHXÝ[ÛˆÛ˜ÙH[™›ØÚÜÈ\XØ]HXÝ]˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™X]]Ø[ÏL™[X\ÙNÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆØ[ÏOOLÏÞÜÝ]\Î_NžÜÝ]\ÎŒÌNß_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ùš]™\‰Ë™XÛÝ™\žKÛÛ[X[™ZKÛ”™X]][XØ]NŠ
+OOžÜ™X]]Ø[ÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JNÂˆ]ØZ]›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÝËšYÙÙ\Š	Ü™Yœ™\Ú	ÊNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹	Ü™X]]	ÊNØ\ÜÙ\›X]Ú
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K›Y\ÜØYÙKú`bú(cÊNÂˆÛÛœÝš\œÝY›ÝËšYÙÙ\Š	Ü™X]]	ÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØÛÛœÝ\XØ]OX]ØZ]›ÝËšYÙÙ\Š	Ü™X]]	ÊNØ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	ØXÝ[Û—Ú[—Ü›ÙÜ™\ÜÉÊNØ\ÜÙ\™\]X[
+™X]]Ø[ËJNÜ™[X\ÙJÜ™\]Y\ÝYY_JNØ]ØZ]š\œÝØ\ÜÙ\™\]X[
+™X]]Ø[ËJNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹	Ü™X]]	ÊNÂŸJNÂ\Ý
+	ØH›ÝY›Ý[™^XÚ]™Yœ™\Ú\]\ÈHÚ\™Yš]™\ˆ˜[›™\ˆÈ[ˆ[›ØÚÙY[\HÝ]IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆØ[ÏOOLÏÞÜÝ]\ÎNžÜÝ]\ÎŒÌNß_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ùš]™\‰Ë™XÛÝ™\žKÛÛ[X[™Z_JNÂˆ]ØZ]›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝ[\OX]ØZ]›ÝËšYÙÙ\Š	Ü™Yœ™\Ú	ÊKšY]ÏXÛÛ[X[™ZKœÛ˜\ÚÝ
+
+NÂˆ\ÜÙ\™\]X[
+[\Kœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+šY]Ë›Ý]ÛÛYK	ØÛÛ™š\›YY	ÊNØ\ÜÙ\™\]X[
+šY]Ë™\ØX›PÛÛ[X[™Ë˜[ÙJNØ\ÜÙ\™\]X[
+šY]Ë˜XÝ[Û‹[
+NØ\ÜÙ\›X]Ú
+šY]Ë]Kú`bú(cÊNØ\ÜÙ\›X]Ú
+šY]Ë›Y\ÜØYÙKú`bú.è¹¢bøàæøàï8àèÊNÂŸJNÂ\Ý
+	Û›ÝYšXØ][Ûˆ™YY˜XÚÈ]ÛˆœšYÙH]XÚ\ÈÛ™HÛXÚÈ\Ý[™\ˆ[™™[[Ý™\È]Ûˆ›ÛH^]	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K™[™\œÏV×NÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒÌJ_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ü\ÜÙ[™Ù\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ü\ÜÙ[™Ù\‰Ë™XÛÝ™\žKÛÛ[X[™Z_JKœšYÙOT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]™[™\ŽšY]ÏOœ™[™\œËœ\Ú
+šY]Ê_JNÂˆ\ÜÙ\™\]X[
+œšYÙK˜]XÚ
+
+KœÝ\YYJNØ\ÜÙ\™\]X[
+œšYÙK˜]XÚ
+
+Kœ™X\ÛÛ‹	Ø[™XYWØ]XÚY	ÊNØ\ÜÙ\™\]X[
+\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+\™Ù]˜YÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+™[™\œË›[™ÝJNÂˆœšYÙK™]XÚ
+
+NØ\ÜÙ\™\]X[
+\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK
+NØ\ÜÙ\™\]X[
+œšYÙKœÛ˜\ÚÝ
+
+K™]XÚYYJNÝ\™Ù]™\Ü]Ú
+	ØÛXÚÉÊNØ\ÜÙ\™\]X[
+™[™\œË›[™ÝJNÂŸJNÂ\Ý
+	ØHÝX›HÛXÚÈÛˆH›ÝYšXØ][Ûˆ™Yœ™\Ú]ÛˆÝ\ÈÛ™H™XYÛ›IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™[X\ÙNØÛÛœÝ\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K™[™\œÏV×NÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜È[OžØØ[ÊÏLNÚYŠØ[ÏÊ\™]\›ˆÜÝ]\ÎŒÌNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙOJ
+OOœ™\ÛÛ™JÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽš[œ™]š\Ú[Û‹Ý]\Î‰ÛÛ—Ýš\	ßJ_JNßJNß_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ü\ÜÙ[™Ù\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ü\ÜÙ[™Ù\‰Ë™XÛÝ™\žKÛÛ[X[™Z_JNÂˆ]ØZ]›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝœšYÙOT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]™[™\ŽšY]ÏOœ™[™\œËœ\Ú
+šY]Ê_JNØœšYÙK˜]XÚ
+
+NÂˆÛÛœÝš\œÝXœšYÙK˜XÝ]˜]J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØÛÛœÝ\XØ]OX]ØZ]œšYÙK˜XÝ]˜]J
+NØ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	ØXÝ[Û—Ú[—Ü›ÙÜ™\ÜÉÊNØ\ÜÙ\™\]X[
+Ø[ËÊNÜ™[X\ÙJ
+NØÛÛœÝÛÛ\]YX]ØZ]š\œÝÂˆ\ÜÙ\™\]X[
+ÛÛ\]Yœ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+Ø[ËÊNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™Ë˜[ÙJNØ\ÜÙ\›ÚÊ™[™\œËœÛÛYJšY]ÏOšY]Ë›Ý]ÛÛYOOOIÜ[™[™ÉÊJNØ\ÜÙ\™\]X[
+™[™\œË˜]
+LJK˜XÝ[Û‹[
+NÂŸJNÂ\Ý
+	Ù]XÚ[™ÈH›ÝYšXØ][Ûˆ]Ûˆ\š[™ÈH™XY›ÜÈ]È[^YY™[™\‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™[X\ÙNØÛÛœÝ\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K™[™\œÏV×NÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜È[OžØØ[ÊÏLNÚYŠØ[ÏÊ\™]\›ˆÜÝ]\ÎŒÌNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙOJ
+OOœ™\ÛÛ™JÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽš[œ™]š\Ú[Û‹Ý]\Î‰Ø\œš]š[™ÉßJ_JNßJNß_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ùš]™\‰Ë™XÛÝ™\žKÛÛ[X[™Z_JNÂˆ]ØZ]›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝœšYÙOT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]™[™\ŽšY]ÏOœ™[™\œËœ\Ú
+šY]Ê_JNØœšYÙK˜]XÚ
+
+NØÛÛœÝ[™[™ÏXœšYÙK˜XÝ]˜]J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØÛÛœÝ™Y›Ü™O\™[™\œË›[™ÝØœšYÙK™]XÚ
+
+NÜ™[X\ÙJ
+NØÛÛœÝÝ[OX]ØZ][™[™ÎÂˆ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ØœšYÙWÜÝ[IÊNØ\ÜÙ\™\]X[
+™[™\œË›[™Ý™Y›Ü™JNØ\ÜÙ\™\]X[
+\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK
+NØ\ÜÙ\™\]X[
+Ø[ËÊNÂŸJNÂ\Ý
+	Ø[ˆÛ›ÝYšXØ][Ûˆ]ÛˆØ[››ÝXÝY\ˆHÛÛ[X[™RHÝÚ]Ú\È›ÛIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏLØÛÛœÝ\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+NÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ü\ÜÙ[™Ù\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆÜÝ]\ÎŒÌNß_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ü\ÜÙ[™Ù\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ü\ÜÙ[™Ù\‰Ë™XÛÝ™\žKÛÛ[X[™Z_JNÂˆ]ØZ]›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝœšYÙOT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]™[™\ŽŠ
+OOžß_JNØœšYÙK˜]XÚ
+
+NØÛÛ[X[™ZKœÙ]›ÛJ	Ùš]™\‰ÊNØÛÛœÝ™Z™XÝYX]ØZ]œšYÙK˜XÝ]˜]J
+NÂˆ\ÜÙ\™\]X[
+™Z™XÝYœ™X\ÛÛ‹	ØXÝ[Û—Û›ÝØ]˜Z[X›IÊNØ\ÜÙ\™\]X[
+Ø[ËŠNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+Kœ›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K›Ý]ÛÛYK	ÚYIÊNÂŸJNÂ\Ý
+	ÝH™X]][XØ][Ûˆ]Ûˆ]™[\ÈÚ[™ÛKY›YÚ[™™[XZ[œÈØÚÙY[[H™]ÈÙ\ÜÚ[Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]Ø[ÏL™X]]Ø[ÏL™[X\ÙNØÛÛœÝ\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+NÂˆÛÛœÝš^\™O\›ÛSY™XÞXÛQš^\™J‹Ü™XYÝ\œ™[šYN˜\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒJ_JK›Ý[™\žOT‹˜Ü™X]T›ÛT›Ý][™Ð›Ý[™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛ_JNØ]ØZ]›Ý[™\žK›˜]šYØ]J	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆÛÛœÝÝ\œ™[XÝ\œ™[šYUšY]Ê	Ùš]™\‰ËÜ™]š\Ú[ÛŽŽÝ]\Î‰Ø\ÜÚYÛ™Y	ßJK™XÛÝ™\žOT‹˜Ü™X]T›ÛS›ÝYšXØ][Û”™XÛÝ™\žJÛY™XÞXÛN™š^\™K›Y™XÞXÛK›ÛN‰Ùš]™\‰ËÝ\œ™[šYN˜Ý\œ™[™XÛÝ™\Ž˜\Þ[˜Ê
+OOžØØ[ÊÏLNÜ™]\›ˆØ[ÏOOLÏÞÜÝ]\ÎßNžÜÝ]\ÎŒÌNß_JKÛÛ[X[™ZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊK›ÝÏT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ›ÝÊÜ›ÛN‰Ùš]™\‰Ë™XÛÝ™\žKÛÛ[X[™ZKÛ”™X]][XØ]NŠ
+OOžÜ™X]]Ø[ÊÏLNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙO\™\ÛÛ™NßJNß_JNÂˆ]ØZ]›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ]ØZ]›ÝËšYÙÙ\Š	Ü™Yœ™\Ú	ÊNØÛÛœÝœšYÙOT‹˜Ü™X]S›ÝYšXØ][Û‘™YY˜XÚÑ]™[œšYÙJÙ›ÝË]™[\™Ù]\™Ù]™[™\ŽŠ
+OOžß_JNØœšYÙK˜]XÚ
+
+NØÛÛœÝš\œÝXœšYÙK˜XÝ]˜]J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØÛÛœÝ\XØ]OX]ØZ]œšYÙK˜XÝ]˜]J
+NÂˆ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	ØXÝ[Û—Ú[—Ü›ÙÜ™\ÜÉÊNØ\ÜÙ\™\]X[
+™X]]Ø[ËJNÜ™[X\ÙJÜ™\]Y\ÝYY_JNØ]ØZ]š\œÝØ\ÜÙ\™\]X[
+™X]]Ø[ËJNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹	Ü™X]]	ÊNØ\ÜÙ\™\]X[
+ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K™\ØX›PÛÛ[X[™ËYJNÂŸJNÂ\Ý
+	Ü›ÛH[žHÝÛœÈÛ™H›ÝYšXØ][Ûˆ™YY˜XÚÈœšYÙHÚ]Ý]\XØ]H]XÚY[	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+Kš^\™O\›ÛQ™YY˜XÚÓY™XÞXÛQš^\™JŠNÂˆ\ÜÙ\™\]X[
+
+]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊJK™[\™YYJNØ\ÜÙ\™\]X[
+
+]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊJKœ™X\ÛÛ‹	Ø[™XYWÙ[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+š^\™K™™YY˜XÚÜË›[™ÝJNØ\ÜÙ\™Y\\]X[
+š^\™K™]™[ËÉØ]XÚœ\ÜÙ[™Ù\ŽŒI×JNØ\ÜÙ\™\]X[
+š^\™K™™YY˜XÚÜÖÌK\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+š^\™K™™YY˜XÚÜÖÌK\™Ù]˜YÛÝ[
+	ØÛXÚÉÊKJNÂŸJNÂ\Ý
+	ÛX]š[™ÈH›ÛH]XÚ\È]È›ÝYšXØ][Ûˆ]Ûˆ™Y›Ü™H]\ˆÛXÚÜÈØ[ˆXÝ	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLØÛÛœÝš^\™O\›ÛQ™YY˜XÚÓY™XÞXÛQš^\™J‹Û›ÝYšXØ][Û”™XY˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝš\œÝYš^\™K™™YY˜XÚÜÖÌNØ]ØZ]š\œÝ™›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY™š\œÝ˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØ\ÜÙ\™\]X[
+š\œÝ˜ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹	Ü™Yœ™\Ú	ÊNØÛÛœÝ™Y›Ü™O\™XYÎÂˆš^\™K›Y™XÞXÛK›X]™J
+NØ\ÜÙ\™\]X[
+š\œÝ\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK
+NÙš\œÝ\™Ù]™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]š\œÝ˜œšYÙKšYJ
+NÂˆ\ÜÙ\™\]X[
+™XYË™Y›Ü™JNØ\ÜÙ\™\]X[
+š\œÝš[›™\‹œÛ˜\ÚÝ
+
+K™]XÚYYJNØ\ÜÙ\™\]X[
+
+]ØZ]š\œÝš[›™\‹˜XÝ]˜]J
+JKœ™X\ÛÛ‹	ØœšYÙWÚ[˜XÝ]™IÊNÂŸJNÂ\Ý
+	Ü›ÛHÝÚ]Ú[™È]XÚ\ÈHÛ›ÝYšXØ][ÛˆœšYÙH™Y›Ü™H]XÚ[™ÈH™]ÈÛ™IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+Kš^\™O\›ÛQ™YY˜XÚÓY™XÞXÛQš^\™JŠNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ùš]™\‰ÊNÂˆ\ÜÙ\™Y\\]X[
+š^\™K™]™[ËÉØ]XÚœ\ÜÙ[™Ù\ŽŒIË	Ù]XÚœ\ÜÙ[™Ù\ŽŒIË	Ø]XÚ™š]™\ŽŒ‰×JNØ\ÜÙ\™\]X[
+š^\™K™™YY˜XÚÜÖÌK\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK
+NØ\ÜÙ\™\]X[
+š^\™K™™YY˜XÚÜÖÌWK\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+š^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNÂŸJNÂ\Ý
+	Ü™KY[\š[™ÈHØ[YH›ÛHÜ™X]\ÈHœ™\Ú›ÝYšXØ][Ûˆ]ÛˆÙ[™\˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+Kš^\™O\›ÛQ™YY˜XÚÓY™XÞXÛQš^\™JŠNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ùš]™\‰ÊNØÛÛœÝš\œÝYš^\™K™™YY˜XÚÜÖÌNÙš^\™K›Y™XÞXÛK›X]™J
+NØ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ùš]™\‰ÊNØÛÛœÝÙXÛÛ™Yš^\™K™™YY˜XÚÜÖÌWNÂˆ\ÜÙ\››Ý\]X[
+š\œÝš[›™\‹ÙXÛÛ™š[›™\ŠNØ\ÜÙ\™\]X[
+š\œÝ™Ù[™\˜][ÛŠÌKÙXÛÛ™™Ù[™\˜][ÛŠNØ\ÜÙ\™\]X[
+š\œÝ\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK
+NØ\ÜÙ\™\]X[
+ÙXÛÛ™\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+
+]ØZ]š\œÝš[›™\‹˜XÝ]˜]J
+JKœ™X\ÛÛ‹	ØœšYÙWÚ[˜XÝ]™IÊNÂŸJNÂ\Ý
+	ØH[^YYÛ›ÝYšXØ][ÛˆXÝ[ÛˆØ[››Ý™[™\ˆ[ÈHÝÚ]ÚY›ÛHÙ[™\˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]ÛØ[ÏL™[X\ÙNØÛÛœÝš^\™O\›ÛQ™YY˜XÚÓY™XÞXÛQš^\™J‹Û›ÝYšXØ][Û”™XYŠÜ›ÛK[JOOžÂˆYŠ›ÛHOOIÜ\ÜÙ[™Ù\‰Ê\™]\›ˆ›ÛZ\ÙKœ™\ÛÛ™JÜÝ]\ÎŒÌJNÛÛØ[ÊÏLNÚYŠÛØ[ÏÊ\™]\›ˆ›ÛZ\ÙKœ™\ÛÛ™JÜÝ]\ÎŒÌJNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙOJ
+OOœ™\ÛÛ™JÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê	Ü\ÜÙ[™Ù\‰ËÜ™]š\Ú[ÛŽš[œ™]š\Ú[Û‹Ý]\Î‰ÛÛ—Ýš\	ßJ_JNßJNÂˆ_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝÛYš^\™K™™YY˜XÚÜÖÌNØ]ØZ]Û™›ÝËš[™JÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY›Û˜Ý\œ™[šY™]š\Ú[ÛŽŽ_JNØÛÛœÝ[™[™Ï[Ûš[›™\‹˜XÝ]˜]J
+NØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NØÛÛœÝÛ™[™\ÛÝ[[Ûœ™[™\œË›[™ÝÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ùš]™\‰ÊNØÛÛœÝÝ\œ™[Yš^\™K™™YY˜XÚÜÖÌWNÜ™[X\ÙJ
+NØÛÛœÝ™\Ý[X]ØZ][™[™ÎØ]ØZ]Ûš[›™\‹šYJ
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	ØœšYÙWÜÝ[IÊNØ\ÜÙ\™\]X[
+Ûœ™[™\œË›[™ÝÛ™[™\ÛÝ[
+NØ\ÜÙ\™\]X[
+Ý\œ™[˜ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+Kœ›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+Ý\œ™[˜ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+K›Ý]ÛÛYK	ÚYIÊNØ\ÜÙ\™\]X[
+Ý\œ™[\™Ù]›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNÂŸJNÂ\Ý
+	ÝHXÝ]™H›ÛHÙ[™\˜][ÛˆXØÙ\ÈH›ÝYšXØ][Ûˆ[›ÝYÚ]ÈÝÛ™YœšYÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLØÛÛœÝš^\™O\›ÛQ™YY˜XÚÓY™XÞXÛQš^\™J‹Û›ÝYšXØ][Û”™XY˜\Þ[˜ÊÜ›ÛK[JOOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê›ÛKÜ™]š\Ú[ÛŽš[œ™]š\Ú[Û‹Ý]\Î‰Ø\ÜÚYÛ™Y	ßJ_Nß_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝÙ[™\˜][ÛYš^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹Ý\œ™[Yš^\™K™™YY˜XÚÜÖÌK˜Ý\œ™[ÂˆÛÛœÝ™\Ý[X]ØZ]š^\™K›Y™XÞXÛKš[™S›ÝYšXØ][ÛŠÜ›ÛN‰Ü\ÜÙ[™Ù\‰ËÙ[™\˜][Û‹[žÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ__JNÂˆ\ÜÙ\™\]X[
+™\Ý[œ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+™XYËJNØ\ÜÙ\™\]X[
+š^\™K™™YY˜XÚÜÖÌKœ™XÛÝ™\žKœÛ˜\ÚÝ
+
+Kœ™]š\Ú[Û‹JNØ\ÜÙ\™\]X[
+š^\™K™™YY˜XÚÜÖÌK˜ÛÛ[X[™ZKœÛ˜\ÚÝ
+
+Kœ›ÛK	Ü\ÜÙ[™Ù\‰ÊNÂŸJNÂ\Ý
+	ØÜ›ÜÜË\›ÛH[™Ý[KYÙ[™\˜][Ûˆ›ÝYšXØ][Ûˆ[ÈÝÜ™Y›Ü™H™YY˜XÚÈÜˆ™XYÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLØÛÛœÝš^\™O\›ÛQ™YY˜XÚÓY™XÞXÛQš^\™J‹Û›ÝYšXØ][Û”™XY˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝÙ[™\˜][ÛYš^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹Ý\œ™[Yš^\™K™™YY˜XÚÜÖÌK˜Ý\œ™[[^Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ_NÂˆ\ÜÙ\™\]X[
+
+]ØZ]š^\™K›Y™XÞXÛKš[™S›ÝYšXØ][ÛŠÜ›ÛN‰Ùš]™\‰ËÙ[™\˜][Û‹[JJKœ™X\ÛÛ‹	ÜÝ[WÜ›ÛWÙÙ[™\˜][Û‰ÊNØ\ÜÙ\™\]X[
+
+]ØZ]š^\™K›Y™XÞXÛKš[™S›ÝYšXØ][ÛŠÜ›ÛN‰Ü\ÜÙ[™Ù\‰ËÙ[™\˜][ÛŽ™Ù[™\˜][ÛŠÌK[JJKœ™X\ÛÛ‹	ÜÝ[WÜ›ÛWÙÙ[™\˜][Û‰ÊNØ\ÜÙ\™\]X[
+™XYË
+NØ\ÜÙ\™\]X[
+š^\™K™™YY˜XÚÜÖÌKš[›™\‹œÛ˜\ÚÝ
+
+Kš[™Y]™[Ë
+NÂŸJNÂ\Ý
+	Û›ÝYšXØ][Ûˆ[ÈY\ˆ›ÛH^]ÝÜ™Y›Ü™HH]XÚYœšYÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLØÛÛœÝš^\™O\›ÛQ™YY˜XÚÓY™XÞXÛQš^\™J‹Û›ÝYšXØ][Û”™XY˜\Þ[˜Ê
+OOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒÌNß_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ùš]™\‰ÊNØÛÛœÝÙ[™\˜][ÛYš^\™K›Y™XÞXÛKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹Ý\œ™[Yš^\™K™™YY˜XÚÜÖÌK˜Ý\œ™[Ùš^\™K›Y™XÞXÛK›X]™J
+NÂˆÛÛœÝ™\Ý[X]ØZ]š^\™K›Y™XÞXÛKš[™S›ÝYšXØ][ÛŠÜ›ÛN‰Ùš]™\‰ËÙ[™\˜][Û‹[žÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY˜Ý\œ™[šY™]š\Ú[ÛŽŽ__JNÂˆ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	Û›ÝÙ[\™Y	ÊNØ\ÜÙ\™\]X[
+™XYË
+NØ\ÜÙ\™\]X[
+š^\™K™™YY˜XÚÜÖÌKš[›™\‹œÛ˜\ÚÝ
+
+Kš[™Y]™[Ë
+NÂŸJNÂ\Ý
+	ÜØ[YK\›ÛH™KY[žHXØÙ\ÈÛ›HHœ™\Ú›ÝYšXØ][ÛˆÙ[™\˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÛ]™XYÏLØÛÛœÝš^\™O\›ÛQ™YY˜XÚÓY™XÞXÛQš^\™J‹Û›ÝYšXØ][Û”™XY˜\Þ[˜ÊÜ›ÛK[JOOžÜ™XYÊÏLNÜ™]\›ˆÜÝ]\ÎŒŒ›ÙN˜Ý\œ™[šYUšY]Ê›ÛKÜ™]š\Ú[ÛŽš[œ™]š\Ú[Û‹Ý]\Î‰Ø\ÜÚYÛ™Y	ßJ_Nß_JNÂˆ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝÛYš^\™K™™YY˜XÚÜÖÌNÙš^\™K›Y™XÞXÛK›X]™J
+NØ]ØZ]š^\™K›Y™XÞXÛK™[\Š	Ü\ÜÙ[™Ù\‰ÊNØÛÛœÝœ™\ÚYš^\™K™™YY˜XÚÜÖÌWK[^Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY™œ™\Ú˜Ý\œ™[šY™]š\Ú[ÛŽŽ_NÂˆ\ÜÙ\™\]X[
+
+]ØZ]š^\™K›Y™XÞXÛKš[™S›ÝYšXØ][ÛŠÜ›ÛN‰Ü\ÜÙ[™Ù\‰ËÙ[™\˜][ÛŽ›Û™Ù[™\˜][Û‹[JJKœ™X\ÛÛ‹	ÜÝ[WÜ›ÛWÙÙ[™\˜][Û‰ÊN÷÷Î÷¶‰žËkºwµçXÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	ÜÝ[H›ÝYšXØ][Ûˆ˜Z[\™HØ[››Ý[\œ\H[™[™Èœ™\Ú\Ù\ÜÚ[Ûˆ›ÝYšXØ][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™Z™XÝÛ[™[X\ÙS™]Ò[ÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[ŠÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÜ™]\›ˆÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌOÛ™]È›ÛZ\ÙJ
+Ü™\ÛÛ™K™Z™XÝ
+OOžÜ™Z™XÝÛ[\™Z™XÝßJN›™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙS™]Ò[\™\ÛÛ™NßJNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆÛÛœÝÛ[\ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒMßJNÝÚ[J\™Z™XÝÛ[
+X]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÜÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+
+]ØZ]˜[˜XÚÑÛK˜XÝ]˜]J
+JKœ™X\ÛÛ‹	ÙÛWØœšYÙWÜÝ[IÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNÂˆÛÛœÝ™]Ò[\ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒNJNÝÚ[J\™[X\ÙS™]Ò[
+X]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËM×KÉÙš]™\‹X‰ËNWJNØÛÛœÝœ™\ÚšY]Ï^Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_NÂˆ™Z™XÝÛ[
+\œ›ÜŠ	ÛÛ›ÝYšXØ][Ûˆ˜Z[Y	ÊJNØÛÛœÝÝ[OX]ØZ]Û[Ø]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+Ý[Kœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ØœšYÙWÜÝ[IÊNØ\ÜÙ\™Y\\]X[
+Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_Kœ™\ÚšY]ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÂˆ™[X\ÙS™]Ò[
+Ü›ØÙ\ÜÙYYK™X\ÛÛŽ‰Û›ÝYšXØ][Û—Ø\YY	ßJNØÛÛœÝÝ\œ™[X]ØZ]™]Ò[Ø]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™\]X[
+Ý\œ™[œ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+Ý\œ™[œ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ø\YY	ÊNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËM×KÉÙš]™\‹X‰ËNWJNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+]™[\™Ù]›\Ý[™\ÛÝ[
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊKJNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	ØÝ\œ™[›ÝYšXØ][Ûˆ˜Z[\™HØÚÜÈÛ›HHXÝ]™HÙ\ÜÚ[Ûˆ[™Ù™™\œÈÛ™H^XÚ]™Yœ™\Ú	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[SØš™XÝ™œ™Y^™JØXØÛÝ[™YŽ‰Ùš]™\‹XÝ\œ™[	ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÛ]YÙOIÜ›ÛIË›Ý]\‹™\šYšXØ][ÛœÏLÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K[™YV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OO˜XØÛÝ[ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OOžßNßKˆ[™S›ÝYšXØ][Û’[˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÝ›ÝÈ\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœÊÏLNØ\ÜÙ\™\]X[
+Ù\ÜÚ[Ûš[™[™ËXØÛÝ[
+NÜ™]\›ˆÝ™\šYšYYY_NßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆÛÛœÝ˜Z[YX]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒN_JNØ\ÜÙ\™\]X[
+˜Z[Yœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+˜Z[Yœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XÝ\œ™[	ËNWWJNØ\ÜÙ\›X]Ú
+[[Y[Ë]K^ÛÛ[ú`bú(c8àk¹§ 9¥¬9â­¹¡bøà¤¹cå¹o¥øàiøàcxào¸àføà¤ËÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹^ÛÛ[	ù§ 9¥¬9â­¹¡bøà¤¹è®º*£xàfxà¢ÉÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹˜[ÙJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™\]X[
+™\šYšXØ][ÛœËJNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XÝ\œ™[	×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝJNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ù˜Z[Y^XÚ]™Yœ™\ÚY\ˆH›ÝYšXØ][Ûˆ˜Z[\™HÝ^\ÈØÚÙYÚ]Ý][ˆ]]ÛX]XÈÛÜ	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[SØš™XÝ™œ™Y^™JØXØÛÝ[™YŽ‰Ùš]™\‹XÝ\œ™[	ËšY]Ù\”›ÛN‰Ùš]™\‰ßJNÛ]YÙOIÜ›ÛIË›Ý]\‹™\šYšXØ][ÛœÏLÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K[™YV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OO˜XØÛÝ[ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OOžßNßKˆ[™S›ÝYšXØ][Û’[˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÝ›ÝÈ\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœÊÏLNØ\ÜÙ\™\]X[
+Ù\ÜÚ[Ûš[™[™ËXØÛÝ[
+NÝ›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆÛÛœÝ˜Z[YX]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒŒJNØ\ÜÙ\™\]X[
+˜Z[Yœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹^ÛÛ[	ù§ 9¥¬9â­¹¡bøà¤¹è®º*£xàfxà¢ÉÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹˜[ÙJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+™\šYšXØ][ÛœËJNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XÝ\œ™[	ËŒWJNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XÝ\œ™[	×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝJNØ\ÜÙ\›X]Ú
+[[Y[Ë]K^ÛÛ[ú`bú(c8àk¹§ 9¥¬9â­¹¡bøà¤¹è®º*£xàiøàcxào¸àføà¤ËÊNØ\ÜÙ\›X]Ú
+[[Y[Ë›Y\ÜØYÙK^ÛÛ[ú!ê¹båyè®º*£xàkù`g9«h¸àeøào¸àeøàgËÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNÂˆ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™\]X[
+™\šYšXØ][ÛœËJNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ü›ÛHÚÛÜÙ\ˆÛX\œÈH\›Z[˜[›ÝYšXØ][Ûˆ˜Z[\™H™Y›Ü™Hœ™\Ú\Ù\ÜÚ[Ûˆ™Y[žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™\šYšXØ][ÛœÏLÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ]›ÝÈ\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆÜ›ØÙ\ÜÙYYK™X\ÛÛŽ‰Û›ÝYšXØ][Û—Ø\YY	ßNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœÊÏLNØ\ÜÙ\™\]X[
+Ù\ÜÚ[Ûš[™[™ËXØÛÝ[ÖÌJNÝ›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒŒ_JJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™\]X[
+™\šYšXØ][ÛœËJNØ\ÜÙ\›X]Ú
+[[Y[Ë›Y\ÜØYÙK^ÛÛ[ú!ê¹båyè®º*£xàkù`g9«h¸àeøào¸àeøàgËÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK[
+NØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ü›ÛIÊNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK
+NØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNÂˆÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœÖÌWKœÙ\ÜÚ[Ûš[™[™ËXØÛÝ[ÖÌWJNØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒŒŸJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØÛÛœÝÝ\œ™[X]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒŒŸJNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™\]X[
+Ý\œ™[œ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+Ý\œ™[œ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ø\YY	ÊNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËŒWKÉÙš]™\‹X‰ËŒ—WJNØ\ÜÙ\™\]X[
+™\šYšXØ][ÛœËJNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ùœ™\Ú\Ù\ÜÚ[Ûˆ›ÝYšXØ][Ûˆ˜Z[\™HÝÛœÈÛ™H™]È™XÛÝ™\žHXÝ[ÛˆY\ˆ\›Z[˜[™Y[žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\ŽÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×K™\šYšXØ][ÛœÏV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÝ›ÝÈ\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ]›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆÝ™\šYšYYY_NßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒŒßJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\›X]Ú
+[[Y[Ë›Y\ÜØYÙK^ÛÛ[ú!ê¹båyè®º*£xàkù`g9«h¸àeøào¸àeøàgËÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK
+NØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNÂˆÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNØÛÛœÝœ™\Ú˜Z[\™OX]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒJNØ\ÜÙ\™\]X[
+œ™\Ú˜Z[\™Kœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNØ\ÜÙ\›X]Ú
+[[Y[Ë]K^ÛÛ[ú`bú(c8àk¹§ 9¥¬9â­¹¡bøà¤¹cå¹o¥øàiøàcxào¸àføà¤ËÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹^ÛÛ[	ù§ 9¥¬9â­¹¡bøà¤¹è®º*£xàfxà¢ÉÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹˜[ÙJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆÛÛœÝœ™\ÚšY]Ï^Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[XÝ[ÛŽ™[[Y[Ë˜XÝ[Û‹^ÛÛ[\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_NØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒ_JJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™Y\\]X[
+Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[XÝ[ÛŽ™[[Y[Ë˜XÝ[Û‹^ÛÛ[\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_Kœ™\ÚšY]ÊNÂˆ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËŒ×KÉÙš]™\‹X‰ËWJNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	ÜÝ[HØ[˜XÚÈØ[››Ý[\œ\Hœ™\Ú\Ù\ÜÚ[Ûˆ›ÝYšXØ][Ûˆ™\šYšXØ][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™[X\ÙQœ™\Ú™\šYšXØ][ÛŽÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×K™\šYšXØ][ÛœÏV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÝ›ÝÈ\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ]›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙQœ™\Ú™\šYšXØ][ÛJ
+OOœ™\ÛÛ™JÝ™\šYšYYY_JNßJNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒ_JJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒŸJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÝÚ[J\™[X\ÙQœ™\Ú™\šYšXØ][ÛŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNÂˆÛÛœÝ[™[™ÕšY]Ï^Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[XÝ[ÛŽ™[[Y[Ë˜XÝ[Û‹^ÛÛ[Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_NØÛÛœÝÝ[OX]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒßJNØ\ÜÙ\™\]X[
+Ý[Kœ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™Y\\]X[
+Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[XÝ[ÛŽ™[[Y[Ë˜XÝ[Û‹^ÛÛ[Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_K[™[™ÕšY]ÊNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËWKÉÙš]™\‹X‰Ë—WJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNÂˆ™[X\ÙQœ™\Ú™\šYšXØ][ÛŠ
+NØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	ÜÝ[HØ[˜XÚÈØ[››Ý[\ˆHœ™\Ú\Ù\ÜÚ[Ûˆ™\šYšXØ][Ûˆ˜Z[\™IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™Z™XÝœ™\Ú™\šYšXØ][ÛŽÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×K™\šYšXØ][ÛœÏV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÝ›ÝÈ\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ]›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆ™]È›ÛZ\ÙJ
+Ü™\ÛÛ™K™Z™XÝ
+OOžÜ™Z™XÝœ™\Ú™\šYšXØ][Û\™Z™XÝßJNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒŽJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒŽ_JJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÝÚ[J\™Z™XÝœ™\Ú™\šYšXØ][ÛŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÌJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËŽKÉÙš]™\‹X‰ËŽWWJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆ™Z™XÝœ™\Ú™\šYšXØ][ÛŠ\œ›ÜŠ	Ùœ™\Ú™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊJNØ]ØZ]›Ý]\‹šYJ
+NØ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\›X]Ú
+[[Y[Ë]K^ÛÛ[ú`bú(c8àk¹§ 9¥¬9â­¹¡bøà¤¹è®º*£xàiøàcxào¸àføà¤ËÊNØ\ÜÙ\›X]Ú
+[[Y[Ë›Y\ÜØYÙK^ÛÛ[ú!ê¹båyè®º*£xàkù`g9«h¸àeøào¸àeøàgËÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆÛÛœÝÝÜY^Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_NØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÌ_JJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_KÝÜY
+NØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ø]][XØ][ÛˆÜÜÈ™\XÙ\ÈHœ™\Ú\Ù\ÜÚ[Ûˆ[™[™È™\šYšXØ][ÛˆÚ]Û™H™X]][XØ][ÛˆXÝ[Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™Z™XÝœ™\Ú™\šYšXØ][Û‹[˜]˜Z[X›OLÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×K™\šYšXØ][ÛœÏV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÝ›ÝÈ\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ]›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆ™]È›ÛZ\ÙJ
+Ü™\ÛÛ™K™Z™XÝ
+OOžÜ™Z™XÝœ™\Ú™\šYšXØ][Û\™Z™XÝßJNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÝ[˜]˜Z[X›JÏLNÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÌŸJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XI×JNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÌßJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÝÚ[J\™Z™XÝœ™\Ú™\šYšXØ][ÛŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÙ]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+[˜]˜Z[X›KJNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹^ÛÛ[	ùonyblº`n9¢§¸àn9¢.øà¢ÉÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹˜[ÙJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNØ\ÜÙ\›X]Ú
+[[Y[Ë]K^ÛÛ[ú*£z*/8à®øààøà­øàéøàìËÊNÂˆÛÛœÝ™X]]šY]Ï^Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[XÝ[ÛŽ™[[Y[Ë˜XÝ[Û‹^ÛÛ[Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_NÜ™Z™XÝœ™\Ú™\šYšXØ][ÛŠ\œ›ÜŠ	Û]H™\šYšXØ][Ûˆ˜Z[\™IÊJNØ]ØZ]›Ý]\‹šYJ
+NØ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[XÝ[ÛŽ™[[Y[Ë˜XÝ[Û‹^ÛÛ[Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_K™X]]šY]ÊNØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÍJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÍJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËÌ—KÉÙš]™\‹X‰ËÌ×WJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝŠNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	ÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ý\™Ù\ÜÚ[Ûˆ™[XZ[œÈXÝ]™HY\ˆ]][XØ][ÛˆÜÜÈ\š[™Èœ™\Ú™\šYšXØ][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™Z™XÝœ™\Ú™\šYšXØ][ÛŽÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×K™\šYšXØ][ÛœÏV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÚYŠÙ\ÜÚ[Ûš[™[™ÈOOXXØÛÝ[ÖÌ—J]›ÝÈ\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆÜ›ØÙ\ÜÙYYK™X\ÛÛŽ‰Û›ÝYšXØ][Û—Ø\YY	ßNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ]›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆ™]È›ÛZ\ÙJ
+Ü™\ÛÛ™K™Z™XÝ
+OOžÜ™Z™XÝœ™\Ú™\šYšXØ][Û\™Z™XÝßJNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÍ_JJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÍŸJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÝÚ[J\™Z™XÝœ™\Ú™\šYšXØ][ÛŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNÂˆÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÙ]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹^ÛÛ[	ùonyblº`n9¢§¸àn9¢.øà¢ÉÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNÂˆ\ÜÙ\™\]X[
+
+]ØZ]˜[˜XÚÑÛK˜XÝ]˜]J
+JKœ™X\ÛÛ‹	ÙÛWØœšYÙWÜÝ[IÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ü›ÛIÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK
+NÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌ—NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝÊNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœÖÌ—KœÙ\ÜÚ[Ûš[™[™ËXØÛÝ[ÖÌ—JNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNÂˆÛÛœÝÝ\œ™[X]ØZ]ÝXœØÜš\[ÛœÖÌ—K›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÍßJNØ\ÜÙ\™\]X[
+Ý\œ™[œ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+Ý\œ™[œ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ø\YY	ÊNØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÎJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÎJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNÂˆÛÛœÝÝ\œ™[šY]Ï^Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_NÜ™Z™XÝœ™\Ú™\šYšXØ][ÛŠ\œ›ÜŠ	Û]H™\šYšXØ][Ûˆ˜Z[\™IÊJNØ]ØZ]›Ý]\‹šYJ
+NØ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_KÝ\œ™[šY]ÊNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËÍWKÉÙš]™\‹X‰ËÍ—KÉÙš]™\‹XÉËÍ×WJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝÊNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ý\™\Ù\ÜÚ[Ûˆ›ÝYšXØ][ÛˆÚ[œÈÝ™\ˆ[^YYÛ™\šYšXØ][ÛˆÝXØÙ\ÜÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™[X\ÙSÛ™\šYšXØ][Û‹™[X\ÙPÝ\œ™[[ÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×K™\šYšXØ][ÛœÏV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[ŠÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÚYŠÙ\ÜÚ[Ûš[™[™ÈOOXXØÛÝ[ÖÌ—J\™]\›ˆ›ÛZ\ÙKœ™Z™XÝ
+\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊJNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙPÝ\œ™[[\™\ÛÛ™NßJNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ]›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙSÛ™\šYšXØ][Û\™\ÛÛ™NßJNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŒÎ_JJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XI×JNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÝÚ[J\™[X\ÙSÛ™\šYšXØ][ÛŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNÂˆÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÙ]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+
+]ØZ]˜[˜XÚÑÛK˜XÝ]˜]J
+JKœ™X\ÛÛ‹	ÙÛWØœšYÙWÜÝ[IÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌ—NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝÊNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNÂˆÛÛœÝÝ\œ™[[\ÝXœØÜš\[ÛœÖÌ—K›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽ_JNÝÚ[J\™[X\ÙPÝ\œ™[[
+X]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËÎWKÉÙš]™\‹X‰ËKÉÙš]™\‹XÉËWWJNØÛÛœÝÝ\œ™[šY]Ï^Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_NÂˆ™[X\ÙSÛ™\šYšXØ][ÛŠÝ™\šYšYYY_JNØ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŸJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŸJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™Y\\]X[
+Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_KÝ\œ™[šY]ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÂˆ™[X\ÙPÝ\œ™[[
+Ü›ØÙ\ÜÙYYK™X\ÛÛŽ‰Û›ÝYšXØ][Û—Ø\YY	ßJNØÛÛœÝÝ\œ™[X]ØZ]Ý\œ™[[Ø]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™\]X[
+Ý\œ™[œ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+Ý\œ™[œ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ø\YY	ÊNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝÊNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ø]][XØ][ÛˆÜÜÈ\š[™È\™\Ù\ÜÚ[Ûˆ›ÝYšXØ][Ûˆ\ØØ\™È›ÝÝ\œ™[[™ÛÛÜšÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™[X\ÙSÛ™\šYšXØ][Û‹™[X\ÙPÝ\œ™[[[˜]˜Z[X›OLÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×K™\šYšXØ][ÛœÏV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[ŠÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÚYŠÙ\ÜÚ[Ûš[™[™ÈOOXXØÛÝ[ÖÌ—J\™]\›ˆ›ÛZ\ÙKœ™Z™XÝ
+\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊJNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙPÝ\œ™[[\™\ÛÛ™NßJNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ]›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙSÛ™\šYšXØ][Û\™\ÛÛ™NßJNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÝ[˜]˜Z[X›JÏLNÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽßJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÝÚ[J\™[X\ÙSÛ™\šYšXØ][ÛŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÜÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÙ]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+[˜]˜Z[X›KJNØ\ÜÙ\™\]X[
+
+]ØZ]˜[˜XÚÑÛK˜XÝ]˜]J
+JKœ™X\ÛÛ‹	ÙÛWØœšYÙWÜÝ[IÊNÂˆÙ\ÜÚ[ÛXXØÛÝ[ÖÌ—NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØÛÛœÝÝ\œ™[[\ÝXœØÜš\[ÛœÖÌ—K›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽ_JNÝÚ[J\™[X\ÙPÝ\œ™[[
+X]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIË×KÉÙš]™\‹X‰ËKÉÙš]™\‹XÉËWWJNÂˆÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÙ]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›Iß[˜]˜Z[X›HOOLŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹^ÛÛ[	ùonyblº`n9¢§¸àn9¢.øà¢ÉÊNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹˜[ÙJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊKJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›YYJNØ\ÜÙ\›X]Ú
+[[Y[Ë]K^ÛÛ[ú*£z*/8à®øààøà­øàéøàìËÊNÂˆÛÛœÝ™X]]šY]Ï^Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[XÝ[ÛŽ™[[Y[Ë˜XÝ[Û‹^ÛÛ[Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_NÜ™[X\ÙSÛ™\šYšXØ][ÛŠÝ™\šYšYYY_JNÜ™[X\ÙPÝ\œ™[[
+Ü›ØÙ\ÜÙYYK™X\ÛÛŽ‰Û›ÝYšXØ][Û—Ø\YY	ßJNØÛÛœÝÝ[PÝ\œ™[X]ØZ]Ý\œ™[[Ø]ØZ]›Ý]\‹šYJ
+NØ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+Ý[PÝ\œ™[œ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ý[PÝ\œ™[œ™X\ÛÛ‹	ØœšYÙWÜÝ[IÊNØ\ÜÙ\™Y\\]X[
+Ý]N™[[Y[Ë]K^ÛÛ[Y\ÜØYÙN™[[Y[Ë›Y\ÜØYÙK^ÛÛ[XÝ[ÛŽ™[[Y[Ë˜XÝ[Û‹^ÛÛ[Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_K™X]]šY]ÊNÂˆ›ÜŠÛÛœÝÝXœØÜš\[ÛˆÙˆÝXœØÜš\[ÛœÊX\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[Û‹›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽŸJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™ÝÊNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	ÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	ÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K˜XÝ[Û‹	Ü™X]]	ÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ù›Ý\Ù\ÜÚ[Ûˆ™Y[žH™Z™XÝÈ[™YH\\YÙ[™\˜][ÛœÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉË	Ùš]™\‹Y	×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™[X\ÙSÛ™\šYšXØ][Û‹™[X\ÙU\™[ÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×K™\šYšXØ][ÛœÏV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[ŠÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌ—J\™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙU\™[\™\ÛÛ™NßJNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌ×J\™]\›ˆ›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙYYK™X\ÛÛŽ‰Û›ÝYšXØ][Û—Ø\YY	ßJNÜ™]\›ˆ›ÛZ\ÙKœ™Z™XÝ
+\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊJNßKˆ™\šYžS]\Ý˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ]›ÝÈ\œ›ÜŠ	Ý™\šYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙSÛ™\šYšXØ][Û\™\ÛÛ™NßJNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽßJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÝÚ[J\™[X\ÙSÛ™\šYšXØ][ÛŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÂˆÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+
+]ØZ]˜[˜XÚÑÛK˜XÝ]˜]J
+JKœ™X\ÛÛ‹	ÙÛWØœšYÙWÜÝ[IÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌ—NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØÛÛœÝ\™[\ÝXœØÜš\[ÛœÖÌ—K›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽ_JNÝÚ[J\™[X\ÙU\™[
+X]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÂˆÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÙ]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+
+]ØZ]˜[˜XÚÑÛK˜XÝ]˜]J
+JKœ™X\ÛÛ‹	ÙÛWØœšYÙWÜÝ[IÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌ×NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉË	Ùš]™\‹Y	×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™Ý
+NØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœÖÌ×KœÙ\ÜÚ[Ûš[™[™ËXØÛÝ[ÖÌ×JNÂˆÛÛœÝ›Ý\X]ØZ]ÝXœØÜš\[ÛœÖÌ×K›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽLJNØ\ÜÙ\™\]X[
+›Ý\œ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+›Ý\œ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ø\YY	ÊNØÛÛœÝ›Ý\šY]Ï^Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_NÜ™[X\ÙSÛ™\šYšXØ][ÛŠÝ™\šYšYYY_JNÜ™[X\ÙU\™[
+Ü›ØÙ\ÜÙYYK™X\ÛÛŽ‰Û›ÝYšXØ][Û—Ø\YY	ßJNØÛÛœÝÝ[U\™X]ØZ]\™[Ø]ØZ]›Ý]\‹šYJ
+NØ]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+Ý[U\™œ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ý[U\™œ™X\ÛÛ‹	ØœšYÙWÜÝ[IÊNÂˆ›ÜŠÛÛœÝÝXœØÜš\[ÛˆÙˆÝXœØÜš\[ÛœËœÛXÙJÊJX\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[Û‹›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽL_JJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™Y\\]X[
+Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊ_K›Ý\šY]ÊNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIË×KÉÙš]™\‹X‰ËKÉÙš]™\‹XÉËWKÉÙš]™\‹Y	ËLWJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉË	Ùš]™\‹Y	×JNØ\ÜÙ\™\]X[
+ÝXœØÜš\[ÛœË›[™Ý
+NØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ù›Ý\\Ù\ÜÚ[Ûˆ›ÝYšXØ][ÛˆÝ\š]™\È[^YY˜Z[\™\Èœ›ÛH[\\YÙ[™\˜][ÛœÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K]™[\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[[Y[ÏY™YY˜XÚÑÛQ[[Y[Ê
+K˜[˜XÚÕZOT‹˜Ü™X]PÛÛ[X[™ZPÛÛ›Û\Š	Ùš]™\‰ÊKXØÛÝ[ÏVÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉË	Ùš]™\‹Y	×K›X\
+XØÛÝ[™YO“Øš™XÝ™œ™Y^™JØXØÛÝ[™Y‹šY]Ù\”›ÛN‰Ùš]™\‰ßJJNÛ]YÙOIÜ›ÛIËÙ\ÜÚ[ÛXXØÛÝ[ÖÌK›Ý]\‹™Z™XÝš\œÝ™\šYšXØ][Û‹™Z™XÝÙXÛÛ™™\šYšXØ][Û‹™Z™XÝ\™[™[X\ÙQ›Ý\[ÂˆÛÛœÝ™XYÏV×KÝXœØÜš\[ÛœÏV×K\ØÛÛ›™XÝ[ÛœÏV×K[™YV×K™\šYšXØ][ÛœÏV×NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÂˆÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[Û‹ˆ™XYÝ\œ™[šYN˜\Þ[˜ÊÜÙ\ÜÚ[Ûš[™[™ßJOOžÜ™XYËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆÜÝ]\ÎŒŒNßKˆÝXœØÜšX™S›ÝYšXØ][ÛœÎ˜\Þ[˜ÈÛÛ^OžÜÝXœØÜš\[ÛœËœ\Ú
+ÛÛ^
+NÜ™]\›Š
+OO™\ØÛÛ›™XÝ[ÛœËœ\Ú
+ÛÛ^œÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNßKˆ[™S›ÝYšXØ][Û’[ŠÜÙ\ÜÚ[Ûš[™[™Ë[JOOžÚ[™Yœ\Ú
+ÜÙ\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™Y‹[œ™]š\Ú[Û—JNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌ_Ù\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌWJ\™]\›ˆ›ÛZ\ÙKœ™Z™XÝ
+\œ›ÜŠ	Û›ÝYšXØ][Ûˆ˜[œÜÜ˜Z[Y	ÊJNÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌ—J\™]\›ˆ™]È›ÛZ\ÙJ
+™\ÛÛ™K™Z™XÝ
+OOžÜ™Z™XÝ\™[\™Z™XÝßJNÜ™]\›ˆ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙQ›Ý\[\™\ÛÛ™NßJNßKˆ™\šYžS]\ÝŠÜÙ\ÜÚ[Ûš[™[™ßJOOžÝ™\šYšXØ][ÛœËœ\Ú
+Ù\ÜÚ[Ûš[™[™Ë˜XØÛÝ[™YŠNÜ™]\›ˆ™]È›ÛZ\ÙJ
+™\ÛÛ™K™Z™XÝ
+OOžÚYŠÙ\ÜÚ[Ûš[™[™ÏOOXXØÛÝ[ÖÌJ\™Z™XÝš\œÝ™\šYšXØ][Û\™Z™XÝÙ[ÙH™Z™XÝÙXÛÛ™™\šYšXØ][Û\™Z™XÝßJNßBˆJNÂˆÛÛœÝ˜[˜XÚÑÛOT‹˜Ü™X]PÛÛ[X[™™YY˜XÚÑÛPœšYÙJØÛÛ[X[™ZN™˜[˜XÚÕZK[[Y[ËXÝ]˜]N˜XÝ[ÛO˜XÝ[ÛOOIÜ™X]]	ÏÜ›Ý]\‹›˜]šYØ]J	Ü›ÛIÊN”›ÛZ\ÙKœ™\ÛÛ™JÜ›ØÙ\ÜÙY™˜[ÙK™X\ÛÛŽ‰ØXÝ[Û—Û›ÝØ]˜Z[X›IßJ_JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYO”‹˜Ü™X]T›ÛTÙ\šXÙSY™XÞXÛJÜÙ\šXÙ\Îš[š™XÝY[[Y[Ë]™[\™Ù]ØÝ[Y[Ý]NžÝš\ÚXš[]TÝ]N‰Ýš\ÚX›IßK˜]šYØ]N\™Ù]OœYÙOOO]\™Ù]Û[œ›Ý]\‹›˜]šYØ]J\™Ù]
+KÝÜ˜YÙN›Y[[ÜžTÝÜ˜YÙJ
+_JK™[™\•[˜]˜Z[X›NšY]ÏOžÙ˜[˜XÚÕZKœÙ]›ÛJšY]Ëœ›ÛJNÙ˜[˜XÚÕZK˜\Q™YY˜XÚÊšY]Ëœ›ÛK˜[˜XÚÕZKœÛ˜\ÚÝ
+
+K™Ù[™\˜][Û‹šY]Ë›Ý]ÛÛYKÝ]NšY]Ë]KY\ÜØYÙNšY]Ë›Y\ÜØYÙK\ØX›PÛÛ[X[™ÎšY]Ë™\ØX›PÛÛ[X[™ËXÝ[ÛŽšY]Ë˜XÝ[ÛŸJNÙ˜[˜XÚÑÛK˜]XÚ
+
+NÙ˜[˜XÚÑÛKœ™[™\Š
+NßKÛX\•[˜]˜Z[X›NŠ
+OOžÙ˜[˜XÚÕZK˜ÛX\Š
+NÙ˜[˜XÚÑÛK™]XÚ
+
+Nß_JNÂˆ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]™XY\ÚŠ
+OOœYÙK™\ÛÛ™N\™Ù]YÙOO\™Ù]YÙOOOIÜ›ÛIÏÞÜYÙN‰Ü›ÛIË›ÛN›[NžÜYÙN\™Ù]YÙK›ÛN‰Ùš]™\‰ßK™[™\Ž™\Ý[˜][ÛOžÜYÙOY\Ý[˜][Û‹œYÙNß_JNÜ›Ý]\‹˜]XÚ
+
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽLŸJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÝÚ[J\™Z™XÝš\œÝ™\šYšXØ][ÛŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊJKœ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌWNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆ\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[ÛœÖÌWK›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽLßJJKœ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ù˜Z[Y	ÊNÙ[[Y[Ë˜XÝ[Û‹™\Ü]Ú
+	ØÛXÚÉÊNÝÚ[J\™Z™XÝÙXÛÛ™™\šYšXØ][ÛŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÜÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌ—NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNÂˆÛÛœÝ\™[\ÝXœØÜš\[ÛœÖÌ—K›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽMJNÝÚ[J\™Z™XÝ\™[
+X]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÜÙ\ÜÚ[Û[[Ù]™[\™Ù]™\Ü]Ú
+	ÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙY	ÊNÝÚ[J[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛˆOOIÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÜÙ\ÜÚ[ÛXXØÛÝ[ÖÌ×NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØÛÛœÝ›Ý\[\ÝXœØÜš\[ÛœÖÌ×K›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽM_JNÝÚ[J\™[X\ÙQ›Ý\[
+X]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNÂˆÛÛœÝ›Ý\šY]Ï^Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK[[YPXÝ[ÛŽœ[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹›Ý]\XÝ[ÛŽœ›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛŸNÜ™Z™XÝš\œÝ™\šYšXØ][ÛŠ\œ›ÜŠ	ÛÛš\œÝ™\šYšXØ][Ûˆ˜Z[Y	ÊJNÜ™Z™XÝÙXÛÛ™™\šYšXØ][ÛŠ\œ›ÜŠ	ÛÛÙXÛÛ™™\šYšXØ][Ûˆ˜Z[Y	ÊJNÜ™Z™XÝ\™[
+\œ›ÜŠ	ÛÛ\™›ÝYšXØ][Ûˆ˜Z[Y	ÊJNØÛÛœÝÝ[U\™X]ØZ]\™[Ø]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØ\ÜÙ\™\]X[
+Ý[U\™œ›ØÙ\ÜÙY˜[ÙJNØ\ÜÙ\™\]X[
+Ý[U\™œ™X\ÛÛ‹	ØœšYÙWÜÝ[IÊNØ\ÜÙ\™Y\\]X[
+Ø›ÞY[Ž™[[Y[Ë˜›ÞšY[‹XÝ[Û’Y[Ž™[[Y[Ë˜XÝ[Û‹šY[‹\ØX›Y™[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y\Ý[™\œÎ™[[Y[Ë˜XÝ[Û‹›\Ý[™\ÛÝ[
+	ØÛXÚÉÊK[[YPXÝ[ÛŽœ[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹›Ý]\XÝ[ÛŽœ›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[ÛŸK›Ý\šY]ÊNÂˆ™[X\ÙQ›Ý\[
+Ü›ØÙ\ÜÙYYK™X\ÛÛŽ‰Û›ÝYšXØ][Û—Ø\YY	ßJNØÛÛœÝ›Ý\X]ØZ]›Ý\[Ø]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™\]X[
+›Ý\œ›ØÙ\ÜÙYYJNØ\ÜÙ\™\]X[
+›Ý\œ™X\ÛÛ‹	Û›ÝYšXØ][Û—Ø\YY	ÊNÙ›ÜŠÛÛœÝÝXœØÜš\[ÛˆÙˆÝXœØÜš\[ÛœËœÛXÙJÊJX\ÜÙ\™\]X[
+
+]ØZ]ÝXœØÜš\[Û‹›Û’[
+Ý\N‰ÜšYK˜Ú[™ÙY	ËšYRY‰Ùš^\™K\šYIË™]š\Ú[ÛŽMŸJJKœ™X\ÛÛ‹	ÜÝXœØÜš\[Û—Ú[˜XÝ]™IÊNØ\ÜÙ\™Y\\]X[
+[™YÖÉÙš]™\‹XIËL—KÉÙš]™\‹X‰ËL×KÉÙš]™\‹XÉËMKÉÙš]™\‹Y	ËMWWJNØ\ÜÙ\™Y\\]X[
+™\šYšXØ][ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰×JNØ\ÜÙ\™Y\\]X[
+™XYËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉË	Ùš]™\‹Y	×JNØ\ÜÙ\™Y\\]X[
+\ØÛÛ›™XÝ[ÛœËÉÙš]™\‹XIË	Ùš]™\‹X‰Ë	Ùš]™\‹XÉ×JNØ\ÜÙ\™\]X[
+[[Y[Ë˜›ÞšY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜XÝ[Û‹šY[‹YJNØ\ÜÙ\™\]X[
+[[Y[Ë˜ÛÛ[X[™]ÛœÖÌK™\ØX›Y˜[ÙJNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNÙ›ÜŠÛÛœÝXØÛÝ[ÙˆXØÛÝ[ÊX\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJÜ[[YKœÛ˜\ÚÝ
+
+K›Ý]\‹œÛ˜\ÚÝ
+
+K˜[˜XÚÕZKœÛ˜\ÚÝ
+
+WJKš[˜ÛY\ÊXØÛÝ[˜XØÛÝ[™YŠK˜[ÙJNÂŸJNÂ\Ý
+	Ü›ÛK\YÙH[[YHÝÜÈØY™[HÚ[ˆ[š™XÝYÙ\šXÙ\È\™H›ÝÛÛ™šYÝ\™Y	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KšY]ÜÏV×NÛ]˜XÝÜšY\ÏLÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\Î›[Ü™X]SY™XÞXÛNŠ
+OOžÙ˜XÝÜšY\ÊÏLNßK™[™\•[˜]˜Z[X›NšY]ÏOšY]ÜËœ\Ú
+šY]Ê_JNÂˆÛÛœÝ™\Ý[X]ØZ][[YK™[\Š	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[™[\™Y˜[ÙJNØ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	ÜÙ\šXÙ\×Ý[˜]˜Z[X›IÊNØ\ÜÙ\™\]X[
+˜XÝÜšY\Ë
+NØ\ÜÙ\™\]X[
+šY]ÜË›[™ÝJNØ\ÜÙ\™\]X[
+šY]ÜÖÌKœ›ÛK	Ü\ÜÙ[™Ù\‰ÊNØ\ÜÙ\™\]X[
+šY]ÜÖÌK™\ØX›PÛÛ[X[™ËYJNØ\ÜÙ\™\]X[
+šY]ÜÖÌK˜XÝ[Û‹[
+NØ\ÜÙ\›X]Ú
+šY]ÜÖÌK]Kù§*º*+yk¦‹ÊNØ\ÜÙ\›X]Ú
+šY]ÜÖÌK›Y\ÜØYÙKú`&¹/èxàkú(c8àhøài¸àa8ào¸àføà¤ËÊNÂˆ\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\Ê[[YKœÛ˜\ÚÝ
+
+JKœÛÜ
+
+KÉØXÝ]™T›ÛIË	Ø\ÞIË	Û\ÝXÝ[Û‰Ë	ÜYÙIË	Ü™]š\Ú[Û‰Ë	ÜÙ\šXÙTÝ]I×JNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+KœÙ\šXÙTÝ]K	Ý[˜ÛÛ™šYÝ\™Y	ÊNÂŸJNÂ\Ý
+	Ü\X[›ÛHÙ\šXÙH[š™XÝ[ÛˆØ[››Ý™HZ\ÝZÙ[ˆ›ÜˆH]™HÛÛ›™XÝ[Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KšY]ÜÏV×NÛ]Ù\ÜÚ[ÛœÏL˜XÝÜšY\ÏLÂˆÛÛœÝÙ\šXÙ\Ï^ØÛÛ™šYÝ\™YYKÙ\ÜÚ[Û‘›Ü”›ÛJ
+^ÜÙ\ÜÚ[ÛœÊÏLNÜ™]\›ˆÝšY]Ù\”›ÛN‰Ùš]™\‰ßNß_NÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNŠ
+OOžÙ˜XÝÜšY\ÊÏLNßK™[™\•[˜]˜Z[X›NšY]ÏOšY]ÜËœ\Ú
+šY]Ê_JNÂˆÛÛœÝ™\Ý[X]ØZ][[YK™[\Š	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	ÜÙ\šXÙ\×Ý[˜]˜Z[X›IÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+KœÙ\šXÙTÝ]K	Ý[˜ÛÛ™šYÝ\™Y	ÊNØ\ÜÙ\™\]X[
+Ù\ÜÚ[ÛœË
+NØ\ÜÙ\™\]X[
+˜XÝÜšY\Ë
+NØ\ÜÙ\™\]X[
+šY]ÜÖÌK˜XÝ[Û‹[
+NÂŸJNÂ\Ý
+	ØÛÛ™šYÝ\™Y›ÛK\YÙH[[YH[\œÈÛ˜ÙH[™™\Ù\™\È]ÈÙ[™\˜][ÛˆXÜ›ÜÜÈ›ÛH˜]šYØ][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÙ\ÜÚ[Û^ØXØÛÝ[‰Üš]˜]K\\ÜÙ[™Ù\‰ßKØ[ÏV×NÛ]˜XÝÜšY\ÏLÛX\œÏLÂˆÛÛœÝY™XÞXÛO^ÜÛ˜\ÚÝŠ
+OOŠØXÝ]™T›ÛN‰Ü\ÜÙ[™Ù\‰ßJK[\Ž˜\Þ[˜Ê›ÛKÜ[ÛœÊOOžØØ[Ëœ\Ú
+ÉÙ[\‰Ë›ÛKÜ[ÛœËœÙ\ÜÚ[Ûš[™[™×JNÜ™]\›ˆÙ[\™YYK™X\ÛÛŽ‰Ù[\™Y	ßNßKX]™NŠ
+OOžØØ[Ëœ\Ú
+ÉÛX]™I×JNÜ™]\›ˆÛYY_NßKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÜÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[ÛŸJNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNš[š™XÝYOžÙ˜XÝÜšY\ÊÏLNØ\ÜÙ\™\]X[
+[š™XÝYÙ\šXÙ\ÊNÜ™]\›ˆY™XÞXÛNßKÛX\•[˜]˜Z[X›NŠ
+OOžØÛX\œÊÏLNß_JNÂˆ\ÜÙ\™\]X[
+
+]ØZ][[YK™[\Š	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊJKœ™X\ÛÛ‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+
+]ØZ][[YK™[\Š	Ü\ÜÙ[™Ù\‹Z\ÝÜžIË	Ü\ÜÙ[™Ù\‰ÊJKœ™X\ÛÛ‹	ÝÚ][—Ü›ÛIÊNÂˆ\ÜÙ\™\]X[
+˜XÝÜšY\ËJNØ\ÜÙ\™\]X[
+Ø[Ë›[™ÝJNØ\ÜÙ\™\]X[
+Ø[ÖÌVÌ—KÙ\ÜÚ[ÛŠNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+KœYÙK	Ü\ÜÙ[™Ù\‹Z\ÝÜžIÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ü\ÜÙ[™Ù\‰ÊNØ\ÜÙ\›ÚÊÛX\œÏLŠNØ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJ[[YKœÛ˜\ÚÝ
+
+JKš[˜ÛY\Ê	Üš]˜]K\\ÜÙ[™Ù\‰ÊK˜[ÙJNÂˆÛÛœÝY\[[YK›X]™J
+NØ\ÜÙ\™\]X[
+Y›YYJNØ\ÜÙ\™\]X[
+Ø[Ë˜]
+LJVÌK	ÛX]™IÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK[
+NÂŸJNÂ\Ý
+	ÛZ\ÜÚ[™È]][XØ]YÙ\ÜÚ[Ûˆ›ØÚÜÈY™XÞXÛHÜ™X][Ûˆ[™[Ù\šXÙHKÓÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KšY]ÜÏV×NÛ]˜XÝÜšY\ÏLÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÜÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OO›[JNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNŠ
+OOžÙ˜XÝÜšY\ÊÏLNßK™[™\•[˜]˜Z[X›NšY]ÏOšY]ÜËœ\Ú
+šY]Ê_JNÂˆÛÛœÝ™\Ý[X]ØZ][[YK™[\Š	Ùš]™\‹]š\ÉË	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	ÜÙ\ÜÚ[Û—Ý[˜]˜Z[X›IÊNØ\ÜÙ\™\]X[
+˜XÝÜšY\Ë
+NØ\ÜÙ\™\]X[
+šY]ÜÖÌKœ›ÛK	Ùš]™\‰ÊNØ\ÜÙ\›X]Ú
+šY]ÜÖÌK]Kú*£z*/8à®øààøà­øàéøàìËÊNØ\ÜÙ\™\]X[
+šY]ÜÖÌK›Ý]ÛÛYK	Ü™X]]	ÊNØ\ÜÙ\™\]X[
+šY]ÜÖÌK™\ØX›PÛÛ[X[™ËYJNØ\ÜÙ\™\]X[
+šY]ÜÖÌK˜XÝ[Û‹	Ü™X]]	ÊNÂŸJNÂ\Ý
+	ØÛÛ™šYÝ\™YY™XÞXÛH[žH˜Z[\™HÝÜÈ[™Ø[››Ý™H™]\ÙY\È[ˆXÝ]™HYÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+KÙ\ÜÚ[Û^ØXØÛÝ[‰Üš]˜]IßKšY]ÜÏV×NÛ][šY\ÏLX]™\ÏLÂˆÛÛœÝY™XÞXÛO^ÜÛ˜\ÚÝŠ
+OOŠßJK[\Ž˜\Þ[˜Ê
+OOžÙ[šY\ÊÏLNÜ™]\›ˆÙ[\™Y™˜[ÙK™X\ÛÛŽ‰Ù[žWÜ™Z™XÝY	ßNßKX]™NŠ
+OOžÛX]™\ÊÏLNÜ™]\›ˆÛYY_NßKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÜÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[ÛŸJNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNŠ
+OO›Y™XÞXÛK™[™\•[˜]˜Z[X›NšY]ÏOšY]ÜËœ\Ú
+šY]Ê_JNÂˆÛÛœÝš\œÝX]ØZ][[YK™[\Š	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊKÙXÛÛ™X]ØZ][[YK™[\Š	Ü\ÜÙ[™Ù\‹Z\ÝÜžIË	Ü\ÜÙ[™Ù\‰ÊNÂˆ\ÜÙ\™\]X[
+š\œÝœ™X\ÛÛ‹	Ù[žWÙ˜Z[Y	ÊNØ\ÜÙ\™\]X[
+ÙXÛÛ™œ™X\ÛÛ‹	Ù[žWÙ˜Z[Y	ÊNØ\ÜÙ\™\]X[
+[šY\ËŠNØ\ÜÙ\™\]X[
+X]™\ËŠNØ\ÜÙ\™\]X[
+šY]ÜË›[™ÝŠNØ\ÜÙ\™\]X[
+šY]ÜÖÌK˜XÝ[Û‹	Ü™X]]	ÊNØ\ÜÙ\›X]Ú
+šY]ÜÖÌK]Kúe¢ùiâøàiøàcxào¸àføà¤ËÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[žWÙ˜Z[Y	ÊNÂŸJNÂ\Ý
+	Ü›ÛHÝÚ]Ú™Z™XÝÈH[^YYÛ[[YH[žHÚ]Ý]^ÜÚ[™ÈÙ\ÜÚ[Ûˆš[™[™ÜÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\ÜÙ[™Ù\”Ù\ÜÚ[Û^ØXØÛÝ[‰Üš]˜]KXIßKš]™\”Ù\ÜÚ[Û^ØXØÛÝ[‰Üš]˜]KX‰ßNÛ]™[X\ÙT\ÜÙ[™Ù\ŽÂˆÛÛœÝY™XÞXÛO^ÜÛ˜\ÚÝŠ
+OOŠßJK[\Žœ›ÛOOœ›ÛOOOIÜ\ÜÙ[™Ù\‰ÏÛ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙT\ÜÙ[™Ù\\™\ÛÛ™NßJN”›ÛZ\ÙKœ™\ÛÛ™JÙ[\™YYK™X\ÛÛŽ‰Ù[\™Y	ßJKX]™NŠ
+OOŠÛYY_JKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÜÙ\ÜÚ[Û‘›Ü”›ÛNœ›ÛOOœ›ÛOOOIÜ\ÜÙ[™Ù\‰ÏÜ\ÜÙ[™Ù\”Ù\ÜÚ[ÛŽ™š]™\”Ù\ÜÚ[ÛŸJNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNŠ
+OO›Y™XÞXÛ_JNÂˆÛÛœÝÛ\[[YK™[\Š	ÚÛYIË	Ü\ÜÙ[™Ù\‰ÊNÝÚ[J\™[X\ÙT\ÜÙ[™Ù\ŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØÛÛœÝœ™\ÚX]ØZ][[YK™[\Š	Ùš]™\‹ZÛYIË	Ùš]™\‰ÊNÜ™[X\ÙT\ÜÙ[™Ù\ŠÙ[\™YYK™X\ÛÛŽ‰Ù[\™Y	ßJNØÛÛœÝÝ[OX]ØZ]ÛÂˆ\ÜÙ\™\]X[
+œ™\Ú™[\™YYJNØ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÙ[žIÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØÛÛœÝX›XÔÝ]OR”ÓÓ‹œÝš[™ÚYžJ[[YKœÛ˜\ÚÝ
+
+JNØ\ÜÙ\™\]X[
+X›XÔÝ]Kš[˜ÛY\Ê	Üš]˜]KXIÊK˜[ÙJNØ\ÜÙ\™\]X[
+X›XÔÝ]Kš[˜ÛY\Ê	Üš]˜]KX‰ÊK˜[ÙJNÂŸJNÂ\Ý
+	Ü›ÛK\YÙH›Ý]\ˆ]XÚ\ÈÛ™H\Ú\Ý[™\ˆ[™›Ý]\È]ÈÝ\œ™[\™Ù]	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K[šY\ÏV×K™[™\œÏV×NÛ]\ÚIÚÛYIÎÂˆÛÛœÝ[[YO^ÜÛ˜\ÚÝŠ
+OOŠßJK[\Ž˜\Þ[˜ÊYÙK›ÛJOOžÙ[šY\Ëœ\Ú
+ÜYÙK›ÛWJNÜ™]\›ˆÙ[\™YYK™X\ÛÛŽ‰Ù[\™Y	ßNßKX]™NŠ
+OOŠÛYY_JKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]\™Ù]™XY\ÚŠ
+OOš\Ú™\ÛÛ™NœYÙOOŠÜYÙK›ÛN‰Ü\ÜÙ[™Ù\‰ßJK™[™\Ž˜[YOOœ™[™\œËœ\Ú
+˜[YKœYÙJ_JNÂˆ\ÜÙ\™\]X[
+›Ý]\‹˜]XÚ
+
+KœÝ\YYJNØ\ÜÙ\™\]X[
+›Ý]\‹˜]XÚ
+
+Kœ™X\ÛÛ‹	Ø[™XYWØ]XÚY	ÊNØ\ÜÙ\™\]X[
+\™Ù]›\Ý[™\ÛÝ[
+	Ú\ÚÚ[™ÙIÊKJNØ\ÜÙ\™\]X[
+\™Ù]˜YÛÝ[
+	Ú\ÚÚ[™ÙIÊKJNÂˆ\™Ù]™\Ü]Ú
+	Ú\ÚÚ[™ÙIÊNØ]ØZ]›Ý]\‹šYJ
+NØ\ÜÙ\™Y\\]X[
+[šY\ËÖÉÚÛYIË	Ü\ÜÙ[™Ù\‰×WJNØ\ÜÙ\™Y\\]X[
+™[™\œËÉÚÛYI×JNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	ÚÛYIÊNÂŸJNÂ\Ý
+	Ø›ÝÛK[Y[H˜]šYØ][Ûˆ™\Ù\™\ÈÛ™H[š™XÝY›ÛHY™XÞXÛHÙ[™\˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KÙ\ÜÚ[Û^ØXØÛÝ[‰Üš]˜]IßK™[™\œÏV×NÛ][šY\ÏLÂˆÛÛœÝY™XÞXÛO^ÜÛ˜\ÚÝŠ
+OOŠßJK[\Ž˜\Þ[˜Ê
+OOžÙ[šY\ÊÏLNÜ™]\›ˆÙ[\™YYK™X\ÛÛŽ‰Ù[\™Y	ßNßKX]™NŠ
+OOŠÛYY_JKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝÙ\šXÙ\ÏX[ÝÙY›ÛTÙ\šXÙ\ÊÜÙ\ÜÚ[Û‘›Ü”›ÛNŠ
+OOœÙ\ÜÚ[ÛŸJNÂˆÛÛœÝ[[YOT‹˜Ü™X]T›ÛTYÙT[[YJÜÙ\šXÙ\ËÜ™X]SY™XÞXÛNŠ
+OO›Y™XÞXÛ_JNÂˆÛÛœÝ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]\™Ù]™XY\ÚŠ
+OO‰ÉË™\ÛÛ™NœYÙOOŠÜYÙK›ÛN‰Ü\ÜÙ[™Ù\‰ßJK™[™\Ž˜[YOOœ™[™\œËœ\Ú
+˜[YKœYÙJ_JNÂˆ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	ÚÛYIÊJK›˜]šYØ]YYJNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü\ÜÙ[™Ù\‹Z\ÝÜžIÊJKœ™X\ÛÛ‹	ÝÚ][—Ü›ÛIÊNØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	Ü\ÜÙ[™Ù\‹XXØÛÝ[	ÊJKœ™X\ÛÛ‹	ÝÚ][—Ü›ÛIÊNÂˆ\ÜÙ\™\]X[
+[šY\ËJNØ\ÜÙ\™Y\\]X[
+™[™\œËÉÚÛYIË	Ü\ÜÙ[™Ù\‹Z\ÝÜžIË	Ü\ÜÙ[™Ù\‹XXØÛÝ[	×JNØ\ÜÙ\™\]X[
+[[YKœÛ˜\ÚÝ
+
+Kœ™]š\Ú[Û‹ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+Kœ™]š\Ú[Û‹ÊNÂŸJNÂ\Ý
+	Ü›ÛHÚÛÜÙ\ˆX]™\ÈH[[YH™Y›Ü™H™[™\š[™ÈHÚÛÜÙ\‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+KÜ™\V×NÂˆÛÛœÝ[[YO^ÜÛ˜\ÚÝŠ
+OOŠßJK[\Ž˜\Þ[˜Ê
+OOŠÙ[\™YY_JKX]™NŠ
+OOžÛÜ™\‹œ\Ú
+	ÛX]™IÊNÜ™]\›ˆÛYY_NßKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]\™Ù]™XY\ÚŠ
+OO‰ÉË™\ÛÛ™NŠ
+OOŠÜYÙN‰Ü›ÛIË›ÛN›[JK™[™\ŽŠ
+OO›Ü™\‹œ\Ú
+	Ü™[™\‰Ê_JNÂˆÛÛœÝ™\Ý[X]ØZ]›Ý]\‹›˜]šYØ]J	Ü›ÛIÊNØ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	Ü›ÛWØÚÛÜÙ\‰ÊNØ\ÜÙ\™Y\\]X[
+Ü™\‹ÉÛX]™IË	Ü™[™\‰×JNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK[
+NÂŸJNÂ\Ý
+	Ü˜\Y›ÛH˜]šYØ][ÛˆØ[››Ý™\Z[Üˆ™\ÝÜ™HH[^YYÛYÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+K™[™\œÏV×NÛ]™[X\ÙT\ÜÙ[™Ù\ŽÂˆÛÛœÝ[[YO^ÜÛ˜\ÚÝŠ
+OOŠßJK[\ŽŠYÙK›ÛJOOœ›ÛOOOIÜ\ÜÙ[™Ù\‰ÏÛ™]È›ÛZ\ÙJ™\ÛÛ™OOžÜ™[X\ÙT\ÜÙ[™Ù\\™\ÛÛ™NßJN”›ÛZ\ÙKœ™\ÛÛ™JÙ[\™YYK™X\ÛÛŽ‰Ù[\™Y	ßJKX]™NŠ
+OOŠÛYY_JKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]\™Ù]™XY\ÚŠ
+OO‰ÉË™\ÛÛ™NœYÙOOŠÜYÙK›ÛNœYÙKœÝ\ÕÚ]
+	Ùš]™\‹IÊOÉÙš]™\‰Î‰Ü\ÜÙ[™Ù\‰ßJK™[™\Ž˜[YOOœ™[™\œËœ\Ú
+˜[YKœYÙJ_JNÂˆÛÛœÝÛ\›Ý]\‹›˜]šYØ]J	ÚÛYIÊNÝÚ[J\™[X\ÙT\ÜÙ[™Ù\ŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØÛÛœÝœ™\ÚX]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊNÜ™[X\ÙT\ÜÙ[™Ù\ŠÙ[\™YYK™X\ÛÛŽ‰Ù[\™Y	ßJNØÛÛœÝÝ[OX]ØZ]ÛÂˆ\ÜÙ\™\]X[
+œ™\Ú›˜]šYØ]YYJNØ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÛ˜]šYØ][Û‰ÊNØ\ÜÙ\™Y\\]X[
+™[™\œËÉÚÛYIË	Ùš]™\‹ZÛYI×JNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K˜XÝ]™T›ÛK	Ùš]™\‰ÊNÂŸJNÂ\Ý
+	Ù[^YY˜Z[\™Hœ›ÛHH\\Y›ÛHØ[››Ý™\XÙHHœ™\Ú›Ý]\ˆ™\Ý[	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+NÛ]™Z™XÝ\ÜÙ[™Ù\ŽÂˆÛÛœÝ[[YO^ÜÛ˜\ÚÝŠ
+OOŠßJK[\ŽŠYÙK›ÛJOOœ›ÛOOOIÜ\ÜÙ[™Ù\‰ÏÛ™]È›ÛZ\ÙJ
+™\ÛÛ™K™Z™XÝ
+OOžÜ™Z™XÝ\ÜÙ[™Ù\\™Z™XÝßJN”›ÛZ\ÙKœ™\ÛÛ™JÙ[\™YYK™X\ÛÛŽ‰Ù[\™Y	ßJKX]™NŠ
+OOŠÛYY_JKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]\™Ù]™XY\ÚŠ
+OO‰ÉË™\ÛÛ™NœYÙOOŠÜYÙK›ÛNœYÙKœÝ\ÕÚ]
+	Ùš]™\‹IÊOÉÙš]™\‰Î‰Ü\ÜÙ[™Ù\‰ßJK™[™\ŽŠ
+OOžß_JNÂˆÛÛœÝÛ\›Ý]\‹›˜]šYØ]J	ÚÛYIÊNÝÚ[J\™Z™XÝ\ÜÙ[™Ù\ŠX]ØZ]™]È›ÛZ\ÙJ™\ÛÛ™OOœÙ][[YYX]J™\ÛÛ™JJNØÛÛœÝœ™\ÚX]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊNÜ™Z™XÝ\ÜÙ[™Ù\Š\œ›ÜŠ	ÛÙ™›[™IÊJNØÛÛœÝÝ[OX]ØZ]ÛÂˆ\ÜÙ\™\]X[
+œ™\Ú›˜]šYØ]YYJNØ\ÜÙ\™\]X[
+Ý[Kœ™X\ÛÛ‹	ÜÝ[WÛ˜]šYØ][Û‰ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+K›\ÝXÝ[Û‹	Ù[\™Y	ÊNØ\ÜÙ\™\]X[
+›Ý]\‹œÛ˜\ÚÝ
+
+KœYÙK	Ùš]™\‹ZÛYIÊNÂŸJNÂ\Ý
+	Ù]XÚY›ÛK\YÙH›Ý]\ˆYÛ›Ü™\È]\™H\ÚÚ[™Ù\È[™X]™\È]È[[YIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+NÛ][šY\ÏLX]™\ÏL\ÚIÚÛYIÎÂˆÛÛœÝ[[YO^ÜÛ˜\ÚÝŠ
+OOŠßJK[\Ž˜\Þ[˜Ê
+OOžÙ[šY\ÊÏLNÜ™]\›ˆÙ[\™YY_NßKX]™NŠ
+OOžÛX]™\ÊÏLNÜ™]\›ˆÛYY_NßKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]\™Ù]™XY\ÚŠ
+OOš\Ú™\ÛÛ™NœYÙOOŠÜYÙK›ÛN‰Ü\ÜÙ[™Ù\‰ßJK™[™\ŽŠ
+OOžß_JNÜ›Ý]\‹˜]XÚ
+
+NÜ›Ý]\‹™]XÚ
+
+NÝ\™Ù]™\Ü]Ú
+	Ú\ÚÚ[™ÙIÊNØ]ØZ]›ÛZ\ÙKœ™\ÛÛ™J
+NÂˆ\ÜÙ\™\]X[
+[šY\Ë
+NØ\ÜÙ\™\]X[
+X]™\ËJNØ\ÜÙ\™\]X[
+\™Ù]›\Ý[™\ÛÝ[
+	Ú\ÚÚ[™ÙIÊK
+NØ\ÜÙ\™\]X[
+
+]ØZ]›Ý]\‹›˜]šYØ]J	ÚÛYIÊJKœ™X\ÛÛ‹	Ü›Ý]\—Ù]XÚY	ÊNÂŸJNÂ\Ý
+	Ú[˜[Y›Ý]\ˆ\Ý[˜][ÛˆÝÜÈ™Y›Ü™H™[™\š[™ÈÜˆ[\š[™ÈÙ\šXÙ\ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+K\™Ù]\™XÛÝ™\žQ]™[\™Ù]
+
+NÛ][šY\ÏL™[™\œÏLÂˆÛÛœÝ[[YO^ÜÛ˜\ÚÝŠ
+OOŠßJK[\Ž˜\Þ[˜Ê
+OOžÙ[šY\ÊÏLNÜ™]\›ˆÙ[\™YY_NßKX]™NŠ
+OOŠÛYY_JKYN˜\Þ[˜Ê
+OOŠßJ_NÂˆÛÛœÝ›Ý]\T‹˜Ü™X]T›ÛTYÙT›Ý]\ŠÜ[[YK]™[\™Ù]\™Ù]™XY\ÚŠ
+OO‰ÉË™\ÛÛ™NŠ
+OOŠÜYÙN‰Ùš]™\‹ZÛYIË›ÛN‰Ü\ÜÙ[™Ù\‰ßJK™[™\ŽŠ
+OOžÜ™[™\œÊÏLNß_JNÂˆÛÛœÝ™\Ý[X]ØZ]›Ý]\‹›˜]šYØ]J	Ùš]™\‹ZÛYIÊNØ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	Ú[˜[YÙ\Ý[˜][Û‰ÊNØ\ÜÙ\™\]X[
+[šY\Ë
+NØ\ÜÙ\™\]X[
+™[™\œË
+NÂŸJNÂ\Ý
+	Ü›ÝÝ\HÚÝÈ]\ÈÚ\™Y›ÝYÚÛ™H^XÚ]›ÛK\YÙH›Ý]\‰Ë
+
+HOˆÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÝÚ[™Ý×‘šZšT›ÝÝ\TÙ\šXÙ\×[ÊNØ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÔ—˜Ü™X]T›ÛTYÙT›Ý]\—
+ÊNØ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÜ›ÛTYÙT›Ý]\—˜]XÚ
+
+KÊNØ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÙšZšN˜]]\Ù\ÜÚ[Û‹XÚ[™ÙYÊNØ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØÛÛ[X[™™YY˜XÚÑÛW˜]XÚ
+
+KÊNØ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØÛX\•[˜]˜Z[X›N—
+
+OO—ØÛÛ[X[™ZW˜ÛX\—
+
+NØÛÛ[X[™™YY˜XÚÑÛW™]XÚ
+
+N×KÊNØ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÛ˜]šYØ]NœYÙOOœÝ]WœYÙOOO\YÙWÛ[œÚÝ×
+YÙW
+KÊNØ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÙ[˜Ý[ÛˆÚÝ×
+\™Ù]
+WÜ™]\›ˆ›ÛTYÙT›Ý]\—›˜]šYØ]W
+\™Ù]
+N×KÊNÂŸJNÂ\Ý
+	Ü›Ùš[H[™ÛÛXÝÜ^[Y[™Y™\™[˜Ù\ÈÝ\š]™H[ˆ[‹YØÝ[Y[›ÛHÝÚ]Ú	Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+K\\ÜÙ[™Ù\ŠJNÂˆK›X]™J
+NÈK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÂˆ\ÜÙ\™\]X[
+KœÝ]Kœ›Ùš[KšYšY
+NÂˆÛÛœÝ[Kœ™\]Y\ÝšYJÜXÚÝ\œœXÚÝ\\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆ\ÜÙ\™\]X[
+‹œ\ÜÙ[™Ù\“˜[YK	Ô™]šY]ÈÝY\Ý	ÊNÈ\ÜÙ\™\]X[
+‹›[™ÝXYÙK	Ú˜IÊNÈ\ÜÙ\™\]X[
+‹œ^[Y[	ØØ\™	ÊNÂŸJNÂ\Ý
+	Û™]È\XØ][ÛˆØ[››Ý[š™XÝ\›Ý˜[Üˆ[˜X›H][Ý[™ÉË
+
+HOˆÂˆÛÛœÝÛKŸO\Ù]\
+
+NÈK˜ÚÛÜÙT›ÛJ	Ùš]™\‰ÊNÂˆKœ™YÚ\Ý\‘š]™\ŠË‹‹˜\XØ][ÛŠŠKÝ]\Î‰Ü™]šY]ÙY	Ë\›Ý™YYK[YÚX›NY_JNÂˆ\ÜÙ\™\]X[
+K™Ø]J
+K™[YÚX›K˜[ÙJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ]Û›[™JYJJNÂˆ\ÜÙ\™\]X[
+K™š]™\”™\]Y\ÝÊ
+K›[™Ý
+NÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÝX›Z]Ù™™\Š	ÜØ[\KXÚ]IËÙ˜\™N‰ÌŒ	Ë]N‰ÍIßJJNÂŸJNÂ\Ý
+	Ü™]šY]ÙY[[ÈXØÛÝ[Ù\È›Ý\›Ý™HHÙ\\˜][HÝX›Z]Y\XØ][Û‰Ë
+
+HOˆÂˆÛÛœÝÛKŸO\Ù]\
+
+NÈK˜ÚÛÜÙT›ÛJ	Ùš]™\‰ÊNÈÛÛœÝ[Kœ™YÚ\Ý\‘š]™\Š\XØ][ÛŠŠJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K™Ø]J
+K™[YÚX›KYJNÂˆK›X]™J
+NÈK˜ÚÛÜÙT›ÛJ	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+KœÝ]Kœ›Ùš[KšYšY
+NÈ\ÜÙ\™\]X[
+K™Ø]J
+K™[YÚX›K˜[ÙJNÂŸJNÂ\Ý
+	Ü][Ý[™È\È›Ý\ÜÚYÛ›Y[ÈÙ[XÝ[Ûˆ™\Ù\™\ÈHYÜ™YY][ÝHÛ˜\ÚÝ	Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝ[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈKœÙ]Û›[™JYJNÂˆÛÛœÝÏ[KœÝX›Z]Ù™™\Š‹šYÙ˜\™N‰ÌŒËL	Ë]N‰ÍÉßJNÂˆ\ÜÙ\™\]X[
+K™š]™\•š\Ê
+K›[™Ý
+NÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈKœÙ[XÝÙ™™\ŠËšY
+NÂˆ\ÜÙ\™\]X[
+‹œ][ÝTÛ˜\ÚÝ™˜\™PÙ[ËŒÍL
+NÈ\ÜÙ\™\]X[
+‹œ][ÝTÛ˜\ÚÝ™]KÊNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠËšY
+JNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K™š]™\•š\Ê
+K›[™ÝJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÝX›Z]Ù™™\Š‹šYÙ˜\™N‰ÌÌ	Ë]N‰ÍIßJJNÂˆ\ÜÙ\™\]X[
+‹œ][ÝTÛ˜\ÚÝ™˜\™PÙ[ËŒÍL
+NÂŸJNÂ\Ý
+	ÜšYHØ[››ÝÝ\Ú]Ý]ÛÛ™š\›X][ÛˆÙˆH›ÛÚÙY™ZXÛH[™š]™\‰Ë
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈ‰ËYKYJJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIË˜[ÙKYJJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆ\ÜÙ\™\]X[
+šYKœÝ]\Ë	Ø\œš]š[™ÉÊNÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšY
+JNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÈ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ÛÛ—Ýš\	ÊNÂˆK˜Y˜[˜ÙUš\
+šYKšY
+NÈ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ØÛÛ\]Y	ÊNÂŸJNÂ\Ý
+	Ù^\™Y][Ý\È[™™]›ÚÙY[YÚXš[]H\™H™XÚXÚÙY]Ù[XÝ[Û‰Ë
+
+HOˆÂˆ›ÜŠÛÛœÝ™X\ÛÛˆÙˆÉÙ^\™Y	Ë	Ü™]›ÚÙY	×JHÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝ[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆÛÛœÝÏ[K™Ù]Ù™™\œÊ‹šY
+VÌNÂˆYŠ™X\ÛÛOOIÙ^\™Y	ÊHË™^\™\Ð]Q]K››ÝÊ
+KLNÂˆ[ÙHKœÝ]Kœ™XÛÜ™Ë™š[™
+OžšYOO[Ë™š]™\’Y
+KœÝ]\ÏIÜÝ\Ü[™Y	ÎÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠËšY
+JNÈ\ÜÙ\™\]X[
+‹œÝ]\Ë	ØÛÛXÝ[™ÉÊNÂˆBŸJNÂ\Ý
+	ØÚ[™Ú[™ÈHÛÛXÝ[™È›Ý]H[˜[Y]\ÈX\›Y\ˆ][Ý\ÉË
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝš\œÝ[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJKÛ[K™Ù]Ù™™\œÊš\œÝšY
+VÌNÂˆKœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[ÈÝÛ‰ßJNÂˆ\ÜÙ\™\]X[
+š\œÝœÝ]\Ë	ØØ[˜Ù[Y	ÊNÈ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠÛšY
+JNÂŸJNÂ\Ý
+	ÙY][™ÈXÚÝ\\Ý[˜][ÛˆÜˆØÚY[H[[YYX][H[˜[Y]\ÈHXÝ]™HÙX\˜Ú[™][Ý\ÉË
+
+HOˆÂˆ›ÜŠÛÛœÝØÚ[™Ù\Ë™X\ÛÛ—HÙˆÖÞÜXÚÝ\‰Ó™]ÈÝ[	ßK	Ü›Ý]WØÚ[™ÙY	×KÞÙ\Ý[˜][ÛŽ‰Ñ[[ÈÝÛ‰ßK	Ü›Ý]WØÚ[™ÙY	×KÞÜXÚÝ\]›™]È]J]K››ÝÊ
+JÌÍŒ
+KÒTÓÔÝš[™Ê
+_K	ÜØÚY[WØÚ[™ÙY	×WJ^ÂˆÛÛœÝÛ_O\Ù]\
+
+NÜ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆÛÛœÝ™\Ý[[Kš[˜[Y]TšYTÙX\˜Ú
+šYKšYÚ[™Ù\ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[š[˜[Y]YYJNØ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹™X\ÛÛŠNØ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ØØ[˜Ù[Y	ÊNØ\ÜÙ\™\]X[
+šYK˜Ø[˜Ù[™X\ÛÛ‹™X\ÛÛŠNÂˆ\ÜÙ\›ÚÊKœÝ]K›Ù™™\œË™š[\ŠÏO›Ëœ™\]Y\ÝYOO\šYKšY
+K™]™\žJÏO›ËœÝ]\ÏOOIÙ^\™Y	ÊJNØ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠÙ™™\‹šY
+JNÂˆBˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKÜÝ]W˜Ý\œ™[™\]Y\Ý[[ÜÝ]W™^XÝYY[[ÜÝ]WœÙ[XÝY[[×	
+	Û]™K\Ý[[X\žI×
+WšY[]YN×	
+	ÛÙ™™\œÉ×
+Wœ™\XÙPÚ[™[—
+
+NØÛX\“[™\×
+
+NËÊNÂŸJNÂ\Ý
+	ØØ[˜Ù[Y\ÝÜžH\Ý[™ÝZ\Ú\È›Ý]HY]ËØÚY[HY]È[™^XÚ]Ø[˜Ù[][Û‰Ë
+
+HOˆÂˆÛÛœÝÔŸO\Ù]\
+
+NÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹˜Ø[˜Ù[][Û”™X\ÛÛ•šY]Ê	Ü›Ý]WØÚ[™ÙY	Ê_KÚÚ[™‰ÜÙX\˜ÚØÚ[™ÙIËY\ÜØYÙN‰ù.eú.â¹g,9à®xào¸àgøàkú(c8àcyab8àk¹i"y¦í8àjøà¢8à¢¸à xàdøàk¹/§zh/8à¤¹cå¸à¢¹­¢8àeøào¸àeøàgøà ‰ßJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹˜Ø[˜Ù[][Û”™X\ÛÛ•šY]Ê	ÜØÚY[WØÚ[™ÙY	Ê_KÚÚ[™‰ÜØÚY[WØÚ[™ÙIËY\ÜØYÙN‰ù.¢9í!9¥éy¦`¸àk¹i"y¦í8àjøà¢8à¢¸à xàdøàk¹/§zh/8à¤¹cå¸à¢¹­¢8àeøào¸àeøàgøà ‰ßJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹˜Ø[˜Ù[][Û”™X\ÛÛ•šY]Ê	Ü\ÜÙ[™Ù\—Ü™\]Y\ÝY	Ê_KÚÚ[™‰Ü\ÜÙ[™Ù\‰ËY\ÜØYÙN‰ùb*yå*: !xàc9/§zh/8à¤¹cå¸à¢¹­¢8àeøào¸àeøàgøà ‰ßJNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹”‹˜Ø[˜Ù[][Û”™X\ÛÛ•šY]Ê	Ý[\\™Y	Ê_KÚÚ[™‰Ý[šÛ›ÝÛ‰ËY\ÜØYÙN‰øàdøàk¹/§zh/8àkùcå¸à¢¹­¢8àexà£8ào¸àeøàgøà ‰ßJNÂˆ\ÜÙ\›X]Ú
+ÛÝ\˜ÙKØÛÛœÝ™X\ÛÛT—˜Ø[˜Ù[][Û”™X\ÛÛ•šY]×
+—˜Ø[˜Ù[™X\ÛÛ—
+NÖ×××JÙ\Ø×
+™X\ÛÛ—›Y\ÜØYÙW
+KÊNÂŸJNÂ\Ý
+	Ý[˜Ú[™ÙYÙX\˜Ú[œ]\È™]Z[™Y[™\ÜÚYÛ™YšY\ÈØ[››Ý™HÚ[[HY]Y	Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÜ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆ\ÜÙ\™Y\\]X[
+Ë‹‹›Kš[˜[Y]TšYTÙX\˜Ú
+šYKšYÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ËZ\œÜ™˜[ÙKXÚÝ\]›[J_KÚ[˜[Y]Y™˜[ÙK™X\ÛÛŽ‰Ý[˜Ú[™ÙY	ßJNÂˆ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ØÛÛXÝ[™ÉÊNØ\ÜÙ\™\]X[
+Ù™™\‹œÝ]\Ë	ØXÝ]™IÊNÂˆKœÙ[XÝÙ™™\ŠÙ™™\‹šY
+NÂˆ\ÜÙ\›ÝÜÊ
+
+OO›Kš[˜[Y]TšYTÙX\˜Ú
+šYKšYÜXÚÝ\‰Ó™]ÈÝ[	ßJKú`n9¢§¹®"8àoøàîù.eú.â¹.+KÊNØ\ÜÙ\™\]X[
+šYKœÝ]\Ë	Ø\ÜÚYÛ™Y	ÊNØ\ÜÙ\™\]X[
+šYKœXÚÝ\	Ñ[[ÈÝ[	ÊNÂŸJNÂ\Ý
+	ØH]\ˆ™ZXÛHZ\ÛX]Ú™]›ÚÙ\È[ˆX\›Y\ˆÛÛ™š\›X][Û‰Ë
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÂˆK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈ‰ËYKYJJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšY
+K	ÔÝ\]\Ý™[XZ[ˆ›ØÚÙYY\ˆH™]ÈZ\ÛX]Ú	ÊNÂŸJNÂ‚\Ý
+	ÝÚ]˜]Ú[™ÈZ]\ˆY[]HÚXÚÈ™\]Z\™\ÈHœ™\ÚÝXØÙ\ÜÙ[ÛÛ™š\›X][Û‰Ë
+
+HOˆÂˆ›ÜŠÛÛœÝÚXÚÜÈÙˆÖÙ˜[ÙKYWKÝYK˜[ÙWWJHÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIË‹‹˜ÚXÚÜÊJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K˜Ø[”Ý\š\
+šYKšY
+K˜[ÙJNÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšY
+JNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K˜Ø[”Ý\š\
+šYKšY
+KYJNÂˆK˜Y˜[˜ÙUš\
+šYKšY
+NÈ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ÛÛ—Ýš\	ÊNÂˆBŸJNÂ\Ý
+	ÙY][™ÈØœÙ\™Y™ZXÛH[™›Ü›X][ÛˆÛX\œÈÛÛ™š\›X][Ûˆ™Y›Ü™H[›Ý\ˆÛÚÝ\	Ë
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆKš[˜[Y]U™ZXÛPÛÛ™š\›X][ÛŠšYKšY
+NÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K˜Ø[”Ý\š\
+šYKšY
+K˜[ÙJNÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšY
+JNÂŸJNÂ\Ý
+	Ùš]™\œÈ[™[œ™[]Y\ÜÙ[™Ù\œÈØ[››ÝÛX\ˆ[›Ý\ˆ\ÜÙ[™Ù\ˆÛÛ™š\›X][Û‰Ë
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\›ÝÜÊ
+
+OO›Kš[˜[Y]U™ZXÛPÛÛ™š\›X][ÛŠšYKšY
+Køàdøàk¹¤ãy/gÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÂˆÛÛœÝÝÛ™\[KœÝ]Kœ›Ùš[NÈKœÝ]Kœ›Ùš[O^Ë‹‹›ÝÛ™\‹Y‰Ý[œ™[]Y\\ÜÙ[™Ù\‰ßNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›Kš[˜[Y]U™ZXÛPÛÛ™š\›X][ÛŠšYKšY
+Køàdøàk¹/§zh/ÊNÂˆKœÝ]Kœ›Ùš[O[ÝÛ™\ŽÈ\ÜÙ\™\]X[
+šYK™ZXÛPÛÛ™š\›YYYJNÂŸJNÂ\Ý
+	Ø[ˆ\›Ý™Y™\XÙ[Y[™ZXÛKš]™\‹ÜˆÚ[™ÙY\ÜÚYÛ›Y[™YYÈH™]ÈÛÛ™š\›X][Û‰Ë
+
+HOˆÂˆ›ÜŠÛÛœÝÚ[™ÙˆÉÝ™ZXÛIË	Ùš]™\‰Ë	ÚÛ\‰Ë	Ø\X\˜[˜ÙIË	Ø\ÜÚYÛ›Y[	Ë	ÛÙ™™\‰Ë	ÜØÚY[I×JHÂˆÛÛœÝÛK‹šY_O\Ù[XÝY
+
+NÈK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆÛÛœÝ™XÛÜ™[KœÝ]Kœ™XÛÜ™Ë™š[™
+OžšYOO\šYK™š]™\’Y
+NÂˆYŠÚ[™OOIÝ™ZXÛIÊH™XÛÜ™™ZXÛRYIÜ™\XÙ[Y[]™ZXÛIÎÂˆYŠÚ[™OOIÙš]™\‰ÊH™XÛÜ™™š]™\’YIÜ™\XÙ[Y[Yš]™\‰ÎÂˆYŠÚ[™OOIÚÛ\‰ÊH™XÛÜ™šÛ\’YIÜ™\XÙ[Y[ZÛ\‰ÎÂˆYŠÚ[™OOIØ\X\˜[˜ÙIÊH™XÛÜ™˜ÛÛÜIÙY™™\™[XÛÛÜ‰ÎÂˆYŠÚ[™OOIØ\ÜÚYÛ›Y[	ÊHšYK˜\ÜÚYÛ›Y[™]š\Ú[ÛŠÊÎÂˆYŠÚ[™OOIÛÙ™™\‰ÊHšYKœÙ[XÝYÙ™™\’YIÜ™\XÙ[Y[[Ù™™\‰ÎÂˆYŠÚ[™OOIÜØÚY[IÊHšYKœXÚÝ\][™]È]J]K››ÝÊ
+JÌÍŒ
+KÒTÓÔÝš[™Ê
+NÂˆ›ÜŠÛÛœÝØÈÙˆØš™XÝ˜[Y\Ê™XÛÜ™™ØÝ[Y[ÊJHØË˜š[™[™Ï\™XÛÜ™šÛ\’Y
+ÉËÉÊÜ™XÛÜ™™ZXÛRY
+ÉËÉÊÜ™XÛÜ™™š]™\’YÂˆ\ÜÙ\™\]X[
+‹˜\ÜÙ\ÜÊ™XÛÜ™
+K™[YÚX›KYK	Ý\Ý™\XÙ[Y[™]Z[œÈ˜[YÝ\œ™[]šY[˜ÙIÊNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K˜Ø[”Ý\š\
+šYKšY
+K˜[ÙKÚ[™
+NÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšY
+JNÂˆBŸJNÂ\Ý
+	ØH›ÛÛX[ˆ›YÈÚ]Ý]HX]Ú[™ÈÛÛ™š\›X][Ûˆ™XÛÜ™Ø[››ÝÝ\HšYIË
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆšYK™ZXÛPÛÛ™š\›YY]YNÂˆ\ÜÙ\™\]X[
+K˜Ø[”Ý\š\
+šYKšY
+K˜[ÙJNÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšY
+JNÂŸJNÂ\Ý
+	Ü™]›ØØ][ÛˆY\ˆHÝXØÙ\ÜÙ[ÚXÚÈÝ[›ØÚÜÈšYHÝ\	Ë
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆKœÝ]Kœ™XÛÜ™Ë™š[™
+OžšYOO\šYK™š]™\’Y
+KœÝ]\ÏIÜÝ\Ü[™Y	ÎÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K˜Ø[”Ý\š\
+šYKšY
+K˜[ÙJNÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšY
+JNÂŸJNÂ‚\Ý
+	Ü\ÜÙ[™Ù\ˆØ[˜Ù[ÈHÛÛXÝ[™È™\]Y\Ý[™[Ý[H][Ý\È™XÛÛYH[\ØX›IË
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆK˜Ø[˜Ù[šYJšYKšY
+NÂˆ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ØØ[˜Ù[Y	ÊNÈ\ÜÙ\™\]X[
+K™Ù]Ù™™\œÊšYKšY
+K›[™Ý
+NÂˆ\ÜÙ\›ÚÊKœÝ]K›Ù™™\œË™š[\ŠÏO›Ëœ™\]Y\ÝYOO\šYKšY
+K™]™\žJÏO›ËœÝ]\ÏOOIÙ^\™Y	ÊJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠÙ™™\‹šY
+JNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈKœÙ]Û›[™JYJNÂˆ\ÜÙ\›ÚÊ[K™š]™\”™\]Y\ÝÊ
+KœÛÛYJOœ‹šYOO\šYKšY
+JNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÝX›Z]Ù™™\ŠšYKšYÙ˜\™N‰ÌIË]N‰ÌÉßJJNÂŸJNÂ\Ý
+	Ø\ÜÚYÛ™YØ[˜Ù[][Ûˆ™\Ù\™\ÈHYÜ™YYšXÙH[™š]™\ˆ\ÝÜžK›Ý™ZXÛH›ÛÙ‰Ë
+
+HOˆÂˆÛÛœÝÛKšYKÙ™™\ŸO\Ù[XÝY
+
+KÛ˜\ÚÝ\šYKœ][ÝTÛ˜\ÚÝš]™\’Y\šYK™š]™\’YÂˆK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆK˜Ø[˜Ù[šYJšYKšY
+NÂˆ\ÜÙ\™\]X[
+šYKœ][ÝTÛ˜\ÚÝÛ˜\ÚÝ
+NÈ\ÜÙ\›ÚÊØš™XÝš\Ñœ›Þ™[ŠÛ˜\ÚÝ
+JNÂˆ\ÜÙ\™\]X[
+Û˜\ÚÝ™˜\™PÙ[ËŒÍL
+NÈ\ÜÙ\™\]X[
+Û˜\ÚÝ™]KÊNÂˆ\ÜÙ\™\]X[
+šYK™š]™\’Yš]™\’Y
+NÈ\ÜÙ\™\]X[
+šYKœÙ[XÝYÙ™™\’YÙ™™\‹šY
+NÂˆ\ÜÙ\™\]X[
+Ù™™\‹œÝ]\Ë	Ù^\™Y	ÊNÈ\ÜÙ\™\]X[
+šYK™ZXÛPÛÛ™š\›YY˜[ÙJNÈ\ÜÙ\™\]X[
+šYK™ZXÛPÛÛ™š\›X][Û‹[
+NÂˆ\ÜÙ\™\]X[
+šYK˜Ø[˜Ù[Yœ›ÛK	Ø\ÜÚYÛ™Y	ÊNÈ\ÜÙ\™\]X[
+šYK˜Ø[˜Ù[YžK	Ü\ÜÙ[™Ù\‰ÊNÂˆ\ÜÙ\›ÚÊ[X™\‹š\Ñš[š]J]Kœ\œÙJšYK˜Ø[˜Ù[Y]
+JJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K™š]™\•š\Ê
+VÌKšYJNÂˆ\ÜÙ\™\]X[
+KœÝ]K›Û›[™VÙš]™\’YK˜[ÙJNÈ\ÜÙ\™\]X[
+K˜Ø[”Ý\š\
+šYKšY
+K˜[ÙJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšY
+JNÂŸJNÂ\Ý
+	ØØ[˜Ù[][Ûˆ\š[™ÈXÚÝ\Ú[œÈÝ™\ˆHÝ[HšYK\Ý\XÝ[Ûˆ]™[ˆY\ˆÛÛ™š\›X][Û‰Ë
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆK˜Ø[˜Ù[šYJšYKšY
+NÈ\ÜÙ\™\]X[
+šYK˜Ø[˜Ù[Yœ›ÛK	Ø\œš]š[™ÉÊNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K˜Ø[”Ý\š\
+šYKšY
+K˜[ÙJNÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšY
+JNÂŸJNÂ\Ý
+	ØØ[˜Ù[][Ûˆ™\]Z\™\ÈHÝÛš[™È\ÜÙ[™Ù\ˆ[™HÛ›ÝÛˆ™\]Y\Ý	Ë
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Ø[˜Ù[šYJšYKšY
+Køàdøàk¹¤ãy/gÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈÛÛœÝÝÛ™\[KœÝ]Kœ›Ùš[NÂˆKœÝ]Kœ›Ùš[O^Ë‹‹›ÝÛ™\‹Y‰Ý[œ™[]Y\\ÜÙ[™Ù\‰ßNÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Ø[˜Ù[šYJšYKšY
+Køàdøàk¹/§zh/8à¤¹cå¸à¢¹­¢8àføào¸àføà¤ËÊNÂˆKœÝ]Kœ›Ùš[O[ÝÛ™\ŽÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Ø[˜Ù[šYJ	ÛZ\ÜÚ[™Ë\šYIÊKøàdøàk¹/§zh/8à¤¹cå¸à¢¹­¢8àføào¸àføà¤ËÊNÂˆ\ÜÙ\™\]X[
+šYKœÝ]\Ë	Ø\ÜÚYÛ™Y	ÊNÈ\ÜÙ\™\]X[
+šYK˜Ø[˜Ù[Y][™Yš[™Y
+NÂˆK›X]™J
+NÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Ø[˜Ù[šYJšYKšY
+Køàdøàk¹¤ãy/gÊNÂŸJNÂ\Ý
+	Ü™\X]YØ[˜Ù[][Ûˆ\ÈY[\Ý[[™Ø[››Ý™H\™›Ü›YYžH[›Ý\ˆ\ÜÙ[™Ù\‰Ë
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈK˜Ø[˜Ù[šYJšYKšY
+NÈÛÛœÝš\œÝR”ÓÓ‹œÝš[™ÚYžJšYJNÂˆ\ÜÙ\™\]X[
+K˜Ø[˜Ù[šYJšYKšY
+KšYJNÈ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJšYJKš\œÝ
+NÂˆKœÝ]Kœ›Ùš[O^Ë‹‹›KœÝ]Kœ›Ùš[KY‰Ý[œ™[]Y\\ÜÙ[™Ù\‰ßNÈ\ÜÙ\›ÝÜÊ
+
+OO›K˜Ø[˜Ù[šYJšYKšY
+JNÂˆ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJšYJKš\œÝ
+NÂŸJNÂ\Ý
+	Ø[ˆ[™XYHÝ\YÜˆÛÛ\]YšYHØ[››Ý™HØ[˜Ù[Yœ›ÛHHÝ[HX[ÙÉË
+
+HOˆÂˆ›ÜŠÛÛœÝÝ]\ÈÙˆÉÛÛ—Ýš\	Ë	ØÛÛ\]Y	×JHÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈK˜ÛÛ™š\›U™ZXÛJšYKšY	ÑSSÈIËYKYJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÈK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆYŠÝ]\ÏOOIØÛÛ\]Y	ÊHK˜Y˜[˜ÙUš\
+šYKšY
+NÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈÛÛœÝ™Y›Ü™OR”ÓÓ‹œÝš[™ÚYžJšYJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜Ø[˜Ù[šYJšYKšY
+Kù.eú.âºe¢ùiâùo£8àîùk£9.¡¹o£ÊNÈ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJšYJK™Y›Ü™JNÂˆBŸJNÂ\Ý
+	ØY\ˆØ[˜Ù[][ÛˆH™]ÈšYHØ[ˆ™H™\]Y\ÝY[™Hš]™\ˆ^XÚ]H™\Ý[Y\È™XÙZ]š[™È™\]Y\ÝÉË
+
+HOˆÂˆÛÛœÝÛKšYKÙ™™\ŸO\Ù[XÝY
+
+NÈK˜Ø[˜Ù[šYJšYKšY
+NÂˆÛÛœÝ™^[Kœ™\]Y\ÝšYJÜXÚÝ\œšYKœXÚÝ\\Ý[˜][ÛŽœšYK™\Ý[˜][ÛŸJNÂˆ\ÜÙ\››Ý\]X[
+™^šYšYKšY
+NÈ\ÜÙ\™\]X[
+™^œÝ]\Ë	ØÛÛXÝ[™ÉÊNÂˆ\ÜÙ\™\]X[
+K›^T™\]Y\ÝÊ
+K›[™ÝŠNÈ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠÙ™™\‹šY
+JNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K™š]™\”™\]Y\ÝÊ
+K›[™Ý
+NÂˆKœÙ]Û›[™JYJNÈ\ÜÙ\›ÚÊK™š]™\”™\]Y\ÝÊ
+KœÛÛYJOœ‹šYOO[™^šY
+JNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÝX›Z]Ù™™\ŠšYKšYÙ˜\™N‰ÌŒ	Ë]N‰ÍIßJJNÂˆKœÝX›Z]Ù™™\Š™^šYÙ˜\™N‰ÌŒ	Ë]N‰ÍIßJNÂŸJNÂ\Ý
+	Ü›Ý]H™\XÙ[Y[™XÛÜ™ÈH\Ý[˜ÝØ[˜Ù[][Ûˆ™X\ÛÛˆ[™[˜[Y]\ÈHÛ™\]Y\Ý	Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝš\œÝ[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆKœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[ÈÝÛ‰ßJNÂˆ\ÜÙ\™\]X[
+š\œÝ˜Ø[˜Ù[™X\ÛÛ‹	Ü›Ý]WØÚ[™ÙY	ÊNÈ\ÜÙ\™\]X[
+š\œÝ˜Ø[˜Ù[Yœ›ÛK	ØÛÛXÝ[™ÉÊNÂˆÛÛœÝ]Yš\œÝ˜Ø[˜Ù[Y]ÈK˜Ø[˜Ù[šYJš\œÝšY
+NÈ\ÜÙ\™\]X[
+š\œÝ˜Ø[˜Ù[™X\ÛÛ‹	Ü›Ý]WØÚ[™ÙY	ÊNÈ\ÜÙ\™\]X[
+š\œÝ˜Ø[˜Ù[Y]]
+NÂŸJNÂ‚\Ý
+	ØH]\™HXÚÝ\[YH\È›Ü›X[^™Y[™Ú\™YÚ][ˆ[YÚX›Hš]™\‰Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝXÚÝ\][™]È]J]K››ÝÊ
+JÌÍŒ
+KÒTÓÔÝš[™Ê
+NÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ËXÚÝ\]JNÂˆ\ÜÙ\™\]X[
+šYKœXÚÝ\]XÚÝ\]
+NÂˆK\ÙT™]šY]ÙYš^\™J
+NÈKœÙ]Û›[™JYJNÂˆ\ÜÙ\™\]X[
+K™š]™\”™\]Y\ÝÊ
+K™š[™
+Oœ‹šYOO\šYKšY
+KœXÚÝ\]XÚÝ\]
+NÂŸJNÂ\Ý
+	Ú[[YYX]HšY\È™[XZ[ˆ^XÚ][™È›Ý[š\š][ˆX\›Y\ˆØÚY[IË
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝØÚY[Y[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ËXÚÝ\]›™]È]J]K››ÝÊ
+JÌÍŒ
+KÒTÓÔÝš[™Ê
+_JNÂˆÛÛœÝ[[YYX]O[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆ\ÜÙ\™\]X[
+[[YYX]KœXÚÝ\][
+NÈ\ÜÙ\››Ý\]X[
+[[YYX]KšYØÚY[YšY
+NÂˆ\ÜÙ\™\]X[
+ØÚY[YœÝ]\Ë	ØØ[˜Ù[Y	ÊNÈ\ÜÙ\™\]X[
+ØÚY[Y˜Ø[˜Ù[™X\ÛÛ‹	ÜØÚY[WØÚ[™ÙY	ÊNÂŸJNÂ\Ý
+	Ú[˜[YÜˆ\ÝXÚÝ\[Y\È\™H™Z™XÝYÚ]Ý]Ü™X][™ÈÜˆ™\XÚ[™ÈH™\]Y\Ý	Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝÛÝ[[KœÝ]Kœ™\]Y\ÝË›[™ÝÂˆ›ÜŠÛÛœÝXÚÝ\]ÙˆÉÛ›ÝXKY]IË™]È]J]K››ÝÊ
+KMŒ
+KÒTÓÔÝš[™Ê
+WJHÂˆ\ÜÙ\›ÝÜÊ
+
+OO›Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ËXÚÝ\]JKùãï¹g*8à¢8à¢¹o£ÊNÂˆ\ÜÙ\™\]X[
+KœÝ]Kœ™\]Y\ÝË›[™ÝÛÝ[
+NÂˆBŸJNÂ\Ý
+	ÝHØ[YHØÚY[Y™\]Y\Ý\ÈY[\Ý[Ú[HHÚ[™ÙY[YH™\XÙ\È]	Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÂˆÛÛœÝš\œÝ][™]È]J]K››ÝÊ
+JÌÍŒ
+KÒTÓÔÝš[™Ê
+NÂˆÛÛœÝÙXÛÛ™][™]È]J]K››ÝÊ
+JÍÌŒ
+KÒTÓÔÝš[™Ê
+NÂˆÛÛœÝš\œÝ[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ËXÚÝ\]™š\œÝ]JNÂˆ\ÜÙ\™\]X[
+Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ËXÚÝ\]™š\œÝ]JKš\œÝ
+NÂˆÛÛœÝÙXÛÛ™[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ËXÚÝ\]œÙXÛÛ™]JNÂˆ\ÜÙ\™\]X[
+š\œÝœÝ]\Ë	ØØ[˜Ù[Y	ÊNÈ\ÜÙ\™\]X[
+š\œÝ˜Ø[˜Ù[™X\ÛÛ‹	ÜØÚY[WØÚ[™ÙY	ÊNÂˆ\ÜÙ\™\]X[
+ÙXÛÛ™œXÚÝ\]ÙXÛÛ™]
+NÈ\ÜÙ\™\]X[
+ÙXÛÛ™œÝ]\Ë	ØÛÛXÝ[™ÉÊNÂŸJNÂ\Ý
+	ÜÙ[XÝ[ÛˆÛ˜\ÚÝÈHØÚY[YXÚÝ\[Û™ÜÚYHHYÜ™YY][ÝIË
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝXÚÝ\][™]È]J]K››ÝÊ
+JÌÍŒ
+KÒTÓÔÝš[™Ê
+NÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ËXÚÝ\]JNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈKœÙ]Û›[™JYJNÈÛÛœÝÙ™™\[KœÝX›Z]Ù™™\ŠšYKšYÙ˜\™N‰ÌŒËL	Ë]N‰ÍÉßJNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈKœÙ[XÝÙ™™\ŠÙ™™\‹šY
+NÂˆ\ÜÙ\™\]X[
+šYKœXÚÝ\]XÚÝ\]
+NÈ\ÜÙ\™\]X[
+šYKœ][ÝTÛ˜\ÚÝœXÚÝ\]XÚÝ\]
+NÂˆ\ÜÙ\›ÚÊØš™XÝš\Ñœ›Þ™[ŠšYKœ][ÝTÛ˜\ÚÝ
+JNÂŸJNÂ\Ý
+	ØØ[˜Ù[[™ÈHØÚY[Y\ÜÚYÛ›Y[™]Z[œÈ]ÈXÚÝ\[YH›Üˆ›Ý\ÝÜšY\ÉË
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝXÚÝ\][™]È]J]K››ÝÊ
+JÌÍŒ
+KÒTÓÔÝš[™Ê
+NÂˆÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ËXÚÝ\]JNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈKœÙ]Û›[™JYJNÈÛÛœÝÙ™™\[KœÝX›Z]Ù™™\ŠšYKšYÙ˜\™N‰ÌŒËL	Ë]N‰ÍÉßJNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈKœÙ[XÝÙ™™\ŠÙ™™\‹šY
+NÈK˜Ø[˜Ù[šYJšYKšY
+NÂˆ\ÜÙ\™\]X[
+K›^T™\]Y\ÝÊ
+K™š[™
+Oœ‹šYOO\šYKšY
+KœXÚÝ\]XÚÝ\]
+NÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\™\]X[
+K™š]™\•š\Ê
+K™š[™
+Oœ‹šYOO\šYKšY
+KœXÚÝ\]XÚÝ\]
+NÂŸJNÂ‚\Ý
+	ÛÙ™™\ˆ™Yœ™\Ú™XÛÜ™È[YH^\žH[™^Z[œÈÚH›È][ÝH\ÈÙ[XÝX›IË
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆKœÝ]K›Ù™™\œË™š[\ŠÏO›Ëœ™\]Y\ÝYOO\šYKšY
+K™›Ü‘XXÚ
+ÏO›Ë™^\™\Ð]Q]K››ÝÊ
+KLJNÂˆ\ÜÙ\™\]X[
+K™Ù]Ù™™\œÊšYKšY
+K›[™Ý
+NÂˆÛÛœÝÝ[[X\žO[K›Ù™™\”Ý[[X\žJšYKšY
+NÂˆ\ÜÙ\™\]X[
+Ý[[X\žK˜XÝ]™K
+NÈ\ÜÙ\›ÚÊÝ[[X\žK™^\™YŒ
+NÈ\ÜÙ\™\]X[
+Ý[[X\žK[˜]˜Z[X›K
+NÂˆ\ÜÙ\›ÚÊKœÝ]K›Ù™™\œË™š[\ŠÏO›Ëœ™\]Y\ÝYOO\šYKšY
+K™]™\žJÏO›ËœÝ]\ÏOOIÙ^\™Y	É‰›ËœÝ]\Ô™X\ÛÛOOIÝ[YIÊJNÂŸJNÂ\Ý
+	ÛÛ™H^\™YÙ™™\ˆÙ\È›ÝYH[›Ý\ˆÝ\œ™[Ù™™\‰Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆÛÛœÝ™Y›Ü™O[K™Ù]Ù™™\œÊšYKšY
+NÈ\ÜÙ\›ÚÊ™Y›Ü™K›[™ÝŒJNÂˆ™Y›Ü™VÌK™^\™\Ð]Q]K››ÝÊ
+KLNÂˆÛÛœÝY\[K™Ù]Ù™™\œÊšYKšY
+KÝ[[X\žO[K›Ù™™\”Ý[[X\žJšYKšY
+NÂˆ\ÜÙ\™\]X[
+Y\‹›[™Ý™Y›Ü™K›[™ÝLJNÈ\ÜÙ\™\]X[
+Ý[[X\žK˜XÝ]™KY\‹›[™Ý
+NÈ\ÜÙ\™\]X[
+Ý[[X\žK™^\™YJNÂˆ\ÜÙ\›ÚÊXY\‹œÛÛYJÏO›ËšYOOX™Y›Ü™VÌKšY
+JNÂŸJNÂ\Ý
+	Ø[ˆ[YÚX›Hš]™\ˆØ[ˆ™K\][ÝHY\ˆ^\žHÚ]Ý]™]š]š[™ÈHÛÙ™™\‰Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈKœÙ]Û›[™JYJNÈÛÛœÝÛ[KœÝX›Z]Ù™™\ŠšYKšYÙ˜\™N‰ÌŒËL	Ë]N‰ÍÉßJNÂˆÛ™^\™\Ð]Q]K››ÝÊ
+KLNÈK™š]™\”™\]Y\ÝÊ
+NÂˆ\ÜÙ\™\]X[
+ÛœÝ]\Ë	Ù^\™Y	ÊNÂˆÛÛœÝœ™\Ú[KœÝX›Z]Ù™™\ŠšYKšYÙ˜\™N‰ÌŒ	Ë]N‰Í‰ßJNÂˆ\ÜÙ\››Ý\]X[
+œ™\ÚšYÛšY
+NÈ\ÜÙ\™\]X[
+ÛœÝ]\Ë	Ù^\™Y	ÊNÈ\ÜÙ\™\]X[
+œ™\ÚœÝ]\Ë	ØXÝ]™IÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈÛÛœÝš\ÚX›O[K™Ù]Ù™™\œÊšYKšY
+NÂˆ\ÜÙ\›ÚÊš\ÚX›KœÛÛYJÏO›ËšYOOYœ™\ÚšY
+JNÈ\ÜÙ\›ÚÊ]š\ÚX›KœÛÛYJÏO›ËšYOO[ÛšY
+JNÂˆKœÙ[XÝÙ™™\Šœ™\ÚšY
+NÈ\ÜÙ\™\]X[
+šYKœ][ÝTÛ˜\ÚÝ™˜\™PÙ[Ë
+NÂŸJNÂ\Ý
+	Ø[ˆÙ™™\ˆXYH[˜]˜Z[X›HžH[YÚXš[]HØ[››ÝÚ[[H™]š]™IË
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆÛÛœÝÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌK™XÛÜ™[KœÝ]Kœ™XÛÜ™Ë™š[™
+Oœ‹šYOO[Ù™™\‹™š]™\’Y
+NÂˆ™XÛÜ™œÝ]\ÏIÜÝ\Ü[™Y	ÎÈ\ÜÙ\›ÚÊ[K™Ù]Ù™™\œÊšYKšY
+KœÛÛYJÏO›ËšYOO[Ù™™\‹šY
+JNÂˆ\ÜÙ\™\]X[
+Ù™™\‹œÝ]\Ë	Ý[˜]˜Z[X›IÊNÈ\ÜÙ\™\]X[
+Ù™™\‹œÝ]\Ô™X\ÛÛ‹	Ù[YÚXš[]IÊNÂˆ™XÛÜ™œÝ]\ÏIÜ™]šY]ÙY	ÎÈ\ÜÙ\›ÚÊ[K™Ù]Ù™™\œÊšYKšY
+KœÛÛYJÏO›ËšYOO[Ù™™\‹šY
+JNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠÙ™™\‹šY
+JNÂŸJNÂ\Ý
+	ÛÙ™™\‹\Ý]HÝZY[˜ÙH\È[Z]YÈHÝÛš[™È\ÜÙ[™Ù\‰Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJKÝÛ™\[KœÝ]Kœ›Ùš[NÂˆK\ÙT™]šY]ÙYš^\™J
+NÈ\ÜÙ\›ÝÜÊ
+
+OO›K›Ù™™\”Ý[[X\žJšYKšY
+Køàdøàk¹¤ãy/gÊNÂˆK˜ÚÛÜÙT›ÛJ	Ü\ÜÙ[™Ù\‰ÊNÈKœÝ]Kœ›Ùš[O^Ë‹‹›ÝÛ™\‹Y‰Ý[œ™[]Y\\ÜÙ[™Ù\‰ßNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K›Ù™™\”Ý[[X\žJšYKšY
+Kúe¬º)©øàiøàcxào¸àføà¤ËÊNÂˆKœÝ]Kœ›Ùš[O[ÝÛ™\ŽÈ\ÜÙ\›ÝÜÊ
+
+OO›K›Ù™™\”Ý[[X\žJ	ÛZ\ÜÚ[™Ë\šYIÊKúe¬º)©øàiøàcxào¸àføà¤ËÊNÂŸJNÂ‚\Ý
+	ÛÙ™™\ˆÙ[XÝ[ÛˆY˜[˜Ù\ÈH™\]Y\Ý™]š\Ú[Ûˆ[™™Z™XÝÈHÝ[H™\X]	Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆ\ÜÙ\™\]X[
+šYKœ™]š\Ú[Û‹JNÈKœÙ[XÝÙ™™\ŠÙ™™\‹šYJNÂˆ\ÜÙ\™\]X[
+šYKœÝ]\Ë	Ø\ÜÚYÛ™Y	ÊNÈ\ÜÙ\™\]X[
+šYKœ™]š\Ú[Û‹ŠNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠÙ™™\‹šYJKùb)xàk¹å.úgh¸àiù¦í9¥¬ÊNÂŸJNÂ\Ý
+	ØØ[˜Ù[][ÛˆÚ[œÈ[ˆXØÙ\ØØ[˜Ù[˜XÙH[™Ý[HÙ[XÝ[ÛˆÚ[™Ù\È›Ý[™ÉË
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆK˜Ø[˜Ù[šYJšYKšYJNÈÛÛœÝY\Ø[˜Ù[R”ÓÓ‹œÝš[™ÚYžJšYJNÂˆ\ÜÙ\™\]X[
+šYKœ™]š\Ú[Û‹ŠNÈ\ÜÙ\›ÝÜÊ
+
+OO›KœÙ[XÝÙ™™\ŠÙ™™\‹šYJKùb)xàk¹å.úgh¸àiù¦í9¥¬ÊNÂˆ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJšYJKY\Ø[˜Ù[
+NÂŸJNÂ\Ý
+	ÜÙ[XÝ[ÛˆÚ[œÈ[ˆXØÙ\ØØ[˜Ù[˜XÙH[™Ý[HØ[˜Ù[][Ûˆ]\Ý™Yœ™\Úš\œÝ	Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJKÙ™™\[K™Ù]Ù™™\œÊšYKšY
+VÌNÂˆKœÙ[XÝÙ™™\ŠÙ™™\‹šYJNÈÛÛœÝY\”Ù[XÝR”ÓÓ‹œÝš[™ÚYžJšYJNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜Ø[˜Ù[šYJšYKšYJKùb)xàk¹å.úgh¸àiù¦í9¥¬ÊNÈ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJšYJKY\”Ù[XÝ
+NÂˆK˜Ø[˜Ù[šYJšYKšYŠNÈ\ÜÙ\™\]X[
+šYKœÝ]\Ë	ØØ[˜Ù[Y	ÊNÈ\ÜÙ\™\]X[
+šYKœ™]š\Ú[Û‹ÊNÂŸJNÂ\Ý
+	ØHØ[˜Ù[][Ûˆ™]žH\ÈY[\Ý[]™[ˆÚ]HÜšYÚ[˜[^XÝY™]š\Ú[Û‰Ë
+
+HOˆÂˆÛÛœÝÛ_O\Ù]\
+
+NÈ\ÜÙ[™Ù\ŠJNÈÛÛœÝšYO[Kœ™\]Y\ÝšYJÜXÚÝ\‰Ñ[[ÈÝ[	Ë\Ý[˜][ÛŽ‰Ñ[[È™XXÚ	ßJNÂˆK˜Ø[˜Ù[šYJšYKšYJNÈÛÛœÝÛ˜ÙOR”ÓÓ‹œÝš[™ÚYžJšYJNÂˆ\ÜÙ\™\]X[
+K˜Ø[˜Ù[šYJšYKšYJKšYJNÈ\ÜÙ\™\]X[
+”ÓÓ‹œÝš[™ÚYžJšYJKÛ˜ÙJNÈ\ÜÙ\™\]X[
+šYKœ™]š\Ú[Û‹ŠNÂŸJNÂ\Ý
+	ØHÝ[Hš]™\ˆ˜[œÚ][ÛˆØ[››ÝÚÚ\H™]Ù\ˆš\Ý]IË
+
+HOˆÂˆÛÛœÝÛKšY_O\Ù[XÝY
+
+NÈ\ÜÙ\™\]X[
+šYKœ™]š\Ú[Û‹ŠNÂˆK\ÙT™]šY]ÙYš^\™J
+NÈK˜Y˜[˜ÙUš\
+šYKšYŠNÈ\ÜÙ\™\]X[
+šYKœÝ]\Ë	Ø\œš]š[™ÉÊNÈ\ÜÙ\™\]X[
+šYKœ™]š\Ú[Û‹ÊNÂˆ\ÜÙ\›ÝÜÊ
+
+OO›K˜Y˜[˜ÙUš\
+šYKšYŠKùb)xàk¹å.úgh¸àiù¦í9¥¬ÊNÈ\ÜÙ\™\]X[
+šYKœÝ]\Ë	Ø\œš]š[™ÉÊNÂŸJNÂ‚\Ý
+	ÛXXÚ[™K\™XYX›HTHÛÛ˜XÝ\ÜÙ\ÈH^XÝ]X›HXØÙ\[˜ÙHÚXÚÙ\‰Ë
+
+HOˆÂˆ\ÜÙ\™Y\\]X[
+˜[Y]PÛÛ˜XÝ
+ØYÛÛ˜XÝ
+
+JK×JNÂŸJNÂ\Ý
+	ÐTHÛÛ˜XÝ[[Y\˜]\È]™\žH\ÜÙ[™Ù\ˆ[™š]™\ˆÜ\˜][Ûˆ^XÝHÛ˜ÙIË
+
+HOˆÂˆÛÛœÝÜXÏ[ØYÛÛ˜XÝ
+
+KYÏV×NÂˆ›ÜŠÛÛœÝÛY]Ù›Ý]KYHÙˆÔTUSÓ”Ê^Ø\ÜÙ\™\]X[
+ÜXËœ]ÖÜ›Ý]WVÛY]ÙK›Ü\˜][Û’YY
+NÚYËœ\Ú
+Y
+NßBˆ\ÜÙ\™\]X[
+™]ÈÙ]
+YÊKœÚ^™KÔTUSÓ”Ë›[™Ý
+NÂŸJNÂ\Ý
+	Ø[Ý]KXÚ[™Ú[™ÈTHÛÛ[X[™È™\]Z\™H[ˆY[\Ý[˜ÞHÙ^IË
+
+HOˆÂˆÛÛœÝÜXÏ[ØYÛÛ˜XÝ
+
+NÂˆ›ÜŠÛÛœÝÛY]Ù›Ý]KYHÙˆÔTUSÓ”Ë™š[\Š
+ÛY]ÙJOO›Y]ÙOOIÜÜÝ	ÊJ^ÂˆÛÛœÝ]][O\ÜXËœ]ÖÜ›Ý]WK\˜[Y]\œÏVË‹‹Š]][Kœ\˜[Y]\œß×JK‹‹Š]][VÛY]ÙKœ\˜[Y]\œß×JWNÂˆÛÛœÝ™\ÛÛ™Y\\˜[Y]\œË›X\
+Oœ‰™YÜÜXË˜ÛÛ\Û™[Ëœ\˜[Y]\œÖÜ‰™Y‹œÜ]
+	ËÉÊK˜]
+LJWNœ
+NÂˆ\ÜÙ\›ÚÊ™\ÛÛ™YœÛÛYJOœ›˜[YOOOIÒY[\Ý[˜ÞKRÙ^IÉ‰œš[OOIÚXY\‰É‰œœ™\]Z\™Y
+KY
+NÂˆBŸJNÂ\Ý
+	ÐTH[œ]È™]™\ˆXØÙ\Ø[\‹XÛÛ›ÛYXÝÜˆÜˆ\›Ý˜[šY[ÉË
+
+HOˆÂˆÛÛœÝ^R”ÓÓ‹œÝš[™ÚYžJØYÛÛ˜XÝ
+
+K˜ÛÛ\Û™[ËœØÚ[X\ÊNÂˆ›ÜŠÛÛœÝšY[ÙˆÉÜ\ÜÙ[™Ù\’Y	Ë	Ùš]™\’Y	Ë	Ü™]šY]Ù\’Y	Ë	Ø\›Ý™Y	Ë	Ù[YÚX›IË	Ü™]šY]ÔÝ]\É×JH\ÜÙ\›ÚÊ]^š[˜ÛY\Ê‰ÙšY[W˜
+KšY[
+NÂŸJNÂ\Ý
+	ÐTHÛÛ˜XÝš^\È[Û™^K™]š\Ú[Ûˆ[™ØÚY[YXÚÝ\™\™\Ù[][ÛœÉË
+
+HOˆÂˆÛÛœÝØÚ[X\Ï[ØYÛÛ˜XÝ
+
+K˜ÛÛ\Û™[ËœØÚ[X\ÎÂˆ\ÜÙ\™Y\\]X[
+ØÚ[X\Ë”™]š\Ú[Û‹Ý\N‰Ú[YÙ\‰ËZ[š[][NŒ_JNÂˆ\ÜÙ\™\]X[
+ØÚ[X\ËÜ™X]SÙ™™\’[œ]œ›Ü\Y\Ë™˜\™PÙ[Ë\K	Ú[YÙ\‰ÊNÂˆ\ÜÙ\™\]X[
+ØÚ[X\ËÜ™X]TšYT™\]Y\Ý[œ]œ›Ü\Y\ËœXÚÝ\]™›Ü›X]	Ù]K][YIÊNÂˆ\ÜÙ\™\]X[
+ØÚ[X\ËÜ™X]TšYT™\]Y\Ý[œ]œ›Ü\Y\ËœXÚÝ\[YV›Û™K˜ÛÛœÝ	ÔXÚYšXËÑšZšIÊNÂˆ\ÜÙ\™\]X[
+ØÚ[X\Ë”Ù[XÝY][ÝKœ™XYÛ›KYJNÂŸJNÂ\Ý
+	ÐTHÛÛ˜XÝ[Z]ÈØ[˜Ù[][Ûˆ™X\ÛÛœÈÈH™YH™]šY]ÙYYX[š[™ÜÉË
+
+HOˆÂˆÛÛœÝØÚ[XO[ØYÛÛ˜XÝ
+
+K˜ÛÛ\Û™[ËœØÚ[X\ËØ[˜Ù[šYR[œ]Âˆ\ÜÙ\™Y\\]X[
+ØÚ[XKœ›Ü\Y\Ëœ™X\ÛÛ‹™[[KÐSÑSUSÓ—Ô‘PTÓÓ”ÊNÂˆ\ÜÙ\›ÚÊØÚ[XKœ™\]Z\™Yš[˜ÛY\Ê	Ü™X\ÛÛ‰ÊJNÂˆ›ÜŠÛÛœÝÚ[™ÙHÙˆÂˆ™X\ÛÛœÏOœ™X\ÛÛœË˜ÛÛ˜Ø]
+	ÜÙX\˜ÚÙY]Y	ÊKˆ™X\ÛÛœÏOœ™X\ÛÛœË™š[\Š™X\ÛÛOœ™X\ÛÛˆOOIÜØÚY[WØÚ[™ÙY	ÊBˆJ^ÂˆÛÛœÝÚ[™ÙY\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆÚ[™ÙY˜ÛÛ\Û™[ËœØÚ[X\ËØ[˜Ù[šYR[œ]œ›Ü\Y\Ëœ™X\ÛÛ‹™[[OXÚ[™ÙJÚ[™ÙY˜ÛÛ\Û™[ËœØÚ[X\ËØ[˜Ù[šYR[œ]œ›Ü\Y\Ëœ™X\ÛÛ‹™[[JNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+Ú[™ÙY
+KœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÐØ[˜Ù[šYR[œ]™X\ÛÛˆ]\Ý[ÝÈ^XÝIÊJJNÂˆBŸJNÂ\Ý
+	ÐTHÚXÚÙ\ˆ˜Z[ÈÛÜÙYÚ[ˆØY™]H™\]Z\™[Y[È\™H™[[Ý™Y	Ë
+
+HOˆÂˆÛÛœÝ›ÒÙ^O\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆ›ÒÙ^Kœ]ÖÉËÝŒKÛÙ™™\œËÞÛÙ™™\’YKÜÙ[XÝ	×KœÜÝœ\˜[Y]\œÏ[›ÒÙ^Kœ]ÖÉËÝŒKÛÙ™™\œËÞÛÙ™™\’YKÜÙ[XÝ	×KœÜÝœ\˜[Y]\œË™š[\ŠOˆ\‰™Y‹™[™ÕÚ]
+	ËÒY[\Ý[˜ÞRÙ^IÊJNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+›ÒÙ^JKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÜÙ[XÝšYSÙ™™\ˆ™\]Z\™\ÈY[\Ý[˜ÞKRÙ^IÊJJNÂˆÛÛœÝ[š™XÝY\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆ[š™XÝY˜ÛÛ\Û™[ËœØÚ[X\ËÜ™X]SÙ™™\’[œ]œ›Ü\Y\Ë™š]™\’Y^Ý\N‰ÜÝš[™ÉßNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+[š™XÝY
+KœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÜÙ\™\‹[ÝÛ™Yš]™\’Y	ÊJJNÂˆÛÛœÝZ\ÜÚ[™Õ™ZXÛQ\œ›Ü\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆZ\ÜÚ[™Õ™ZXÛQ\œ›Ü‹˜ÛÛ\Û™[ËœØÚ[X\Ë‘\œ›Ü‹œ›Ü\Y\Ë˜ÛÙK™[[O[Z\ÜÚ[™Õ™ZXÛQ\œ›Ü‹˜ÛÛ\Û™[ËœØÚ[X\Ë‘\œ›Ü‹œ›Ü\Y\Ë˜ÛÙK™[[K™š[\ŠÛÙOO˜ÛÙHOOIÝ™ZXÛWØÛÛ™š\›X][Û—Ü™\]Z\™Y	ÊNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+Z\ÜÚ[™Õ™ZXÛQ\œ›ÜŠKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	Ñ\œ›ÜˆÛÙH[[H™\]Z\™\È™ZXÛWØÛÛ™š\›X][Û—Ü™\]Z\™Y	ÊJJNÂˆÛÛœÝXZÙYšYTÝ]O\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆXZÙYšYTÝ]K˜ÛÛ\Û™[ËœØÚ[X\Ë”šYTÝ]UšY]Ëœ›Ü\Y\Ë˜\ÜÚYÛ™Yš]™\’Y^Ý\N‰ÜÝš[™ÉßNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+XZÙYšYTÝ]JKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÔšYTÝ]UšY]È]\Ý›Ý^ÜÙHš]˜]HšY[\ÜÚYÛ™Yš]™\’Y	ÊJJNÂˆÛÛœÝ›ÐÛÛ™][Û˜[\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆ[]H›ÐÛÛ™][Û˜[œ]ÖÉËÝŒKÜšY\ËÞÜ™\]Y\ÝYI×K™Ù]œ™\ÜÛœÙ\ÖÉÌÌ	×NÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+›ÐÛÛ™][Û˜[
+KœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÙÙ]šYTÝ]H]\ÝØÝ[Y[›Ù[\ÜÈÌ	ÊJJNÂˆÛÛœÝÚ\™YØXÚO\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆÚ\™YØXÚK˜ÛÛ\Û™[ËšXY\œË”š]˜]S›ÐØXÚKœØÚ[XK˜ÛÛœÝIÜX›XËX^XYÙOMŒ	ÎÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+Ú\™YØXÚJKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÜšYHÝ]HØXÚHÛÛ›Û]\Ý™Hš]˜]K›ËXØXÚIÊJJNÂˆÛÛœÝÝÜ™YÙ™™\œÏ\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆÝÜ™YÙ™™\œË˜ÛÛ\Û™[ËšXY\œË”š]˜]S›ÔÝÜ™KœØÚ[XK˜ÛÛœÝIÜX›XËX^XYÙOMŒ	ÎÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+ÝÜ™YÙ™™\œÊKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÛÙ™™\ˆ\ÝØXÚHÛÛ›Û]\Ý™Hš]˜]K›Ë\ÝÜ™IÊJJNÂˆÛÛœÝZ\ÜÚ[™ÓÙ™™\•˜\žO\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆ[]HZ\ÜÚ[™ÓÙ™™\•˜\žKœ]ÖÉËÝŒKÜšYK\™\]Y\ÝËÞÜ™\]Y\ÝYKÛÙ™™\œÉ×K™Ù]œ™\ÜÛœÙ\ÖÉÌŒ	×KšXY\œË•˜\žNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+Z\ÜÚ[™ÓÙ™™\•˜\žJKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	Û\ÝšYSÙ™™\œÈŒ™\]Z\™\È˜\žHXY\‰ÊJJNÂˆÛÛœÝØXÚXX›SÙ™™\‘[šX[\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆ[]HØXÚXX›SÙ™™\‘[šX[˜ÛÛ\Û™[Ëœ™\ÜÛœÙ\Ë”š]˜]T›ÛQ[šYYšXY\œÖÉÐØXÚKPÛÛ›Û	×NÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+ØXÚXX›SÙ™™\‘[šX[
+KœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	Û\ÝšYSÙ™™\œÈÈ™\]Z\™\ÈØXÚKPÛÛ›ÛXY\‰ÊJJNÂˆÛÛœÝÛÛ™][Û˜[Ù™™\œÏ\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆÛÛ™][Û˜[Ù™™\œËœ]ÖÉËÝŒKÜšYK\™\]Y\ÝËÞÜ™\]Y\ÝYKÛÙ™™\œÉ×K™Ù]œ™\ÜÛœÙ\ÖÉÌÌ	×O^Ù\ØÜš\[ÛŽ‰Ó›Ý[ÙYšYY	ßNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+ÛÛ™][Û˜[Ù™™\œÊKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	Û\ÝšYSÙ™™\œÈ]\Ý™]\›ˆHÛÛ\]HŒ™\ÜÛœÙH[œÝXYÙˆÌ	ÊJJNÂˆÛÛœÝ›ÓÙ™™\”Ù\™\•[YO\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆ›ÓÙ™™\”Ù\™\•[YK˜ÛÛ\Û™[ËœØÚ[X\Ë“Ù™™\“\Ýœ™\]Z\™Y[›ÓÙ™™\”Ù\™\•[YK˜ÛÛ\Û™[ËœØÚ[X\Ë“Ù™™\“\Ýœ™\]Z\™Y™š[\ŠšY[O™šY[OOIÜÙ\™\“›ÝÉÊNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+›ÓÙ™™\”Ù\™\•[YJKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÓÙ™™\“\Ý™\]Z\™\ÈH™XY[Û›H]K][YHÙ\™\“›ÝÉÊJJNÂˆÛÛœÝ›ÓÙ™™\”™Yœ™\ÚXY[™O\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆ›ÓÙ™™\”™Yœ™\ÚXY[™K˜ÛÛ\Û™[ËœØÚ[X\Ë“Ù™™\“\Ýœ™\]Z\™Y[›ÓÙ™™\”™Yœ™\ÚXY[™K˜ÛÛ\Û™[ËœØÚ[X\Ë“Ù™™\“\Ýœ™\]Z\™Y™š[\ŠšY[O™šY[OOIÛ™^^\žP]	ÊNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+›ÓÙ™™\”™Yœ™\ÚXY[™JKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÓÙ™™\“\Ý™\]Z\™\ÈH[X›H™XY[Û›H]K][YH™^^\žP]	ÊJJNÂˆÛÛœÝ›Ô˜]S[Z]\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆ[]H›Ô˜]S[Z]œ]ÖÉËÝŒKÜšY\ËÞÜ™\]Y\ÝYI×K™Ù]œ™\ÜÛœÙ\ÖÉÍŽI×NÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+›Ô˜]S[Z]
+KœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÙÙ]šYTÝ]H]\ÝØÝ[Y[ŽIÊJJNÂˆÛÛœÝ›Ô™]žPY\\ÝXÝ\™YÛÛ™JØYÛÛ˜XÝ
+
+JNÂˆ[]H›Ô™]žPY\‹˜ÛÛ\Û™[Ëœ™\ÜÛœÙ\Ë”Ù\šXÙU[˜]˜Z[X›KšXY\œÖÉÔ™]žKPY\‰×NÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+›Ô™]žPY\ŠKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÙÙ]šYTÝ]HLÈ™\]Z\™\È™]žKPY\ˆXY\‰ÊJJNÂŸJNÂ\Ý
+	ØÝ\œ™[\šYH\ØÛÝ™\žHÛÛ˜XÝ\š]™\ÈØÛÜHœ›ÛH]][XØ][Ûˆ[™˜Z[ÈÛÜÙY	Ë
+
+HOˆÂˆÛÛœÝÜXÏ[ØYÛÛ˜XÝ
+
+KÜ\˜][Û\ÜXËœ]ÖÉËÝŒKÜšY\ËØÝ\œ™[	×K™Ù]Âˆ\ÜÙ\™\]X[
+Ü\˜][Û‹›Ü\˜][Û’Y	ÙÙ]Ý\œ™[šYIÊNÂˆ\ÜÙ\™Y\\]X[
+Ü\˜][Û‹œ\˜[Y]\œË[™Yš[™Y
+NÂˆ\ÜÙ\›ÚÊÜ\˜][Û‹œ™\ÜÛœÙ\ÖÉÌŒ	×JNÂˆ\ÜÙ\›ÚÊÜ\˜][Û‹œ™\ÜÛœÙ\ÖÉÌŒ	×JNÂˆ\ÜÙ\›ÚÊÜ\˜][Û‹œ™\ÜÛœÙ\ÖÉÍI×JNÂˆ\ÜÙ\™\]X[
+Ü\˜][Û‹œ™\ÜÛœÙ\ÖÉÌÌ	×K[™Yš[™Y
+NÂˆÛÛœÝÚ]šYRY\ÝXÝ\™YÛÛ™JÜXÊNÂˆÚ]šYRYœ]ÖÉËÝŒKÜšY\ËØÝ\œ™[	×K™Ù]œ\˜[Y]\œÏVÞÛ˜[YN‰Ü™\]Y\ÝY	Ë[Ž‰Ü]Y\žIË™\]Z\™Y™˜[ÙKØÚ[XNžÝ\N‰ÜÝš[™Éß_WNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+Ú]šYRY
+KœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÝÚ]Ý]]Üˆ]Y\žHY[YšY\œÉÊJJNÂˆÛÛœÝÚ]Ý][\O\ÝXÝ\™YÛÛ™JÜXÊNÂˆ[]HÚ]Ý][\Kœ]ÖÉËÝŒKÜšY\ËØÝ\œ™[	×K™Ù]œ™\ÜÛœÙ\ÖÉÌŒ	×NÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+Ú]Ý][\JKœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	ÙÙ]Ý\œ™[šYH]\ÝØÝ[Y[Œ	ÊJJNÂˆÛÛœÝÛÛ™][Û˜[\ÝXÝ\™YÛÛ™JÜXÊNÂˆÛÛ™][Û˜[œ]ÖÉËÝŒKÜšY\ËØÝ\œ™[	×K™Ù]œ™\ÜÛœÙ\ÖÉÌÌ	×O^Ù\ØÜš\[ÛŽ‰Ý[œØY™H[\HÝ\\™\ÜÛœÙIßNÂˆ\ÜÙ\›ÚÊ˜[Y]PÛÛ˜XÝ
+ÛÛ™][Û˜[
+KœÛÛYJY\ÜØYÙOO›Y\ÜØYÙKš[˜ÛY\Ê	Ù[Ý\\™\Ý[[œÝXYÙˆÌ	ÊJJNÂŸJNÂ\Ý
+	ÒÛÛ˜XÝ[›™\ˆ[™›Ü˜Ù\È›ÛKÝÛ™\œÚ\[YÚXš[]H[™ØY™H\œ›ÜœÈÝ™\ˆÛÜ˜XÚÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝ™\Ý[ÏX]ØZ][“[ØÚÐÛÛ˜XÝ
+
+NÂˆ\ÜÙ\™\]X[
+™\Ý[Ë›[™ÝM
+NÂˆ\ÜÙ\™\]X[
+™\Ý[Ë™š[\ŠOœ‹œÝ]\ÏOOM
+K›[™ÝJNÂˆ\ÜÙ\™\]X[
+™\Ý[Ë™š[\ŠOœ‹œÝ]\ÏOOMÊK›[™ÝÊNÂˆ\ÜÙ\™\]X[
+™\Ý[Ë™š[\ŠOœ‹œÝ]\ÏOOMJK›[™ÝJNÂˆ\ÜÙ\™\]X[
+™\Ý[Ë™š[\ŠOœ‹œÝ]\ÏOOMŒŠK›[™ÝŠNÂˆ\ÜÙ\™\]X[
+™\Ý[Ë™š[\ŠOœ‹œÝ]\ÏÌ
+K›[™ÝÊNÂŸJNÂ\Ý
+	ÒØ[˜Ù[][Ûˆ™\Ù\™\ÈÛ›H™]šY]ÙY™X\ÛÛœÈ[™™Z™XÝÈ[\\™Y[œ]Ú]Ý]ÚYHY™™XÝÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÛÛ˜XÝX]ØZ]Ø[˜Ù[][Û”™X\ÛÛ”™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+ÛÛ˜XÝ˜[ÝÙY›X\
+][OOš][Kœ™X\ÛÛŠKÐSÑSUSÓ—Ô‘PTÓÓ”ÊNÂˆ›ÜŠÛÛœÝ][HÙˆÛÛ˜XÝ˜[ÝÙY
+^Âˆ\ÜÙ\™\]X[
+][Kœ™\Ý[œÝ]\ËŒ
+NÂˆ\ÜÙ\™\]X[
+][KœÝ]K˜Ø[˜Ù[™X\ÛÛ‹][Kœ™X\ÛÛŠNÂˆ\ÜÙ\™\]X[
+][K˜]Y]]™[ÖÌKœ™X\ÛÛ‹][Kœ™X\ÛÛŠNÂˆ\ÜÙ\™\]X[
+][K˜]Y]]™[ÖÌK›Ý]ÛÛYK	ØÛÛ[Z]Y	ÊNÂˆBˆ\ÜÙ\™Y\\]X[
+ÛÛ˜XÝš[˜[Y›X\
+][OO–Ú][KœÝ]\Ë][K˜›ÙK˜ÛÙWJK\œ˜^J
+K™š[
+ÍŒ‹	Ú[˜[YÜ™\]Y\Ý	×JJNÂˆ\ÜÙ\™Y\\]X[
+ÛÛ˜XÝš[˜[YÝ]KÚY‘’VT‘Kœ™\]Y\ÝYÝ]\Î‰ØÛÛXÝ[™ÉË™]š\Ú[ÛŽ‘’VT‘Kœ™]š\Ú[Û‹\ÜÚYÛ™Yš]™\’Y›[™ZXÛPÛÛ™š\›X][ÛŽ›[JNÂˆ\ÜÙ\™Y\\]X[
+ÛÛ˜XÝš[˜[Y]Y]]™[Ë×JNÂˆ\ÜÙ\™\]X[
+ÛÛ˜XÝš[˜[YÝÜ™YÙ^\Ë
+NÂŸJNÂ\Ý
+	Ù^XÝØ[˜Ù[][Ûˆ™\^H™]\›œÈHÜšYÚ[˜[™X\ÛÛˆÚ]Ý]\XØ]HÝ]HÜˆ]Y]	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝØ[ÝÙYOX]ØZ]Ø[˜Ù[][Û”™X\ÛÛ”™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ][HÙˆ[ÝÙY
+^Âˆ\ÜÙ\™Y\\]X[
+][Kœ™\^K][Kœ™\Ý[
+NÂˆ\ÜÙ\™\]X[
+][KœÝ]K˜Ø[˜Ù[™X\ÛÛ‹][Kœ™X\ÛÛŠNÂˆ\ÜÙ\™\]X[
+][KœÝ]Kœ™]š\Ú[Û‹’VT‘Kœ™]š\Ú[ÛŠÌJNÂˆ\ÜÙ\™\]X[
+][K˜]Y]]™[Ë›[™ÝJNÂˆ\ÜÙ\™\]X[
+][KœÝÜ™YÙ^\ËJNÂˆBŸJNÂ\Ý
+	Ø[ˆY[\Ý[˜ÞHÙ^HØ[››Ý™H™]\ÙYÈ™\XÙHH™XÛÜ™YØ[˜Ù[][Ûˆ™X\ÛÛ‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝØ[ÝÙYOX]ØZ]Ø[˜Ù[][Û”™X\ÛÛ”™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ][HÙˆ[ÝÙY
+^Âˆ\ÜÙ\››Ý\]X[
+][K˜Ú[™ÙY™X\ÛÛ‹][Kœ™X\ÛÛŠNÂˆ\ÜÙ\™Y\\]X[
+Ú][K˜ÛÛ™›XÝœÝ]\Ë][K˜ÛÛ™›XÝ˜›ÙK˜ÛÙWKÍK	ÚY[\Ý[˜ÞWØÛÛ™›XÝ	×JNÂˆ\ÜÙ\™\]X[
+][KœÝ]K˜Ø[˜Ù[™X\ÛÛ‹][Kœ™X\ÛÛŠNÂˆ\ÜÙ\™\]X[
+][K˜]Y]]™[ÖÌKœ™X\ÛÛ‹][Kœ™X\ÛÛŠNÂˆBŸJNÂ\Ý
+	ØH™]ÈY[\Ý[˜ÞHÙ^HØ[››Ý™XÛ\ÜÚYžH[ˆ[™XYHØ[˜Ù[Y™\]Y\Ý	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÚ[[]]X›_OX]ØZ]Ø[˜Ù[][Û”™X\ÛÛ”™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+[[]]X›K›X\
+][OOš][Kœ™X\ÛÛŠKÐSÑSUSÓ—Ô‘PTÓÓ”ÊNÂˆ›ÜŠÛÛœÝ][HÙˆ[[]]X›J^Âˆ\ÜÙ\››Ý\]X[
+][K˜Ú[™ÙY™X\ÛÛ‹][Kœ™X\ÛÛŠNÂˆ\ÜÙ\™Y\\]X[
+Ú][K˜ÛÛ[Z]YœÝ]\Ë][K˜[Y[™Y[œÝ]\Ë][K˜[Y[™Y[˜›ÙK˜ÛÙWKÌŒK	Ú[˜[YÝ˜[œÚ][Û‰×JNÂˆ\ÜÙ\™\]X[
+][KœÝ]K˜Ø[˜Ù[™X\ÛÛ‹][Kœ™X\ÛÛŠNÂˆ\ÜÙ\™\]X[
+][KœÝ]Kœ™]š\Ú[Û‹’VT‘Kœ™]š\Ú[ÛŠÌJNÂˆ\ÜÙ\™Y\\]X[
+][K˜]Y]]™[Ë›X\
+]™[O–Ù]™[›Ý]ÛÛYK]™[œ™X\ÛÛ—JKÖÉØÛÛ[Z]Y	Ë][Kœ™X\ÛÛ—KÉÜ™Z™XÝY	Ë	Ú[˜[YÝ˜[œÚ][Û‰×WJNÂˆ\ÜÙ\™\]X[
+][KœÝÜ™YÙ^\ËŠNÂˆBŸJNÂ\Ý
+	ÒÛÛ˜XÝØÙ[˜\š[ÜÈÛÛ˜ÙX[›Ü™ZYÛˆ™\ÛÝ\˜Ù\È[œÝXYÙˆXZÚ[™ÈÝÛ™\œÚ\	Ë
+
+HOˆÂˆÛÛœÝY[ZØÙ[˜\š[ÜÊ
+K™š[\ŠÏOœË˜ÛÛ˜ÙX[Y
+NÂˆ\ÜÙ\™Y\\]X[
+Y[‹›X\
+ÏOœË™^XÝYÌJKÍJNÂˆ\ÜÙ\›ÚÊY[‹™]™\žJÏOœË™^XÝYÌWOOOIÜ™\ÛÝ\˜ÙWÛ›ÝÙ›Ý[™	ÊJNÂŸJNÂ\Ý
+	ÒÛÛ˜XÝ[›™\ˆ˜Z[ÈÚ[ˆH\›Z\ÜÚ]™H˜[œÜÜ™]\›œÈÝXØÙ\ÜÈ›Üˆ]™\žH™\]Y\Ý	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ\›Z\ÜÚ]™Q™]ÚX\Þ[˜Ê
+OOŠÜÝ]\ÎŒŒ^˜\Þ[˜Ê
+OO‰ÞßIËXY\œÎžÙÙ]Š
+OO›[_JNÂˆ]ØZ]\ÜÙ\œ™Z™XÝÊ[’ÛÛ˜XÝ
+	Ú‹ËÛ[ØÚËš[˜[Y	Ë[™Yš[™Y\›Z\ÜÚ]™Q™]Ú
+KÛ›ÈÙ\ÜÚ[ÛˆØ[››Ý™XYÙ™™\œËÊNÂŸJNÂ\Ý
+	Ø]][XØ]Y\ÜÙ[™Ù\ˆ[™\ÜÚYÛ™Yš]™\ˆ\ØÛÝ™\ˆ›ÛK\Ú\YÝ\œ™[Ý]HÚ]Ý]HšYHQ	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÜ\ÜÙ[™Ù\‹š]™\ŸOX]ØZ]Ý\œ™[šYQ\ØÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+Ü\ÜÙ[™Ù\‹œÝ]\Ë\ÜÙ[™Ù\‹˜›ÙKšY]Ù\”›ÛK\ÜÙ[™Ù\‹˜›ÙK›™^XÝ[Û—KÌŒ	Ü\ÜÙ[™Ù\‰Ë	Ý˜XÚ×ÜXÚÝ\	×JNÂˆ\ÜÙ\™Y\\]X[
+Ùš]™\‹œÝ]\Ëš]™\‹˜›ÙKšY]Ù\”›ÛKš]™\‹˜›ÙK›™^XÝ[Û—KÌŒ	Ùš]™\‰Ë	ÜÝ\ÜXÚÝ\	×JNÂˆÛÛœÝØY™QšY[ÏVÉÚY	Ë	ÜÝ]\ÉË	Ü™]š\Ú[Û‰Ë	ÝšY]Ù\”›ÛIË	Û™^XÝ[Û‰Ë	Ý\]Y]	×NÂˆ\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\Ê\ÜÙ[™Ù\‹˜›ÙJKØY™QšY[ÊNÂˆ\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\Êš]™\‹˜›ÙJKØY™QšY[ÊNÂŸJNÂ\Ý
+	Ý[œ™[]Y]][XØ]YXÝÜœÈ™XÙZ]™H›Ù[\ÜÈŒÚ]Ý]›Ü™ZYÛˆšYH]Z[ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÛÝ\”\ÜÙ[™Ù\‹Ý\‘š]™\ŸOX]ØZ]Ý\œ™[šYQ\ØÛÝ™\žT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ™\Ý[ÙˆÛÝ\”\ÜÙ[™Ù\‹Ý\‘š]™\—J^Âˆ\ÜÙ\™Y\\]X[
+Ü™\Ý[œÝ]\Ë™\Ý[˜›ÙWKÌŒ[JNÂˆ\ÜÙ\™\]X[
+™\Ý[šXY\œË˜ØXÚPÛÛ›Û	Üš]˜]K›ËXØXÚIÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šXY\œË˜\žK	Ð]]Üš^˜][Û‰ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šXY\œË™]YË[
+NÂˆBŸJNÂ\Ý
+	ØÛÛ\]Y[™Ø[˜Ù[YšY\È\™H^ÛYYœ›ÛHÝ\œ™[\šYH\ØÛÝ™\žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝØÛÛ\]Y\ÜÙ[™Ù\‹ÛÛ\]Yš]™\‹Ø[˜Ù[Y\ÜÙ[™Ù\‹Ø[˜Ù[Yš]™\ŸOX]ØZ]Ý\œ™[šYQ\ØÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+ØÛÛ\]Y\ÜÙ[™Ù\‹œÝ]\ËÛÛ\]Y\ÜÙ[™Ù\‹˜›ÙWKÌŒ[JNÂˆ\ÜÙ\™Y\\]X[
+ØÛÛ\]Yš]™\‹œÝ]\ËÛÛ\]Yš]™\‹˜›ÙWKÌŒ[JNÂˆ\ÜÙ\™Y\\]X[
+ØØ[˜Ù[Y\ÜÙ[™Ù\‹œÝ]\ËØ[˜Ù[Y\ÜÙ[™Ù\‹˜›ÙWKÌŒ[JNÂˆ\ÜÙ\™Y\\]X[
+ØØ[˜Ù[Yš]™\‹œÝ]\ËØ[˜Ù[Yš]™\‹˜›ÙWKÌŒ[JNÂŸJNÂ\Ý
+	Û][\H[™š[š\ÚYØ[™Y]\ÈÝÜÚ]H›Û‹Y\ØÛÜÚ[™ÈÛÛ™›XÝ	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÛ][\_OX]ØZ]Ý\œ™[šYQ\ØÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+][\KœÝ]\ËJNÂˆ\ÜÙ\™\]X[
+][\K˜›ÙK˜ÛÙK	Ø[XšYÝ[Ý\×ØÝ\œ™[ÜšYIÊNÂˆ\ÜÙ\›X]Ú
+][\K˜›ÙKœ™\]Y\ÝY×˜XÙK[[ØÚËKÊNÂˆ\ÜÙ\›ÚÊR”ÓÓ‹œÝš[™ÚYžJ][\K˜›ÙJKš[˜ÛY\Ê’VT‘Kœ™\]Y\ÝY
+JNÂˆ\ÜÙ\›ÚÊR”ÓÓ‹œÝš[™ÚYžJ][\K˜›ÙJKš[˜ÛY\Ê	ÜšYKY\XØ]KYš^\™IÊJNÂŸJNÂ\Ý
+	ØÝ\œ™[\šYH\ØÛÝ™\žH™Z™XÝÈZ\ÜÚ[™È]][XØ][Ûˆ[™Ø[\‹\Ý\YYšYHQÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÝ[˜]][XØ]Y[š™XÝYYOX]ØZ]Ý\œ™[šYQ\ØÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+Ý[˜]][XØ]YœÝ]\Ë[˜]][XØ]Y˜›ÙK˜ÛÙWKÍK	Ø]][XØ][Û—Ü™\]Z\™Y	×JNÂˆ\ÜÙ\™Y\\]X[
+Ú[š™XÝYYœÝ]\Ë[š™XÝYY˜›ÙK˜ÛÙWKÍŒ‹	Ú[˜[YÜ™\]Y\Ý	×JNÂŸJNÂ\Ý
+	ØÝ\œ™[\šYH\ØÛÝ™\žH\ÈHÚYKYY™™XÝYœ™YHš]˜]H[™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÜ\ÜÙ[™Ù\‹š]™\‹™Y›Ü™KY\ŸOX]ØZ]Ý\œ™[šYQ\ØÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+Y\‹™Y›Ü™JNÂˆ\ÜÙ\™\]X[
+\ÜÙ[™Ù\‹šXY\œË˜ØXÚPÛÛ›Û	Üš]˜]K›ËXØXÚIÊNÂˆ\ÜÙ\™\]X[
+\ÜÙ[™Ù\‹šXY\œË˜\žK	Ð]]Üš^˜][Û‰ÊNÂˆ\ÜÙ\›X]Ú
+\ÜÙ[™Ù\‹šXY\œË™]YË×ˆ–ÐKV˜K^ŒNWËW^ÌH‰ÊNÂˆ\ÜÙ\››Ý\]X[
+\ÜÙ[™Ù\‹šXY\œË™]YËš]™\‹šXY\œË™]YÊNÂŸJNÂ\Ý
+	ØÛÛ˜Ý\œ™[Ù™™\ˆÙ[XÝ[Ûˆ[™Ø[˜Ù[][Ûˆ›ÙXÙH^XÝHÛ™HÚ[›™\‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙOX]ØZ][ÛÛ˜Ý\œ™[˜ÞPÛÛ˜XÝ
+
+NÂˆ\ÜÙ\™Y\\]X[
+˜XÙKœZ\‹›X\
+™\Ý[Oœ™\Ý[œÝ]\ÊKœÛÜ
+
+KŠOO˜KXŠKÌŒWJNÂˆ\ÜÙ\™\]X[
+˜XÙK›ÜÙ\‹˜›ÙK˜ÛÙK	ÜÝ[WÜ™]š\Ú[Û‰ÊNÂˆ\ÜÙ\™\]X[
+˜XÙK›ÜÙ\‹˜›ÙKœ™]š\Ú[Û‹ÊNÂˆ\ÜÙ\™\]X[
+˜XÙKœÝ]Kœ™]š\Ú[Û‹ÊNÂˆ\ÜÙ\™\]X[
+˜XÙKœÝ]KœÝ]\Ë˜XÙKÚ[›™\‹˜›ÙKœÝ]\ÊNÂŸJNÂ\Ý
+	Ù^XÝY[\Ý[˜ÞKRÙ^H™\^H™]\›œÈHœ›Þ™[ˆš\œÝÝXØÙ\ÜÈÚ]Ý][›Ý\ˆÚ[™ÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙOX]ØZ][ÛÛ˜Ý\œ™[˜ÞPÛÛ˜XÝ
+
+NÂˆ\ÜÙ\™\]X[
+˜XÙKœ™\^KœÝ]\ËŒ
+NÂˆ\ÜÙ\™Y\\]X[
+˜XÙKœ™\^K˜›ÙK˜XÙKÚ[›™\‹˜›ÙJNÂˆ\ÜÙ\™\]X[
+˜XÙKœÝ]Kœ™]š\Ú[Û‹ÊNÂˆ\ÜÙ\™\]X[
+˜XÙKœÝÜ™YÙ^\ËŠNÂŸJNÂ\Ý
+	Ü™]\Ú[™È[ˆY[\Ý[˜ÞKRÙ^HÚ]Ú[™ÙYÛÛ[\È™Z™XÝY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙOX]ØZ][ÛÛ˜Ý\œ™[˜ÞPÛÛ˜XÝ
+
+NÂˆ\ÜÙ\™\]X[
+˜XÙK˜ÛÛ™›XÝœÝ]\ËJNÂˆ\ÜÙ\™\]X[
+˜XÙK˜ÛÛ™›XÝ˜›ÙK˜ÛÙK	ÚY[\Ý[˜ÞWØÛÛ™›XÝ	ÊNÂˆ\ÜÙ\›X]Ú
+˜XÙK˜ÛÛ™›XÝ˜›ÙKœ™\]Y\ÝY×˜XÙK[[ØÚËKÊNÂŸJNÂ\Ý
+	ÜÙ\™\ˆÛØÚÈ™Z™XÝÈ[ˆ^\™YÙ™™\ˆÚ]Ý]Ú[™Ú[™ÈHšYIË\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜[Y]OX]ØZ][“Ù™™\•˜[Y]PÛÛ˜XÝ
+
+NÂˆ\ÜÙ\™\]X[
+˜[Y]K™^\™Yœ™\Ý[œÝ]\ËJNÂˆ\ÜÙ\™\]X[
+˜[Y]K™^\™Yœ™\Ý[˜›ÙK˜ÛÙK	ÛÙ™™\—Ù^\™Y	ÊNÂˆ\ÜÙ\™\]X[
+˜[Y]K™^\™Yœ™\Ý[˜›ÙKœ™]š\Ú[Û‹ŠNÂˆ\ÜÙ\™\]X[
+˜[Y]K™^\™Y›Ù™™\‹œÝ]\Ë	Ù^\™Y	ÊNÂˆ\ÜÙ\™Y\\]X[
+˜[Y]K™^\™YœšYKÚY‰ÜšYK[ÝÛ™\‹LIËÝ]\Î‰ØÛÛXÝ[™ÉË™]š\Ú[ÛŽŒ‹\ÜÚYÛ™Yš]™\’Y›[™ZXÛPÛÛ™š\›X][ÛŽ›[JNÂŸJNÂ\Ý
+	ÛÙ™™\ˆ\È^\™Y]H^XÝÙ\™\‹\ÚYH^\žH›Ý[™\žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜[Y]OX]ØZ][“Ù™™\•˜[Y]PÛÛ˜XÝ
+
+NÂˆ\ÜÙ\™\]X[
+˜[Y]K˜›Ý[™\žKœ™\Ý[˜›ÙK˜ÛÙK	ÛÙ™™\—Ù^\™Y	ÊNÂˆ\ÜÙ\™\]X[
+˜[Y]K˜›Ý[™\žK›Ù™™\‹œÝ]\Ô™X\ÛÛ‹	Ý[YIÊNÂˆ\ÜÙ\™\]X[
+˜[Y]K˜[Yœ™\Ý[œÝ]\ËŒ	ÛÛ™HZ[\ÙXÛÛ™™Y›Ü™H^\žH™[XZ[œÈÙ[XÝX›IÊNÂˆ\ÜÙ\™\]X[
+˜[Y]K˜[YœšYKœÙ[XÝY][ÝKœÙ[XÝY]	ÌŒ‹LKLMÕÎŒŒŒ‰ÊNÂŸJNÂ\Ý
+	ÜÙ[XÝ[Ûˆ™XÚXÚÜÈÝ\œ™[š]™\ˆ[YÚXš[]H[™[˜[Y]\ÈHÙ™™\‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜[Y]OX]ØZ][“Ù™™\•˜[Y]PÛÛ˜XÝ
+
+NÂˆ\ÜÙ\™\]X[
+˜[Y]Kš[™[YÚX›Kœ™\Ý[œÝ]\ËJNÂˆ\ÜÙ\™\]X[
+˜[Y]Kš[™[YÚX›Kœ™\Ý[˜›ÙK˜ÛÙK	Ùš]™\—Ý[˜]˜Z[X›IÊNÂˆ\ÜÙ\™\]X[
+˜[Y]Kš[™[YÚX›K›Ù™™\‹œÝ]\Ë	Ý[˜]˜Z[X›IÊNÂˆ\ÜÙ\™\]X[
+˜[Y]Kš[™[YÚX›K›Ù™™\‹œÝ]\Ô™X\ÛÛ‹	Ù[YÚXš[]IÊNÂˆ\ÜÙ\™\]X[
+˜[Y]Kš[™[YÚX›KœšYKœ™]š\Ú[Û‹ŠNÂŸJNÂ\Ý
+	ØÛY[Ø[››ÝÝ™\œšYHH\ÝYÙ™™\‹\Ù[XÝ[ÛˆÛØÚÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜[Y]OX]ØZ][“Ù™™\•˜[Y]PÛÛ˜XÝ
+
+NÂˆ\ÜÙ\™\]X[
+˜[Y]K˜ÛY[ÛØÚËœ™\Ý[œÝ]\ËŒŠNÂˆ\ÜÙ\™\]X[
+˜[Y]K˜ÛY[ÛØÚËœ™\Ý[˜›ÙK˜ÛÙK	Ú[˜[YÜ™\]Y\Ý	ÊNÂˆ\ÜÙ\™\]X[
+˜[Y]K˜ÛY[ÛØÚËœšYKœÝ]\Ë	ØÛÛXÝ[™ÉÊNÂˆ\ÜÙ\™\]X[
+˜[Y]K˜ÛY[ÛØÚË›Ù™™\‹œÝ]\Ë	ØXÝ]™IÊNÂŸJNÂ\Ý
+	ÛÙ™™\ˆ\Ý™]\›œÈÛ›H[ˆXÝ]™HÙ\™\‹][YYÙ™™\ˆÚ]]È^\žIË\Þ[˜È
+
+HOˆÂˆÛÛœÝØXÝ]™_OX]ØZ]Ù™™\“\Ý™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+XÝ]™Kœ™\Ý[œÝ]\ËŒ
+NÂˆ\ÜÙ\™Y\\]X[
+XÝ]™Kœ™\Ý[šXY\œËÙ]YÎ›[ØXÚPÛÛ›Û‰Üš]˜]K›Ë\ÝÜ™IË˜\žN‰Ð]]Üš^˜][Û‰ßJNÂˆ\ÜÙ\™\]X[
+XÝ]™Kœ™\Ý[˜›ÙKœÙ\™\“›ÝË	ÌŒ‹LKLMÕÎŒŒŒ‰ÊNÂˆ\ÜÙ\™\]X[
+XÝ]™Kœ™\Ý[˜›ÙK›™^^\žP]	ÌŒ‹LKLMÕÎŒŒÌŒ‰ÊNÂˆ\ÜÙ\™Y\\]X[
+XÝ]™Kœ™\Ý[˜›ÙKœÝ[[X\žKØXÝ]™NŒK^\™YŒ[˜]˜Z[X›NŒJNÂˆ\ÜÙ\™Y\\]X[
+XÝ]™Kœ™\Ý[˜›ÙK›Ù™™\œËÞÂˆY‘’VT‘K›Ù™™\’Y™\]Y\ÝY‘’VT‘Kœ™\]Y\ÝY˜\™PÙ[ÎŒŒÌ]SZ[]\ÎËˆÝ]\Î‰ØXÝ]™IË^\™\Ð]‰ÌŒ‹LKLMÕÎŒŒÌŒ‰ÂˆWJNÂŸJNÂ\Ý
+	ÛÙ™™\ˆ\Ý[šX[È\™H[ÛÈ›Û‹\ÝÜ˜X›H[™]]Üš^˜][Û‹\Ù\\˜]Y	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÙ[šYYOX]ØZ]Ù™™\“\Ý™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+[šYY›X\
+][OOš][KœÝ]\ÊKÍKËJNÂˆ›ÜŠÛÛœÝ][HÙˆ[šYY
+^Âˆ\ÜÙ\™\]X[
+][KšXY\œË˜ØXÚPÛÛ›Û	Üš]˜]K›Ë\ÝÜ™IÊNÂˆ\ÜÙ\™\]X[
+][KšXY\œË˜\žK	Ð]]Üš^˜][Û‰ÊNÂˆ\ÜÙ\™\]X[
+][KšXY\œË™]YË[
+NÂˆBŸJNÂ\Ý
+	ØÛÛ™][Û˜[Ù™™\ˆ™XYÈ™]\›ˆHÛÛ\]H]\Ý\Ý[œÝXYÙˆ™\Ù\š[™ÈHÝ[H][ÝIË\Þ[˜È
+
+HOˆÂˆÛÛœÝØÛÛ™][Û˜[OX]ØZ]Ù™™\“\Ý™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+ÛÛ™][Û˜[œ™\Ý[œÝ]\ËŒ
+NÂˆ\ÜÙ\™Y\\]X[
+ÛÛ™][Û˜[œ™\Ý[šXY\œËÙ]YÎ›[ØXÚPÛÛ›Û‰Üš]˜]K›Ë\ÝÜ™IË˜\žN‰Ð]]Üš^˜][Û‰ßJNÂˆ\ÜÙ\™Y\\]X[
+ÛÛ™][Û˜[œ™\Ý[˜›ÙKÜÙ\™\“›ÝÎ‰ÌŒ‹LKLMÕÎŒŒŒ‰Ë™^^\žP]›[Ù™™\œÎ–×KÝ[[X\žNžØXÝ]™NŒ^\™YŒK[˜]˜Z[X›NŒ_JNÂˆ\ÜÙ\™\]X[
+ÛÛ™][Û˜[›Ù™™\‹œÝ]\Ë	Ù^\™Y	ÊNÂˆ\ÜÙ\™\]X[
+ÛÛ™][Û˜[›Ù™™\‹œÝ]\Ô™X\ÛÛ‹	Ý[YIÊNÂˆ\ÜÙ\™Y\\]X[
+ÛÛ™][Û˜[˜]Y]]™[Ë×JNÂˆ\ÜÙ\™\]X[
+ÛÛ™][Û˜[œÝÜ™YÙ^\Ë
+NÂŸJNÂ\Ý
+	ÛÙ™™\ˆ\Ý\Ù\ÈHØ[YH\ÝYÙ\™\ˆ[YH›ÜˆXÝ]™K^\™Y[™[˜]˜Z[X›HÝZY[˜ÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝØXÝ]™K^\™Y[˜]˜Z[X›KÛÛ™][Û˜[OX]ØZ]Ù™™\“\Ý™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ][HÙˆØXÝ]™K^\™Y[˜]˜Z[X›KÛÛ™][Û˜[J^Âˆ\ÜÙ\™\]X[
+][Kœ™\Ý[˜›ÙKœÙ\™\“›ÝË	ÌŒ‹LKLMÕÎŒŒŒ‰ÊNÂˆBˆ\ÜÙ\›ÚÊ]Kœ\œÙJXÝ]™Kœ™\Ý[˜›ÙK›Ù™™\œÖÌK™^\™\Ð]
+O‘]Kœ\œÙJXÝ]™Kœ™\Ý[˜›ÙKœÙ\™\“›ÝÊJNÂˆ\ÜÙ\™\]X[
+^\™Yœ™\Ý[˜›ÙKœÝ[[X\žK™^\™YJNÂŸJNÂ\Ý
+	ÛÙ™™\ˆ\Ý^ÜÙ\ÈHÙ\™\‹Y\š]™YXY[™H›Üˆ]]ÛX]XÈ™Yœ™\Ú	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝØXÝ]™_OX]ØZ]Ù™™\“\Ý™\Ý[Ê
+NÂˆÛÛœÝ[^OQ]Kœ\œÙJXÝ]™Kœ™\Ý[˜›ÙK›™^^\žP]
+KQ]Kœ\œÙJXÝ]™Kœ™\Ý[˜›ÙKœÙ\™\“›ÝÊNÂˆ\ÜÙ\™\]X[
+[^KÌÌ
+NÂˆ\ÜÙ\™\]X[
+XÝ]™Kœ™\Ý[˜›ÙK›™^^\žP]XÝ]™Kœ™\Ý[˜›ÙK›Ù™™\œÖÌK™^\™\Ð]
+NÂŸJNÂ\Ý
+	ÛÙ™™\ˆ\ÝÛZ]ÈH]]ÛX]XÈ™Yœ™\ÚXY[™HÚ[ˆ›ÈXÝ]™HÙ™™\ˆ™[XZ[œÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÙ^\™Y[˜]˜Z[X›KÛÛ™][Û˜[OX]ØZ]Ù™™\“\Ý™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ][HÙˆÙ^\™Y[˜]˜Z[X›KÛÛ™][Û˜[JH\ÜÙ\™\]X[
+][Kœ™\Ý[˜›ÙK›™^^\žP][
+NÂŸJNÂ\Ý
+	ÛÙ™™\ˆ\Ý\Ý[™ÝZ\Ú\È^\žHœ›ÛH[YÚXš[]HÜÜÈÚ]Ý]Ú[™Ú[™ÈHšYIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÙ^\™Y[˜]˜Z[X›_OX]ØZ]Ù™™\“\Ý™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+^\™Yœ™\Ý[˜›ÙKÜÙ\™\“›ÝÎ‰ÌŒ‹LKLMÕÎŒŒŒ‰Ë™^^\žP]›[Ù™™\œÎ–×KÝ[[X\žNžØXÝ]™NŒ^\™YŒK[˜]˜Z[X›NŒ_JNÂˆ\ÜÙ\™\]X[
+^\™Y›Ù™™\‹œÝ]\Ë	Ù^\™Y	ÊNÂˆ\ÜÙ\™\]X[
+^\™Y›Ù™™\‹œÝ]\Ô™X\ÛÛ‹	Ý[YIÊNÂˆ\ÜÙ\™Y\\]X[
+[˜]˜Z[X›Kœ™\Ý[˜›ÙKÜÙ\™\“›ÝÎ‰ÌŒ‹LKLMÕÎŒŒŒ‰Ë™^^\žP]›[Ù™™\œÎ–×KÝ[[X\žNžØXÝ]™NŒ^\™YŒ[˜]˜Z[X›NŒ__JNÂˆ\ÜÙ\™\]X[
+[˜]˜Z[X›K›Ù™™\‹œÝ]\Ë	Ý[˜]˜Z[X›IÊNÂˆ\ÜÙ\™\]X[
+[˜]˜Z[X›K›Ù™™\‹œÝ]\Ô™X\ÛÛ‹	Ù[YÚXš[]IÊNÂˆ›ÜŠÛÛœÝ][HÙˆÙ^\™Y[˜]˜Z[X›WJ^Âˆ\ÜÙ\™Y\\]X[
+][KœšYKÚY‘’VT‘Kœ™\]Y\ÝYÝ]\Î‰ØÛÛXÝ[™ÉË™]š\Ú[ÛŽ‘’VT‘Kœ™]š\Ú[Û‹\ÜÚYÛ™Yš]™\’Y›[™ZXÛPÛÛ™š\›X][ÛŽ›[JNÂˆ\ÜÙ\™Y\\]X[
+][K˜]Y]]™[Ë×JNÂˆ\ÜÙ\™\]X[
+][KœÝÜ™YÙ^\Ë
+NÂˆBŸJNÂ\Ý
+	ÜÝXØÙ\ÜÙ[Ù™™\ˆÙ[XÝ[Ûˆ™XÛÜ™ÈHZ[š[X[Ù\™\‹][Y\Ý[\Y]Y]]™[	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÝ˜[Y]_OX]ØZ]]Y]Y™\Ý[Ê
+K]™[]˜[Y]K˜[Y˜]Y]]™[ÖÌNÂˆ\ÜÙ\™Y\\]X[
+]™[ÂˆY‰Ø]Y]LIË\N‰ÛÙ™™\‹œÙ[XÝ[Û‰ËÝ]ÛÛYN‰ØÛÛ[Z]Y	Ë™X\ÛÛŽ›[ˆXÝÜ”›ÛN‰Ü\ÜÙ[™Ù\‰ËXÝÜ”™YŽ‰Ü\ÜÙ[™Ù\‹[ÝÛ™\‰Ë™\]Y\ÝY‘’VT‘Kœ™\]Y\ÝYˆÙ™™\’Y‘’VT‘K›Ù™™\’Yœ›ÛT™]š\Ú[ÛŽŒ‹Ô™]š\Ú[ÛŽŒËØØÝ\œ™Y]‰ÌŒ‹LKLMÕÎŒŒŒ‰ÂˆJNÂŸJNÂ\Ý
+	Ù^\žH[™[YÚXš[]HÙ[XÝ[Ûˆ™Z™XÝ[ÛœÈ\™H]Y]YÚ]Ý]Y˜[˜Ú[™ÈHšYIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÝ˜[Y]_OX]ØZ]]Y]Y™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝÜ™\Ý[™X\ÛÛ—HÙˆÖÝ˜[Y]K™^\™Y	ÛÙ™™\—Ù^\™Y	×KÝ˜[Y]Kš[™[YÚX›K	Ùš]™\—Ý[˜]˜Z[X›I×WJ^Âˆ\ÜÙ\™\]X[
+™\Ý[˜]Y]]™[Ë›[™ÝJNÂˆ\ÜÙ\™\]X[
+™\Ý[˜]Y]]™[ÖÌK›Ý]ÛÛYK	Ü™Z™XÝY	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[˜]Y]]™[ÖÌKœ™X\ÛÛ‹™X\ÛÛŠNÂˆ\ÜÙ\™\]X[
+™\Ý[˜]Y]]™[ÖÌK™œ›ÛT™]š\Ú[Û‹ŠNÂˆ\ÜÙ\™\]X[
+™\Ý[˜]Y]]™[ÖÌKÔ™]š\Ú[Û‹ŠNÂˆ\ÜÙ\™\]X[
+™\Ý[œšYKœ™]š\Ú[Û‹ŠNÂˆBŸJNÂ\Ý
+	ØÛÛ˜Ý\œ™[ÛÛ[X[™È™XÛÜ™Û™HÛÛ[Z][™Û™HÝ[H™Z™XÝ[ÛˆÚ]Ý]™\^H\XØ][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÜ˜XÙ_OX]ØZ]]Y]Y™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+˜XÙK˜]Y]]™[Ë›[™ÝŠNÂˆ\ÜÙ\™\]X[
+˜XÙK˜]Y]]™[Ë™š[\Š]™[O™]™[›Ý]ÛÛYOOOIØÛÛ[Z]Y	ÊK›[™ÝJNÂˆ\ÜÙ\™\]X[
+˜XÙK˜]Y]]™[Ë™š[\Š]™[O™]™[œ™X\ÛÛOOIÜÝ[WÜ™]š\Ú[Û‰ÊK›[™ÝJNÂˆ\ÜÙ\™Y\\]X[
+˜XÙK˜]Y]]™[Ë›X\
+]™[O™]™[šY
+KÉØ]Y]LIË	Ø]Y]L‰×JNÂŸJNÂ\Ý
+	Ø]Y]]™[È\ÙHÛ›HH[ÝÛ\Ý[™^ÛYHÜ™Y[X[È[™š]˜]H™\]Y\Ý[œ]ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÙ]™[ßOX]ØZ]]Y]Y™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ]™[Ùˆ]™[ÊH\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\Ê]™[
+KUQUÑ’QSÊNÂˆÛÛœÝ[˜ÛÙYR”ÓÓ‹œÝš[™ÚYžJ]™[ÊKÓÝÙ\Ø\ÙJ
+NÂˆ›ÜŠÛÛœÝ›Ü˜šY[ˆÙˆË‹‹“Øš™XÝ˜[Y\Ê’VT‘KÚÙ[œÊK	ÚY[\Ý[˜ÞKZÙ^IË	ÜÛ™IË	Ù[XZ[	Ë	ÛØœÙ\™Y]IË	Ü\›Z]	Ë	ÊÍÎIË	Ð	×J^Âˆ\ÜÙ\›ÚÊY[˜ÛÙYš[˜ÛY\Ê›Ü˜šY[‹ÓÝÙ\Ø\ÙJ
+JK›Ü˜šY[ŠNÂˆBŸJNÂ\Ý
+	Ø\ÜÚYÛ™Yš]™\ˆ˜[œÚ][ÛˆY˜[˜Ù\ÈÛ™H™]š\Ú[Ûˆ[™^XÝ™\^HÚ[™Ù\È›Ý[™ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝ™\Ý[X]ØZ]šYTØY™]T™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+™\Ý[˜\œš]š[™ËÜÝ]\ÎŒŒ›ÙNžÚY‘’VT‘Kœ™\]Y\ÝYÝ]\Î‰Ø\œš]š[™ÉË™]š\Ú[ÛŽŒß_JNÂˆ\ÜÙ\™Y\\]X[
+™\Ý[˜\œš]š[™Ô™\^K™\Ý[˜\œš]š[™ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[˜]Y]]™[Ë™š[\Š]™[O™]™[\OOOIÜšYK˜[œÚ][Û‰É‰™]™[™œ›ÛT™]š\Ú[ÛOOLŠK›[™ÝJNÂŸJNÂ\Ý
+	Ý™ZXÛHÛÛ™š\›X][Ûˆ›Ü›X[^™\ÈH›ÛÚÙY]H[™\ÈY[\Ý[	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ™\Ý[X]ØZ]šYTØY™]T™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™\Ý[˜ÛÛ™š\›X][Û‹œÝ]\ËŒJNÂˆ\ÜÙ\™Y\\]X[
+™\Ý[˜ÛÛ™š\›X][Û‹˜›ÙKÜ™\]Y\ÝY‘’VT‘Kœ™\]Y\ÝY\ÜÚYÛ›Y[™]š\Ú[ÛŽŒËÛÛ™š\›YY]‰ÌŒ‹LKLMÕÎŒŒŒ‰ßJNÂˆ\ÜÙ\™Y\\]X[
+™\Ý[˜ÛÛ™š\›X][Û”™\^K™\Ý[˜ÛÛ™š\›X][ÛŠNÂˆ\ÜÙ\™\]X[
+™\Ý[˜]Y]]™[Ë™š[\Š]™[O™]™[\OOOIÝ™ZXÛK˜ÛÛ™š\›X][Û‰É‰™]™[›Ý]ÛÛYOOOIØÛÛ[Z]Y	ÊK›[™Ý‹	Ú[š]X[[™œ™\Ú™XÛÛ™š\›X][ÛˆÛ›IÊNÂŸJNÂ\Ý
+	ØH]\ˆ™ZXÛHZ\ÛX]ÚÛX\œÈ›ÛÙˆ[™Y˜[˜Ù\ÈH™]š\Ú[ÛˆÛ˜ÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝ™\Ý[X]ØZ]šYTØY™]T™\Ý[Ê
+K]™[\™\Ý[˜]Y]]™[Ë™š[™
+][OOš][Kœ™X\ÛÛOOIÝ™ZXÛWÛZ\ÛX]Ú	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[›Z\ÛX]ÚœÝ]\ËJNÂˆ\ÜÙ\™\]X[
+™\Ý[›Z\ÛX]Ú˜›ÙK˜ÛÙK	Ý™ZXÛWÛZ\ÛX]Ú	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[›Z\ÛX]Ú˜›ÙKœ™]š\Ú[Û‹JNÂˆ\ÜÙ\™Y\\]X[
+Ù]™[™œ›ÛT™]š\Ú[Û‹]™[Ô™]š\Ú[Û—KÍWJNÂŸJNÂ\Ý
+	ÜšYHÝ\™YYÈÝ\œ™[™ZXÛH›ÛÙˆ[™Ý\œ™[š]™\ˆ[YÚXš[]IË\Þ[˜È
+
+HOˆÂˆÛÛœÝ™\Ý[X]ØZ]šYTØY™]T™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ\Ú]Ý]ÛÛ™š\›X][Û‹˜›ÙK˜ÛÙK	Ý™ZXÛWØÛÛ™š\›X][Û—Ü™\]Z\™Y	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ\Ú]Ý]ÛÛ™š\›X][Û‹˜›ÙKœ™]š\Ú[Û‹JNÂˆ\ÜÙ\™\]X[
+™\Ý[œ™]›ÚÙYš]™\‹˜›ÙK˜ÛÙK	Ùš]™\—Ý[˜]˜Z[X›IÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œ™]›ÚÙYš]™\‹˜›ÙKœ™]š\Ú[Û‹ŠNÂˆ\ÜÙ\™Y\\]X[
+Ü™\Ý[œÝ\Y˜›ÙKœÝ]\Ë™\Ý[œÝ\Y˜›ÙKœ™]š\Ú[Û—KÉÛÛ—Ýš\	Ë×JNÂˆ\ÜÙ\™Y\\]X[
+Ü™\Ý[˜ÛÛ\]Y˜›ÙKœÝ]\Ë™\Ý[˜ÛÛ\]Y˜›ÙKœ™]š\Ú[Û—KÉØÛÛ\]Y	ËJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]KœÝ]\Ë	ØÛÛ\]Y	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]Kœ™]š\Ú[Û‹
+NÂŸJNÂ\Ý
+	ÜšYHØY™]H]Y]™XÛÜ™ÈXÚ\Ú[ÛœÈÚ]Ý]ØœÙ\™Y]HÜˆ™\^H\XØ]\ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝ™\Ý[X]ØZ]šYTØY™]T™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™\Ý[˜]Y]]™[Ë›[™Ý
+NÂˆ\ÜÙ\™Y\\]X[
+™\Ý[˜]Y]]™[Ë›X\
+]™[O™]™[šY
+KÉØ]Y]LIË	Ø]Y]L‰Ë	Ø]Y]LÉË	Ø]Y]M	Ë	Ø]Y]MIË	Ø]Y]M‰Ë	Ø]Y]MÉË	Ø]Y]N	×JNÂˆ\ÜÙ\›ÚÊ™\Ý[˜]Y]]™[Ë™]™\žJ]™[O“Øš™XÝšÙ^\Ê]™[
+Kš›Ú[Š	ß	ÊOOOPUQUÑ’QSËš›Ú[Š	ß	ÊJJNÂˆÛÛœÝ[˜ÛÙYR”ÓÓ‹œÝš[™ÚYžJ™\Ý[˜]Y]]™[ÊKÓÝÙ\Ø\ÙJ
+NÂˆ\ÜÙ\›ÚÊY[˜ÛÙYš[˜ÛY\Ê	Ù[[ÈIÊJNÂˆ\ÜÙ\›ÚÊY[˜ÛÙYš[˜ÛY\Ê	Ù[[ÈNNIÊJNÂˆ\ÜÙ\›ÚÊY[˜ÛÙYš[˜ÛY\Ê	ÛØœÙ\™Y]IÊJNÂŸJNÂ\Ý
+	Ø›Ø\™[™È˜XÙHÛÛ[Z]È^XÝHÛ™HÙˆØ[˜Ù[][Ûˆ[™šYHÝ\	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^Âˆ\ÜÙ\™Y\\]X[
+Ü˜XÙK˜Ø[˜Ù[œÝ]\Ë˜XÙKœÝ\œÝ]\×KœÛÜ
+
+KŠOO˜KXŠKÌŒWJNÂˆ\ÜÙ\™\]X[
+˜XÙKœÝ]Kœ™]š\Ú[Û‹ÊNÂˆ\ÜÙ\™\]X[
+˜XÙK˜]Y]]™[Ë™š[\Š]™[O™]™[›Ý]ÛÛYOOOIØÛÛ[Z]Y	ÊK›[™ÝJNÂˆ\ÜÙ\™\]X[
+˜XÙK˜]Y]]™[Ë™š[\Š]™[O™]™[œ™X\ÛÛOOIÜÝ[WÜ™]š\Ú[Û‰ÊK›[™ÝJNÂˆBŸJNÂ\Ý
+	ØØ[˜Ù[][Û‹Yš\œÝ™]™[ÈÝ[HšYHÝ\[™ÛX\œÈ™ZXÛH›ÛÙ‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝØØ[˜Ù[š\œÝOX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+Ø[˜Ù[š\œÝ˜Ø[˜Ù[œÝ]\ËŒ
+NÂˆ\ÜÙ\™\]X[
+Ø[˜Ù[š\œÝœÝ]KœÝ]\Ë	ØØ[˜Ù[Y	ÊNÂˆ\ÜÙ\™\]X[
+Ø[˜Ù[š\œÝœÝ]K™ZXÛPÛÛ™š\›X][Û‹[
+NÂˆ\ÜÙ\™\]X[
+Ø[˜Ù[š\œÝœÝ\˜›ÙK˜ÛÙK	ÜÝ[WÜ™]š\Ú[Û‰ÊNÂˆ\ÜÙ\™\]X[
+Ø[˜Ù[š\œÝœÝ\˜›ÙKœ™]š\Ú[Û‹ÊNÂŸJNÂ\Ý
+	ÜšYK\Ý\Yš\œÝ™]™[ÈÝ[HØ[˜Ù[][ÛˆY\ˆ›Ø\™[™È™YÚ[œÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÜÝ\š\œÝOX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+Ý\š\œÝœÝ\œÝ]\ËŒ
+NÂˆ\ÜÙ\™\]X[
+Ý\š\œÝœÝ]KœÝ]\Ë	ÛÛ—Ýš\	ÊNÂˆ\ÜÙ\™\]X[
+Ý\š\œÝ˜Ø[˜Ù[˜›ÙK˜ÛÙK	ÜÝ[WÜ™]š\Ú[Û‰ÊNÂˆ\ÜÙ\™\]X[
+Ý\š\œÝ˜Ø[˜Ù[˜›ÙKœ™]š\Ú[Û‹ÊNÂŸJNÂ\Ý
+	Ø›Ø\™[™Ë\˜XÙHÚ[›™\ˆ™\^H\ÈÝX›HÚ]Ý]\XØ]HÝ]HÜˆ]Y]	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^ÂˆÛÛœÝÚ[›™\”™\Ý[\˜XÙKÚ[›™\OOIØØ[˜Ù[	ÏÜ˜XÙK˜Ø[˜Ù[œ˜XÙKœÝ\Âˆ\ÜÙ\™Y\\]X[
+˜XÙKœ™\^KÚ[›™\”™\Ý[
+NÂˆ\ÜÙ\™\]X[
+˜XÙKœÝ]Kœ™]š\Ú[Û‹ÊNÂˆ\ÜÙ\™\]X[
+˜XÙK˜]Y]]™[Ë›[™ÝŠNÂˆ\ÜÙ\™Y\\]X[
+˜XÙK˜]Y]]™[Ë›X\
+]™[O™]™[šY
+KÉØ]Y]LIË	Ø]Y]L‰×JNÂˆBŸJNÂ\Ý
+	ØØ[˜Ù[][Û‹\˜XÙH\XÚ\[È™XÛÝ™\ˆ›ÛK\Ú\YØ[˜Ù[YÝ]IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÜ™XÛÝ™\ž_OH
+]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+JK˜Ø[˜Ù[š\œÝÂˆ\ÜÙ\™Y\\]X[
+™XÛÝ™\žKœ\ÜÙ[™Ù\‹ÜÝ]\ÎŒŒ›ÙNžÂˆY‘’VT‘Kœ™\]Y\ÝYÝ]\Î‰ØØ[˜Ù[Y	Ë™]š\Ú[ÛŽËšY]Ù\”›ÛN‰Ü\ÜÙ[™Ù\‰Ëˆ™^XÝ[ÛŽ‰ÜÚÝ×ØØ[˜Ù[YÚ\ÝÜžIË\]Y]‰ÌŒ‹LKLMÕÎŒŒŒ‰ÂˆKXY\œÎžÙ]YÎœ™XÛÝ™\žKœ\ÜÙ[™Ù\‹šXY\œË™]YËØXÚPÛÛ›Û‰Üš]˜]K›ËXØXÚIË˜\žN‰Ð]]Üš^˜][Û‰ß_JNÂˆ\ÜÙ\™Y\\]X[
+™XÛÝ™\žK™š]™\‹ÜÝ]\ÎŒŒ›ÙNžÂˆY‘’VT‘Kœ™\]Y\ÝYÝ]\Î‰ØØ[˜Ù[Y	Ë™]š\Ú[ÛŽËšY]Ù\”›ÛN‰Ùš]™\‰Ëˆ™^XÝ[ÛŽ‰ÜÚÝ×ØØ[˜Ù[YÝš\	Ë\]Y]‰ÌŒ‹LKLMÕÎŒŒŒ‰ÂˆKXY\œÎžÙ]YÎœ™XÛÝ™\žK™š]™\‹šXY\œË™]YËØXÚPÛÛ›Û‰Üš]˜]K›ËXØXÚIË˜\žN‰Ð]]Üš^˜][Û‰ß_JNÂŸJNÂ\Ý
+	ÜšYK\Ý\\˜XÙH\XÚ\[È™XÛÝ™\ˆ›ÛK\Ú\YÛ‹]š\Ý]IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÜ™XÛÝ™\ž_OH
+]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+JKœÝ\š\œÝÂˆ\ÜÙ\™Y\\]X[
+Ü™XÛÝ™\žKœ\ÜÙ[™Ù\‹˜›ÙKœÝ]\Ë™XÛÝ™\žKœ\ÜÙ[™Ù\‹˜›ÙKœ™]š\Ú[Û‹™XÛÝ™\žKœ\ÜÙ[™Ù\‹˜›ÙK›™^XÝ[Û—KÉÛÛ—Ýš\	ËË	ÜÚÝ×ÛÛ—Ýš\	×JNÂˆ\ÜÙ\™Y\\]X[
+Ü™XÛÝ™\žK™š]™\‹˜›ÙKœÝ]\Ë™XÛÝ™\žK™š]™\‹˜›ÙKœ™]š\Ú[Û‹™XÛÝ™\žK™š]™\‹˜›ÙK›™^XÝ[Û—KÉÛÛ—Ýš\	ËË	ØÛÛ[YWÝš\	×JNÂˆ\ÜÙ\™Y\\]X[
+Ü™XÛÝ™\žKœ\ÜÙ[™Ù\‹˜›ÙKšY]Ù\”›ÛK™XÛÝ™\žK™š]™\‹˜›ÙKšY]Ù\”›ÛWKÉÜ\ÜÙ[™Ù\‰Ë	Ùš]™\‰×JNÂŸJNÂ\Ý
+	Ü™XÛÝ™\žH™XYÛÛ˜ÙX[ÈHšYHœ›ÛH[œ™[]Y\ÜÙ[™Ù\œÈ[™š]™\œÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^Âˆ›ÜŠÛÛœÝ™\Ý[ÙˆÜ˜XÙKœ™XÛÝ™\žK›Ý\”\ÜÙ[™Ù\‹˜XÙKœ™XÛÝ™\žK›Ý\‘š]™\—J^Âˆ\ÜÙ\™\]X[
+™\Ý[œÝ]\Ë
+NÂˆ\ÜÙ\™\]X[
+™\Ý[˜›ÙK˜ÛÙK	Ü™\ÛÝ\˜ÙWÛ›ÝÙ›Ý[™	ÊNÂˆ\ÜÙ\›X]Ú
+™\Ý[˜›ÙKœ™\]Y\ÝY×˜XÙK[[ØÚËKÊNÂˆ\ÜÙ\›ÚÊR”ÓÓ‹œÝš[™ÚYžJ™\Ý[˜›ÙJKš[˜ÛY\Ê	Ü\ÜÙ[™Ù\‹[ÝÛ™\‰ÊJNÂˆ\ÜÙ\›ÚÊR”ÓÓ‹œÝš[™ÚYžJ™\Ý[˜›ÙJKš[˜ÛY\Ê	Ùš]™\‹X\ÜÚYÛ™Y	ÊJNÂˆBˆBŸJNÂ\Ý
+	Ü™XÛÝ™\žH™\ÜÛœÙH^ÜÙ\ÈÛ›HHØÝ[Y[YØY™HšY[[ÝÛ\Ý	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝØY™QšY[ÏVÉÚY	Ë	ÜÝ]\ÉË	Ü™]š\Ú[Û‰Ë	ÝšY]Ù\”›ÛIË	Û™^XÝ[Û‰Ë	Ý\]Y]	×NÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^Âˆ\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\Ê˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\‹˜›ÙJKØY™QšY[ÊNÂˆ\ÜÙ\™Y\\]X[
+Øš™XÝšÙ^\Ê˜XÙKœ™XÛÝ™\žK™š]™\‹˜›ÙJKØY™QšY[ÊNÂˆÛÛœÝ[˜ÛÙYR”ÓÓ‹œÝš[™ÚYžJÜ˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\‹˜›ÙK˜XÙKœ™XÛÝ™\žK™š]™\‹˜›ÙWJKÓÝÙ\Ø\ÙJ
+NÂˆ›ÜŠÛÛœÝ›Ü˜šY[ˆÙˆÉØ\ÜÚYÛ™Yš]™\šY	Ë	Ý™ZXÛXÛÛ™š\›X][Û‰Ë	ÜÙ[XÝYÙ™™\šY	Ë	Ü]IË	ÜÛ™IË	Ü\›Z]	×JH\ÜÙ\›ÚÊY[˜ÛÙYš[˜ÛY\Ê›Ü˜šY[ŠK›Ü˜šY[ŠNÂˆBŸJNÂ\Ý
+	Ü™XÛÝ™\žH™XYÈÈ›ÝY˜[˜ÙH™]š\Ú[Û‹ÛÛœÝ[YHY[\Ý[˜ÞHÙ^\ÈÜˆY]Y]]™[ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^Âˆ\ÜÙ\™\]X[
+˜XÙKœÝ]Kœ™]š\Ú[Û‹ÊNÂˆ\ÜÙ\™\]X[
+˜XÙKœÝÜ™YÙ^\ËŠNÂˆ\ÜÙ\™\]X[
+˜XÙK˜]Y]]™[Ë›[™ÝŠNÂˆ\ÜÙ\™Y\\]X[
+˜XÙK˜]Y]]™[Ë›X\
+]™[O™]™[šY
+KÉØ]Y]LIË	Ø]Y]L‰×JNÂˆBŸJNÂ\Ý
+	ÜšYK\Ý]H™\ÜÛœÙ\È\ÙHš]˜]H›ÛK\ØÛÜY˜[Y]ÜœÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^Âˆ\ÜÙ\›X]Ú
+˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\‹šXY\œË™]YË×ˆ–ÐKV˜K^ŒNWËW^ÌH‰ÊNÂˆ\ÜÙ\›X]Ú
+˜XÙKœ™XÛÝ™\žK™š]™\‹šXY\œË™]YË×ˆ–ÐKV˜K^ŒNWËW^ÌH‰ÊNÂˆ\ÜÙ\››Ý\]X[
+˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\‹šXY\œË™]YË˜XÙKœ™XÛÝ™\žK™š]™\‹šXY\œË™]YÊNÂˆ›ÜŠÛÛœÝ™\Ý[ÙˆÜ˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\‹˜XÙKœ™XÛÝ™\žK™š]™\—J^Âˆ\ÜÙ\™\]X[
+™\Ý[šXY\œË˜ØXÚPÛÛ›Û	Üš]˜]K›ËXØXÚIÊNÂˆ\ÜÙ\™\]X[
+™\Ý[šXY\œË˜\žK	Ð]]Üš^˜][Û‰ÊNÂˆBˆBŸJNÂ\Ý
+	ÛX]Ú[™ÈÝ›Û™È[™ÙXZÈ˜[Y]ÜœÈ™]\›ˆ›Ù[\ÜÈÌ	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^Âˆ\ÜÙ\™Y\\]X[
+Ü˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\“›Ý[ÙYšYYœÝ]\Ë˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\“›Ý[ÙYšYY˜›ÙWKÌÌ[JNÂˆ\ÜÙ\™Y\\]X[
+Ü˜XÙKœ™XÛÝ™\žK™š]™\“›Ý[ÙYšYYœÝ]\Ë˜XÙKœ™XÛÝ™\žK™š]™\“›Ý[ÙYšYY˜›ÙWKÌÌ[JNÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\“›Ý[ÙYšYYšXY\œË™]YË˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\‹šXY\œË™]YÊNÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žK™š]™\“›Ý[ÙYšYYšXY\œË™]YË˜XÙKœ™XÛÝ™\žK™š]™\‹šXY\œË™]YÊNÂˆBŸJNÂ\Ý
+	ØHÝ[H˜[Y]Üˆ™]\›œÈHÝ\œ™[™\™\Ù[][Ûˆ[™™\XÙ[Y[UYÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^Âˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žKœÝ[T\ÜÙ[™Ù\‹œÝ]\ËŒ
+NÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žKœÝ[T\ÜÙ[™Ù\‹˜›ÙKœ™]š\Ú[Û‹ÊNÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žKœÝ[T\ÜÙ[™Ù\‹˜›ÙKœÝ]\Ë˜XÙKœÝ]KœÝ]\ÊNÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žKœÝ[T\ÜÙ[™Ù\‹šXY\œË™]YË˜XÙKœ™XÛÝ™\žKœ\ÜÙ[™Ù\‹šXY\œË™]YÊNÂˆBŸJNÂ\Ý
+	ØH\ÜÙ[™Ù\ˆ˜[Y]ÜˆØ[››ÝÝ\™\ÜÈHš]™\ˆ™\™\Ù[][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^Âˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žK˜Ü›ÜÜÔ›ÛU˜[Y]Ü‹œÝ]\ËŒ
+NÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žK˜Ü›ÜÜÔ›ÛU˜[Y]Ü‹˜›ÙKšY]Ù\”›ÛK	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žK˜Ü›ÜÜÔ›ÛU˜[Y]Ü‹šXY\œË™]YË˜XÙKœ™XÛÝ™\žK™š]™\‹šXY\œË™]YÊNÂˆBŸJNÂ\Ý
+	ÝÚ[Ø\™™]˜[Y][ÛˆØØÝ\œÈÛ›HY\ˆ\XÚ\[]]Üš^˜][Û‰Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝ˜XÙ\ÏX]ØZ]›Ø\™[™Ô˜XÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ˜XÙHÙˆÜ˜XÙ\Ë˜Ø[˜Ù[š\œÝ˜XÙ\ËœÝ\š\œÝJ^Âˆ\ÜÙ\™Y\\]X[
+Ü˜XÙKœ™XÛÝ™\žKÚ[Ø\™\ÜÙ[™Ù\‹œÝ]\Ë˜XÙKœ™XÛÝ™\žKÚ[Ø\™\ÜÙ[™Ù\‹˜›ÙWKÌÌ[JNÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žKÚ[Ø\™Ý\‹œÝ]\Ë
+NÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žKÚ[Ø\™Ý\‹˜›ÙK˜ÛÙK	Ü™\ÛÝ\˜ÙWÛ›ÝÙ›Ý[™	ÊNÂˆ\ÜÙ\™\]X[
+˜XÙKœ™XÛÝ™\žKÚ[Ø\™Ý\‹šXY\œË™]YË[
+NÂˆBŸJNÂ\Ý
+	ÍŽH™XÛÝ™\žHÛ›ÜœÈ™]žKPY\ˆ™Y›Ü™HÝXØÙYY[™ÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÜ˜]S[Z]YOX]ØZ]™XÛÝ™\žT™]žT™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+˜]S[Z]Y™[^\ËÌÌJNÂˆ\ÜÙ\™Y\\]X[
+˜]S[Z]Yœ™\Ý[˜][\Ë›X\
+][\O˜][\œÝ]\ÊKÍŽKŒJNÂˆ\ÜÙ\™\]X[
+˜]S[Z]Yœ™\Ý[œÝÜY	ÜÝXØÙ\ÜÉÊNÂˆ\ÜÙ\™\]X[
+˜]S[Z]Yœ™\Ý[œ™\Ý[˜›ÙKœ™]š\Ú[Û‹ÊNÂŸJNÂ\Ý
+	ÍLÈ™XÛÝ™\žH\Ù\ÈØ\Y^Û™[X[˜XÚÛÙ™ˆÚ[ˆ™]žKPY\ˆ\ÈXœÙ[	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÝ[˜]˜Z[X›_OX]ØZ]™XÛÝ™\žT™]žT™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+[˜]˜Z[X›K™[^\ËÌLŒJNÂˆ\ÜÙ\™Y\\]X[
+[˜]˜Z[X›Kœ™\Ý[˜][\Ë›X\
+][\O˜][\œÝ]\ÊKÍLËLËŒJNÂˆ\ÜÙ\™\]X[
+[˜]˜Z[X›Kœ™\Ý[œÝÜY	ÜÝXØÙ\ÜÉÊNÂŸJNÂ\Ý
+	Û™]ÛÜšÈ˜Z[\™H™]šY\ÈÚ]˜XÚÛÙ™ˆ[™[ˆ™XÛÝ™\œÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÛ™]ÛÜšßOX]ØZ]™XÛÝ™\žT™]žT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™]ÛÜšË˜Ø[ËŠNÂˆ\ÜÙ\™Y\\]X[
+™]ÛÜšË™[^\ËÌLJNÂˆ\ÜÙ\™Y\\]X[
+™]ÛÜšËœ™\Ý[˜][\Ë›X\
+][\O˜][\œÝ]\ÊKÌŒJNÂˆ\ÜÙ\™\]X[
+™]ÛÜšËœ™\Ý[œÝÜY	ÜÝXØÙ\ÜÉÊNÂŸJNÂ\Ý
+	Ü™]žH[^\È[™][\È\™H›Ý[™Y\š[™ÈHÝ\ÝZ[™YÝ]YÙIË\Þ[˜È
+
+HOˆÂˆÛÛœÝÙ^]\ÝYOX]ØZ]™XÛÝ™\žT™]žT™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+^]\ÝY™[^\ËÍŒŒŒJNÂˆ\ÜÙ\™\]X[
+^]\ÝYœ™\Ý[˜][\Ë›[™Ý
+NÂˆ\ÜÙ\™\]X[
+^]\ÝYœ™\Ý[œÝÜY	Ù^]\ÝY	ÊNÂˆ\ÜÙ\›ÚÊ^]\ÝYœ™\Ý[˜][\Ë™]™\žJ][\O˜][\œÝ]\ÏOOMLÊJNÂŸJNÂ\Ý
+	ØXØÙ\ÜÈ[šX[ÝÜÈ™XÛÝ™\žHÚ]Ý]™]žZ[™ÈÜˆ™]™X[[™ÈHšYIË\Þ[˜È
+
+HOˆÂˆÛÛœÝØXØÙ\ÜÑ[šYYOX]ØZ]™XÛÝ™\žT™]žT™\Ý[Ê
+NÂˆ\ÜÙ\™Y\\]X[
+XØÙ\ÜÑ[šYY™[^\Ë×JNÂˆ\ÜÙ\™\]X[
+XØÙ\ÜÑ[šYYœ™\Ý[˜][\Ë›[™ÝJNÂˆ\ÜÙ\™\]X[
+XØÙ\ÜÑ[šYYœ™\Ý[œÝÜY	ØXØÙ\ÜÉÊNÂˆ\ÜÙ\™\]X[
+XØÙ\ÜÑ[šYYœ™\Ý[œ™\Ý[œÝ]\Ë
+NÂˆ\ÜÙ\™\]X[
+XØÙ\ÜÑ[šYYœ™\Ý[œ™\Ý[˜›ÙK˜ÛÙK	Ü™\ÛÝ\˜ÙWÛ›ÝÙ›Ý[™	ÊNÂŸJNÂ\Ý
+	ØHY[ˆØÜ™Y[ˆÝÜÈ™XÛÝ™\žH™Y›Ü™H[žH™]ÛÜšÈ™\]Y\Ý	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÚY[ŸOX]ØZ]™XÛÝ™\žT™]žT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+Y[‹˜Ø[Ë
+NÂˆ\ÜÙ\™Y\\]X[
+Y[‹œ™\Ý[˜][\Ë×JNÂˆ\ÜÙ\™\]X[
+Y[‹œ™\Ý[œÝÜY	ÚY[‰ÊNÂŸJNÂ\Ý
+	Ô™]žKPY\ˆXØÙ\È[ˆ]H]™Z™XÝÈ[˜[Y[œ][™Û[\È^™[Y\ÉË
+
+HOˆÂˆÛÛœÝ›ÝÏQ]Kœ\œÙJ	ÌŒ‹LKLMÕÎŒŒ‰ÊNÂˆ\ÜÙ\™\]X[
+\œÙT™]žPY\“\Ê	ÕKMÈÙ\ŒˆÎŒŒHÓU	Ë›ÝÊKL
+NÂˆ\ÜÙ\™\]X[
+\œÙT™]žPY\“\Ê	Ú[˜[Y	Ë›ÝÊK[
+NÂˆ\ÜÙ\™\]X[
+\œÙT™]žPY\“\Ê	Ì	Ë›ÝÊKL
+NÂˆ\ÜÙ\™\]X[
+\œÙT™]žPY\“\Ê	ÎNNIË›ÝÊKŒ
+NÂŸJNÂ\Ý
+	ØH[^YY™XÛÝ™\žH™\ÜÛœÙHØ[››Ý›Û˜XÚÈH™]Ù\ˆ›ÝYšXØ][Û‰Ë
+
+HOˆÂˆÛÛœÝÛ™]Ù\“›ÝYšXØ][Û‹[^YY™XÛÝ™\ž_O\™]š\Ú[Û“Y\™ÙT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™]Ù\“›ÝYšXØ][Û‹˜\YYYJNÂˆ\ÜÙ\™\]X[
+™]Ù\“›ÝYšXØ][Û‹œÝ]Kœ™]š\Ú[Û‹
+NÂˆ\ÜÙ\™\]X[
+™]Ù\“›ÝYšXØ][Û‹œÝ]KœÝ]\Ë	ØØ[˜Ù[Y	ÊNÂˆ\ÜÙ\™\]X[
+[^YY™XÛÝ™\žK˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+[^YY™XÛÝ™\žKœ™X\ÛÛ‹	ÜÝ[IÊNÂˆ\ÜÙ\™\]X[
+[^YY™XÛÝ™\žKœÝ]Kœ™]š\Ú[Û‹
+NÂˆ\ÜÙ\™\]X[
+[^YY™XÛÝ™\žKœÝ]KœÝ]\Ë	ØØ[˜Ù[Y	ÊNÂŸJNÂ\Ý
+	ØH[^YY›ÝYšXØ][ÛˆØ[››Ý›Û˜XÚÈH™]Ù\ˆ™XÛÝ™\žH™\ÜÛœÙIË
+
+HOˆÂˆÛÛœÝÛ™]Ù\”™XÛÝ™\žK[^YY›ÝYšXØ][ÛŸO\™]š\Ú[Û“Y\™ÙT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™]Ù\”™XÛÝ™\žKœÝ]Kœ™]š\Ú[Û‹JNÂˆ\ÜÙ\™\]X[
+™]Ù\”™XÛÝ™\žKœÝ]KœÝ]\Ë	ÛÛ—Ýš\	ÊNÂˆ\ÜÙ\™\]X[
+[^YY›ÝYšXØ][Û‹˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+[^YY›ÝYšXØ][Û‹œ™X\ÛÛ‹	ÜÝ[IÊNÂˆ\ÜÙ\™\]X[
+[^YY›ÝYšXØ][Û‹œÝ]KœÝ]\Ë	ÛÛ—Ýš\	ÊNÂŸJNÂ\Ý
+	Ø[ˆ^XÝ\XØ]H™]š\Ú[Ûˆ\ÈYÛ›Ü™YÚ]Ý]™\]Y\Ý[™È™XÛÝ™\žIË
+
+HOˆÂˆÛÛœÝÙ\XØ]_O\™]š\Ú[Û“Y\™ÙT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+\XØ]K˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+\XØ]Kœ™X\ÛÛ‹	Ù\XØ]IÊNÂˆ\ÜÙ\™\]X[
+\XØ]K›™YYÔ™XÛÝ™\žK˜[ÙJNÂˆ\ÜÙ\™\]X[
+\XØ]KœÝ]Kœ™]š\Ú[Û‹
+NÂŸJNÂ\Ý
+	ØÛÛ™›XÝ[™ÈÛÛ[]HØ[YH™]š\Ú[Ûˆ\È›Ý\YY[™™\]Y\ÝÈ™XÛÝ™\žIË
+
+HOˆÂˆÛÛœÝØÛÛ™›XÝ[™ßO\™]š\Ú[Û“Y\™ÙT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+ÛÛ™›XÝ[™Ë˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÛÛ™›XÝ[™Ëœ™X\ÛÛ‹	ÜØ[YWÜ™]š\Ú[Û—ØÛÛ™›XÝ	ÊNÂˆ\ÜÙ\™\]X[
+ÛÛ™›XÝ[™Ë›™YYÔ™XÛÝ™\žKYJNÂˆ\ÜÙ\™\]X[
+ÛÛ™›XÝ[™ËœÝ]KœÝ]\Ë	ØØ[˜Ù[Y	ÊNÂŸJNÂ\Ý
+	ØH›ÝYšXØ][Ûˆ™]š\Ú[ÛˆØ\ØZ]È›Üˆ[ˆ]]Üš]]]™H™XÛÝ™\žHÛ˜\ÚÝ	Ë
+
+HOˆÂˆÛÛœÝÙØ\Ø\™XÛÝ™\ž_O\™]š\Ú[Û“Y\™ÙT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+Ø\˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ø\œ™X\ÛÛ‹	Ü™]š\Ú[Û—ÙØ\	ÊNÂˆ\ÜÙ\™\]X[
+Ø\›™YYÔ™XÛÝ™\žKYJNÂˆ\ÜÙ\™\]X[
+Ø\œÝ]Kœ™]š\Ú[Û‹ÊNÂˆ\ÜÙ\™\]X[
+Ø\™XÛÝ™\žK˜\YYYJNÂˆ\ÜÙ\™\]X[
+Ø\™XÛÝ™\žKœÝ]Kœ™]š\Ú[Û‹L
+NÂˆ\ÜÙ\™\]X[
+Ø\™XÛÝ™\žKœÝ]KœÝ]\Ë	ØÛÛ\]Y	ÊNÂŸJNÂ\Ý
+	ØÜ›ÜÜË\šYKÜ›ÜÜË\›ÛH[™›ÝYšXØ][Û‹[Û›H˜\Ù[[™\È™]™\ˆ[\ˆHÝ\œ™[šY]ÉË
+
+HOˆÂˆÛÛœÝÝÜ›Û™ÔšYKÜ›Û™Ô›ÛKZ\ÜÚ[™Ð˜\Ù[[™K™XÛÝ™\™Y˜\Ù[[™_O\™]š\Ú[Û“Y\™ÙT™\Ý[Ê
+NÂˆ›ÜŠÛÛœÝ™\Ý[ÙˆÝÜ›Û™ÔšYKÜ›Û™Ô›ÛWJ^Âˆ\ÜÙ\™\]X[
+™\Ý[˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\Ý[œ™X\ÛÛ‹	ÜØÛÜWÛZ\ÛX]Ú	ÊNÂˆ\ÜÙ\™\]X[
+™\Ý[›™YYÔ™XÛÝ™\žK˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]Kœ™]š\Ú[Û‹ÊNÂˆBˆ\ÜÙ\™\]X[
+Z\ÜÚ[™Ð˜\Ù[[™Kœ™X\ÛÛ‹	ÛZ\ÜÚ[™×Ø˜\Ù[[™IÊNÂˆ\ÜÙ\™\]X[
+Z\ÜÚ[™Ð˜\Ù[[™K›™YYÔ™XÛÝ™\žKYJNÂˆ\ÜÙ\™\]X[
+Z\ÜÚ[™Ð˜\Ù[[™KœÝ]K[
+NÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Y˜\Ù[[™K˜\YYYJNÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Y˜\Ù[[™Kœ™X\ÛÛ‹	Ø˜\Ù[[™IÊNÂˆ\ÜÙ\™\]X[
+™XÛÝ™\™Y˜\Ù[[™KœÝ]Kœ™]š\Ú[Û‹
+NÂŸJNÂ\Ý
+	ØHZ[š[X[›ÝYšXØ][Ûˆ[ØZ[œÈ\Ü^HÝ]HÛ›Hœ›ÛH[ˆ]]Üš^™Y™XÛÝ™\žH™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝØ]]Üš^™YOX]ØZ]›ÝYšXØ][Û’[™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+]]Üš^™Y˜Ø[ËJNÂˆ\ÜÙ\™Y\\]X[
+]]Üš^™Yœ™XÛÝ™\™Yœ›ÛKÝ\N‰ÜšYK˜Ú[™ÙY	ËšYRY‘’VT‘Kœ™\]Y\ÝY™]š\Ú[ÛŽŽ_JNÂˆ\ÜÙ\™\]X[
+]]Üš^™Y™™]ÚYYJNÂˆ\ÜÙ\™\]X[
+]]Üš^™Y˜\YYYJNÂˆ\ÜÙ\™\]X[
+]]Üš^™YœÝ]Kœ™]š\Ú[Û‹JNÂˆ\ÜÙ\™\]X[
+]]Üš^™YœÝ]KœÝ]\Ë	ÛÛ—Ýš\	ÊNÂˆ\ÜÙ\™\]X[
+]]Üš^™YœÝ]K›™^XÝ[Û‹	ÜÚÝ×ÛÛ—Ýš\	ÊNÂŸJNÂ\Ý
+	Û›ÝYšXØ][Ûˆ^[ØYÈÛÛZ[š[™Èš]˜]HÜˆ\Ü^HšY[È\™H™Z™XÝYÚ]Ý]H™XY	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝÜÙ[œÚ]]™K™Z™XÝYØ[ßOX]ØZ]›ÝYšXØ][Û’[™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™Z™XÝYØ[Ë
+NÂˆ\ÜÙ\™\]X[
+Ù[œÚ]]™K™™]ÚY˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ù[œÚ]]™K˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ù[œÚ]]™Kœ™X\ÛÛ‹	Ú[˜[YÚ[	ÊNÂˆ\ÜÙ\™\]X[
+Ù[œÚ]]™KœÝ]KœÝ]\Ë	ØØ[˜Ù[Y	ÊNÂŸJNÂ\Ý
+	ÜÝ[K\XØ]H[™›Ü™ZYÛˆšYH[ÈÈ›ÝšYÙÙ\ˆ™XÛÝ™\žH˜Y™šXÉË\Þ[˜È
+
+HOˆÂˆÛÛœÝÜÝ[K\XØ]K›Ü™ZYÛ‹™Z™XÝYØ[ßOX]ØZ]›ÝYšXØ][Û’[™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™Z™XÝYØ[Ë
+NÂˆ\ÜÙ\™Y\\]X[
+ÜÝ[Kœ™X\ÛÛ‹\XØ]Kœ™X\ÛÛ‹›Ü™ZYÛ‹œ™X\ÛÛ—KÉÜÝ[WÛÜ—Ù\XØ]WÚ[	Ë	ÜÝ[WÛÜ—Ù\XØ]WÚ[	Ë	Ù›Ü™ZYÛ—Ú[	×JNÂˆ›ÜŠÛÛœÝ™\Ý[ÙˆÜÝ[K\XØ]K›Ü™ZYÛ—J^Âˆ\ÜÙ\™\]X[
+™\Ý[™™]ÚY˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\Ý[œÝ]Kœ™]š\Ú[Û‹
+NÂˆBŸJNÂ\Ý
+	Ø[ˆ]]Üš^™YÛX\œÈØXÚYšYHÝ]HY\ˆXØÙ\ÜÈ\ÈÜÝ	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝØXØÙ\ÜÓÜÝOX]ØZ]›ÝYšXØ][Û’[™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+XØÙ\ÜÓÜÝ™™]ÚYYJNÂˆ\ÜÙ\™\]X[
+XØÙ\ÜÓÜÝœ™X\ÛÛ‹	ØXØÙ\Ü×ÛÜÝ	ÊNÂˆ\ÜÙ\™\]X[
+XØÙ\ÜÓÜÝœÝ]K[
+NÂˆ\ÜÙ\™\]X[
+XØÙ\ÜÓÜÝ›™YYÔ™XÛÝ™\žK˜[ÙJNÂŸJNÂ\Ý
+	ØH™]Ù\ˆ[Ú]HÌ™\ÜÛœÙH™]™\ˆ˜XœšXØ]\ÈH[YÝ]IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÛ›ÝY]š\ÚX›_OX]ØZ]›ÝYšXØ][Û’[™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+›ÝY]š\ÚX›K™™]ÚYYJNÂˆ\ÜÙ\™\]X[
+›ÝY]š\ÚX›K˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+›ÝY]š\ÚX›Kœ™X\ÛÛ‹	Ú[Û›ÝÞY]Ýš\ÚX›IÊNÂˆ\ÜÙ\™\]X[
+›ÝY]š\ÚX›K›™YYÔ™XÛÝ™\žKYJNÂˆ\ÜÙ\™\]X[
+›ÝY]š\ÚX›KœÝ]Kœ™]š\Ú[Û‹
+NÂˆ\ÜÙ\™\]X[
+›ÝY]š\ÚX›KœÝ]KœÝ]\Ë	ØØ[˜Ù[Y	ÊNÂŸJNÂ\Ý
+	ØH›ÝYšXØ][ÛˆØ[ˆ™\]Y\Ý]Ø[››Ý]Ù[ˆ\ÝX›\Ú[ˆ[š]X[\Ü^H˜\Ù[[™IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÚ[š]X[OX]ØZ]›ÝYšXØ][Û’[™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+[š]X[™™]ÚYYJNÂˆ\ÜÙ\™\]X[
+[š]X[˜\YYYJNÂˆ\ÜÙ\™\]X[
+[š]X[œ™X\ÛÛ‹	Ø˜\Ù[[™IÊNÂˆ\ÜÙ\™\]X[
+[š]X[œÝ]Kœ™]š\Ú[Û‹
+NÂˆ\ÜÙ\™\]X[
+[š]X[œÝ]KœÝ]\Ë	Ø\ÜÚYÛ™Y	ÊNÂˆ\ÜÙ\™\]X[
+[š]X[œÝ]KšY]Ù\”›ÛK	Ü\ÜÙ[™Ù\‰ÊNÂŸJNÂ\Ý
+	ÛÙÛÝ]ÛX\œÈšYHÝ]KUYÈ[™ØÚY[Y™]žHÝ]IË
+
+HOˆÂˆÛÛœÝÛÙÙÙYÝ]™]žPØ[˜Ù[YO\Ù\ÜÚ[Û’\ÛÛ][Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™]žPØ[˜Ù[YJNÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]˜XÝ]™K˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]œÝ]K[
+NÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]™]YË[
+NÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]œ™]žTØÚY[Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]š[‘›YÚ
+NÂŸJNÂ\Ý
+	ÛÙÛÝ]X›ÜÈ[ˆ[‹Y›YÚ™XÛÝ™\žH™\]Y\Ý	Ë
+
+HOˆÂˆÛÛœÝÛÙÛÝ]ÚYÛ˜[X›ÜYO\Ù\ÜÚ[Û’\ÛÛ][Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+ÙÛÝ]ÚYÛ˜[X›ÜYYJNÂŸJNÂ\Ý
+	ØH™XÛÝ™\žH™\ÜÛœÙHÛÛ\][™ÈY\ˆÙÛÝ]Ø[››Ý™\ÝÜ™HØXÚYÝ]IË
+
+HOˆÂˆÛÛœÝÙ[^YYY\“ÙÛÝ]O\Ù\ÜÚ[Û’\ÛÛ][Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+[^YYY\“ÙÛÝ]˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+[^YYY\“ÙÛÝ]œ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YYY\“ÙÛÝ]œÝ]K[
+NÂŸJNÂ\Ý
+	Ü›ÛHÝÚ]Ú[™ÈÛX\œÈ\ÜÙ[™Ù\ˆØXÚH[™™Z™XÝÈ]È[^YY™\ÜÛœÙIË
+
+HOˆÂˆÛÛœÝØY\”›ÛTÝÚ]Ú\ÜÙ[™Ù\”ÚYÛ˜[X›ÜY[^YY\ÜÙ[™Ù\ŸO\Ù\ÜÚ[Û’\ÛÛ][Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+Y\”›ÛTÝÚ]Ú˜XÝ]™KYJNÂˆ\ÜÙ\™\]X[
+Y\”›ÛTÝÚ]ÚšY]Ù\”›ÛK	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+Y\”›ÛTÝÚ]ÚœÝ]K[
+NÂˆ\ÜÙ\™\]X[
+Y\”›ÛTÝÚ]Ú™]YË[
+NÂˆ\ÜÙ\™\]X[
+\ÜÙ[™Ù\”ÚYÛ˜[X›ÜYYJNÂˆ\ÜÙ\™\]X[
+[^YY\ÜÙ[™Ù\‹œ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YY\ÜÙ[™Ù\‹œÝ]K[
+NÂŸJNÂ\Ý
+	ÝH™]È›ÛHØ[ˆ\HÛ›H]ÈÝÛˆ]]Üš^™Y™XÛÝ™\žH™\ÜÛœÙIË
+
+HOˆÂˆÛÛœÝÙš]™\”™XÛÝ™\žKš]™\”Ý]_O\Ù\ÜÚ[Û’\ÛÛ][Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+š]™\”™XÛÝ™\žK˜\YYYJNÂˆ\ÜÙ\™\]X[
+š]™\”™XÛÝ™\žKœÝ]KšY]Ù\”›ÛK	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+š]™\”Ý]KšY]Ù\”›ÛK	Ùš]™\‰ÊNÂˆ\ÜÙ\™\]X[
+š]™\”Ý]KœÝ]KœÝ]\Ë	ÛÛ—Ýš\	ÊNÂˆ\ÜÙ\™\]X[
+š]™\”Ý]KœÝ]K›™^XÝ[Û‹	ØÛÛ[YWÝš\	ÊNÂˆ\ÜÙ\™\]X[
+š]™\”Ý]K™]YË	È™š]™\‹Y]YÈ‰ÊNÂŸJNÂ\Ý
+	ÜÝÚ]Ú[™ÈXØÛÝ[È™Z™XÝÈ[ˆÛ™\ÜÛœÙH]™[ˆÚ[ˆ›ÛH[™šYHQX]Ú	Ë
+
+HOˆÂˆÛÛœÝÙ[^YYXØÛÝ[KXØÛÝ[”Ý]_O\Ù\ÜÚ[Û’\ÛÛ][Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+[^YYXØÛÝ[K˜\YY˜[ÙJNÂˆ\ÜÙ\™\]X[
+[^YYXØÛÝ[Kœ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YYXØÛÝ[KœÝ]K[
+NÂˆ\ÜÙ\™\]X[
+XØÛÝ[”Ý]K˜XÝ]™KYJNÂˆ\ÜÙ\™\]X[
+XØÛÝ[”Ý]KšY]Ù\”›ÛK	Ü\ÜÙ[™Ù\‰ÊNÂˆ\ÜÙ\™\]X[
+XØÛÝ[”Ý]KœÝ]K[
+NÂˆ\ÜÙ\™\]X[
+XØÛÝ[”Ý]K™]YË[
+NÂŸJNÂ\Ý
+	ØHÛÛ[X[™ÝXØÙ\ÜÈÛÛ\][™ÈY\ˆÙÛÝ]\È\ØØ\™Y	Ë
+
+HOˆÂˆÛÛœÝÛÙÙÙYÝ]ÙÛÝ]X›ÜY[^YYÝXØÙ\ÜßOXÛÛ[X[™Ù\ÜÚ[Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]˜XÝ]™K˜[ÙJNÂˆ\ÜÙ\™\]X[
+ÙÙÙYÝ]š[‘›YÚ
+NÂˆ\ÜÙ\™\]X[
+ÙÛÝ]X›ÜYYJNÂˆ\ÜÙ\™\]X[
+[^YYÝXØÙ\ÜË˜ÛÛ[Z]Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+[^YYÝXØÙ\ÜËœ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YYÝXØÙ\ÜË˜]]Ô™]žK˜[ÙJNÂŸJNÂ\Ý
+	ÜÙ\ÜÚ[Ûˆ^\žH\š[™ÈHÝ]KXÚ[™Ú[™ÈÛÛ[X[™™\]Z\™\È™X]][XØ][ÛˆÚ]Ý]]]Ë\™]žIË
+
+HOˆÂˆÛÛœÝÜÙ\ÜÚ[Û‘^\™YOXÛÛ[X[™Ù\ÜÚ[Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+Ù\ÜÚ[Û‘^\™Y˜ÛÛ[Z]Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ù\ÜÚ[Û‘^\™Yœ™X\ÛÛ‹	ÜÙ\ÜÚ[Û—Ù^\™Y	ÊNÂˆ\ÜÙ\™\]X[
+Ù\ÜÚ[Û‘^\™Y˜]]Ô™]žK˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ù\ÜÚ[Û‘^\™Y›™YYÔ™X]]YJNÂˆ\ÜÙ\™\]X[
+Ù\ÜÚ[Û‘^\™Y›™YYÔ™XÛÝ™\žKYJNÂŸJNÂ\Ý
+	Ø[ˆ[šÛ›ÝÛˆÛÛ[X[™Ý]ÛÛYH\È™XÛÛ˜Ú[Y™Y›Ü™H[ˆ^XÚ]Ø[YKZÙ^H™]žIË
+
+HOˆÂˆÛÛœÝÛÝ]ÛÛYU[šÛ›ÝÛŸOXÛÛ[X[™Ù\ÜÚ[Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+Ý]ÛÛYU[šÛ›ÝÛ‹˜ÛÛ[Z]Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ý]ÛÛYU[šÛ›ÝÛ‹œ™X\ÛÛ‹	ÛÝ]ÛÛYWÝ[šÛ›ÝÛ‰ÊNÂˆ\ÜÙ\™\]X[
+Ý]ÛÛYU[šÛ›ÝÛ‹˜]]Ô™]žK˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ý]ÛÛYU[šÛ›ÝÛ‹›™YYÔ™XÛÝ™\žKYJNÂˆ\ÜÙ\™\]X[
+Ý]ÛÛYU[šÛ›ÝÛ‹œ™]\ÙTØ[YRÙ^KYJNÂŸJNÂ\Ý
+	ØXØÛÝ[ÝÚ]Ú[™È™Z™XÝÈHÛÛÛ[X[™][ÝÜÈH™]ÈXØÛÝ[ÛÛ[X[™	Ë
+
+HOˆÂˆÛÛœÝÙ[^YYXØÛÝ[KXØÛÝ[ÛÛ[Z]YOXÛÛ[X[™Ù\ÜÚ[Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+[^YYXØÛÝ[Kœ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+[^YYXØÛÝ[K˜ÛÛ[Z]Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+XØÛÝ[ÛÛ[Z]Yœ™X\ÛÛ‹	ØÛÛ[Z]Y	ÊNÂˆ\ÜÙ\™\]X[
+XØÛÝ[ÛÛ[Z]Y˜ÛÛ[Z]YYJNÂŸJNÂ\Ý
+	ÝHØ[YH˜]ÈY[\Ý[˜ÞKRÙ^H\È\ÛÛ]YžH]][XØ]YXØÛÝ[	Ë
+
+HOˆÂˆÛÛœÝØXØÛÝ[TØÛÜK™X]]ØÛÜKXØÛÝ[”ØÛÜKXØÛÝ[R[™TØÛÜKXØÛÝ[’[™TØÛÜ_OXÛÛ[X[™Ù\ÜÚ[Û”™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+XØÛÝ[TØÛÜK™X]]ØÛÜJNÂˆ\ÜÙ\™\]X[
+XØÛÝ[TØÛÜKXØÛÝ[R[™TØÛÜJNÂˆ\ÜÙ\™\]X[
+XØÛÝ[”ØÛÜKXØÛÝ[’[™TØÛÜJNÂˆ\ÜÙ\››Ý\]X[
+XØÛÝ[TØÛÜKXØÛÝ[”ØÛÜJNÂŸJNÂ\Ý
+	ÜÝXÝ\™YY[\Ý[˜ÞHØÛÜ[™È]›ÚYÈ[[Z]\ˆÛÛ\Ú[ÛœÉË
+
+HOˆÂˆÛÛœÝÙ[[Z]\K[[Z]\ŸOXÛÛ[X[™Ù\ÜÚ[Û”™\Ý[Ê
+NÂˆ\ÜÙ\››Ý\]X[
+[[Z]\K[[Z]\ŠNÂŸJNÂ\Ý
+	Ø[ˆ[™XYKX\YY[šÛ›ÝÛˆÛÛ[X[™ÛÛ\]\Èœ›ÛH™XÛÝ™\™YÝ]HÚ]Ý]™\^IË\Þ[˜È
+
+HOˆÂˆÛÛœÝØ[™XYP\YY\YY™\^PØ[ßOX]ØZ]ÛÛ[X[™™XÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+[™XYP\YY˜ÛÛ[Z]YYJNÂˆ\ÜÙ\™\]X[
+[™XYP\YYœ™X\ÛÛ‹	ØÛÛ™š\›YYØžWÜ™XÛÝ™\žIÊNÂˆ\ÜÙ\™\]X[
+[™XYP\YYœ™\Ù[˜[ÙJNÂˆ\ÜÙ\™\]X[
+[™XYP\YYœÝ]KœÝ]\Ë	ØØ[˜Ù[Y	ÊNÂˆ\ÜÙ\™\]X[
+\YY™\^PØ[Ë
+NÂŸJNÂ\Ý
+	Ø[ˆ[˜Ú[™ÙY™XÛÝ™\™YÝ]H\›Z]È^XÝHÛ™H^XÚ]Ø[YKZÙ^H™\^IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÜ™\^YY™\^PØ[ßOX]ØZ]ÛÛ[X[™™XÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™\^YY˜ÛÛ[Z]YYJNÂˆ\ÜÙ\™\]X[
+™\^YYœ™X\ÛÛ‹	ØÛÛ[Z]YØžWÜ™\^IÊNÂˆ\ÜÙ\™\]X[
+™\^YYœ™\Ù[YJNÂˆ\ÜÙ\™\]X[
+™\^PØ[Ë›[™ÝJNÂˆ\ÜÙ\™\]X[
+™\^PØ[ÖÌK˜XÝ[Û‹	ØØ[˜Ù[ÜšYIÊNÂˆ\ÜÙ\™\]X[
+™\^PØ[ÖÌKšY[\Ý[˜ÞRÙ^K	Ü™XÛÝ™\‹XØ[˜Ù[ZÙ^IÊNÂŸJNÂ\Ý
+	ØH™]Ù\ˆÛÛ™›XÝ[™ÈÝ]HÝÜÈ™XÛÝ™\žHÚ]Ý]™\^Z[™ÈHÛÛ[X[™	Ë\Þ[˜È
+
+HOˆÂˆÛÛœÝØÚ[™ÙYÚ[™ÙY™\^PØ[ßOX]ØZ]ÛÛ[X[™™XÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+Ú[™ÙY˜ÛÛ[Z]Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ú[™ÙYœ™X\ÛÛ‹	ÜÝ]WØÚ[™ÙY	ÊNÂˆ\ÜÙ\™\]X[
+Ú[™ÙYœ™\Ù[˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ú[™ÙYœÝ]KœÝ]\Ë	ÛÛ—Ýš\	ÊNÂˆ\ÜÙ\™\]X[
+Ú[™ÙY™\^PØ[Ë
+NÂŸJNÂ\Ý
+	ÛÜÜÈÙˆ™XÛÝ™\žHXØÙ\ÜÈÝÜÈHÛÛ[X[™Ú]Ý]™\^IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÙ[šYY[šYY™\^PØ[ßOX]ØZ]ÛÛ[X[™™XÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+[šYY˜ÛÛ[Z]Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+[šYYœ™X\ÛÛ‹	ØXØÙ\Ü×ÛÜÝ	ÊNÂˆ\ÜÙ\™\]X[
+[šYYœ™\Ù[˜[ÙJNÂˆ\ÜÙ\™\]X[
+[šYY™\^PØ[Ë
+NÂŸJNÂ\Ý
+	Ø[ˆ[šÛ›ÝÛˆ™\^HÝ]ÛÛYHÝÜÈY\ˆHÚ[™ÛH^XÚ]™\^IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÜ™\^U[šÛ›ÝÛ‹[šÛ›ÝÛ”™\^PØ[ßOX]ØZ]ÛÛ[X[™™XÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+™\^U[šÛ›ÝÛ‹˜ÛÛ[Z]Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+™\^U[šÛ›ÝÛ‹œ™X\ÛÛ‹	Ü™\^WÝ[œ™\ÛÛ™Y	ÊNÂˆ\ÜÙ\™\]X[
+™\^U[šÛ›ÝÛ‹œ™\Ù[YJNÂˆ\ÜÙ\™\]X[
+[šÛ›ÝÛ”™\^PØ[ËJNÂŸJNÂ\Ý
+	ØHÙ\ÜÚ[ÛˆÝÚ]Ú\š[™È™XÛÝ™\žH\ØØ\™ÈH™\Ý[[™™]™[È™\^IË\Þ[˜È
+
+HOˆÂˆÛÛœÝÜÝ[TÙ\ÜÚ[Û‹Ý[T™\^PØ[ßOX]ØZ]ÛÛ[X[™™XÛÝ™\žT™\Ý[Ê
+NÂˆ\ÜÙ\™\]X[
+Ý[TÙ\ÜÚ[Û‹˜ÛÛ[Z]Y˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ý[TÙ\ÜÚ[Û‹œ™X\ÛÛ‹	ÜÝ[WÜÙ\ÜÚ[Û‰ÊNÂˆ\ÜÙ\™\]X[
+Ý[TÙ\ÜÚ[Û‹œ™\Ù[˜[ÙJNÂˆ\ÜÙ\™\]X[
+Ý[T™\^PØ[Ë
+NÂŸJNÂ

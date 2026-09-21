@@ -162,6 +162,7 @@ function offerListView(state) {
   }] : [];
   return {
     serverNow: new Date(state.clockMs).toISOString(),
+    nextExpiryAt: offers.length ? offers.reduce((earliest, item) => earliest === null || item.expiresAt < earliest ? item.expiresAt : earliest, null) : null,
     offers,
     summary: {
       active: offer.status === 'active' ? 1 : 0,
@@ -937,7 +938,7 @@ async function runOfferListContract() {
     }
   };
   const [active, expired, unavailable, conditional] = await Promise.all([
-    read({offerExpiresAtMs: clockMs + 1}),
+    read({offerExpiresAtMs: clockMs + 30_000}),
     read({offerExpiresAtMs: clockMs}),
     read({offerExpiresAtMs: clockMs + 1, offerDriverEligible: false}),
     read({
@@ -963,6 +964,12 @@ async function runOfferListContract() {
     if (item.result.body?.serverNow !== new Date(clockMs).toISOString()) {
       throw new Error('offer list did not expose the trusted time used for expiry evaluation');
     }
+  }
+  if (active.result.body?.nextExpiryAt !== new Date(clockMs + 30_000).toISOString()) {
+    throw new Error('offer list did not expose the earliest active expiry as its refresh deadline');
+  }
+  for (const item of [expired, unavailable, conditional]) {
+    if (item.result.body?.nextExpiryAt !== null) throw new Error('offer list exposed a refresh deadline without an active offer');
   }
   if (expired.result.status !== 200 || expired.result.body?.offers?.length !== 0 || expired.result.body?.summary?.expired !== 1) {
     throw new Error('expired offer list did not return expiry guidance state');
