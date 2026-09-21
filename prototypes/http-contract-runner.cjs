@@ -1,1453 +1,900 @@
-'use strict';
-
-const http = require('node:http');
-const crypto = require('node:crypto');
-
-const FIXTURE = Object.freeze({
-  requestId: 'ride-owner-1',
-  offerId: 'offer-reviewed-1',
-  revision: 2,
-  tokens: Object.freeze({
-    owner: 'token-passenger-owner',
-    otherPassenger: 'token-passenger-other',
-    assignedDriver: 'token-driver-assigned',
-    reviewedDriver: 'token-driver-reviewed',
-    otherDriver: 'token-driver-other',
-    pendingDriver: 'token-driver-pending'
-  })
-});
-
-const ACTORS = new Map([
-  [FIXTURE.tokens.owner, {id: 'passenger-owner', role: 'passenger'}],
-  [FIXTURE.tokens.otherPassenger, {id: 'passenger-other', role: 'passenger'}],
-  [FIXTURE.tokens.assignedDriver, {id: 'driver-assigned', role: 'driver', eligible: true}],
-  [FIXTURE.tokens.reviewedDriver, {id: 'driver-reviewed', role: 'driver', eligible: true}],
-  [FIXTURE.tokens.otherDriver, {id: 'driver-other', role: 'driver', eligible: true}],
-  [FIXTURE.tokens.pendingDriver, {id: 'driver-pending', role: 'driver', eligible: false}]
-]);
-const FORBIDDEN_INPUTS = new Set(['passengerId', 'driverId', 'reviewerId', 'approved', 'eligible', 'reviewStatus']);
-const AUDIT_FIELDS = Object.freeze(['id', 'type', 'outcome', 'reason', 'actorRole', 'actorRef', 'requestId', 'offerId', 'fromRevision', 'toRevision', 'occurredAt']);
-const CANCELLATION_REASONS = Object.freeze(['passenger_requested', 'route_changed', 'schedule_changed']);
-
-function errorBody(code, message, suffix = 'error') {
-  return {code, message, requestId: `trace-mock-${suffix}`};
-}
-
-function send(res, status, body, headers = {}) {
-  if (status === 204 || status === 304) {
-    res.writeHead(status, headers);
-    return res.end();
-  }
-  const encoded = JSON.stringify(body);
-  res.writeHead(status, {...headers, 'content-type': 'application/json', 'content-length': Buffer.byteLength(encoded)});
-  res.end(encoded);
-}
-
-async function readBody(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  if (!chunks.length) return {};
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-  catch { return null; }
-}
-
-function hasForbiddenInput(value) {
-  if (!value || typeof value !== 'object') return false;
-  if (Array.isArray(value)) return value.some(hasForbiddenInput);
-  return Object.entries(value).some(([key, child]) => FORBIDDEN_INPUTS.has(key) || hasForbiddenInput(child));
-}
-
-function actorFrom(req) {
-  const match = /^Bearer (.+)$/i.exec(req.headers.authorization || '');
-  return match ? ACTORS.get(match[1]) : null;
-}
-
-function normalizePlate(value) {
-  return String(value || '').normalize('NFKC').toUpperCase().replace(/[^A-Z0-9]/g, '');
-}
-
-function rideStateView(state, actor) {
-  const passengerActions = {
-    collecting: 'compare_offers',
-    assigned: 'track_pickup',
-    arriving: 'confirm_vehicle',
-    on_trip: 'show_on_trip',
-    completed: 'show_completed',
-    cancelled: 'show_cancelled_history'
-  };
-  const driverActions = {
-    assigned: 'start_pickup',
-    arriving: 'wait_for_vehicle_confirmation',
-    on_trip: 'continue_trip',
-    completed: 'show_completed',
-    cancelled: 'show_cancelled_trip'
-  };
-  return {
-    id: state.ride.id,
-    status: state.ride.status,
-    revision: state.ride.revision,
-    viewerRole: actor.role,
-    nextAction: (actor.role === 'passenger' ? passengerActions : driverActions)[state.ride.status],
-    updatedAt: new Date(state.clockMs).toISOString()
-  };
-}
-
-function rideStateEtag(state, actor) {
-  const digest = crypto.createHash('sha256').update(JSON.stringify(rideStateView(state, actor))).digest('base64url').slice(0, 24);
-  return `"${digest}"`;
-}
-
-function matchesIfNoneMatch(value, etag) {
-  if (!value) return false;
-  const normalized = token => token.trim().replace(/^W\//i, '');
-  return String(value).split(',').some(candidate => candidate.trim() === '*' || normalized(candidate) === etag);
-}
-
-function createMockState(options = {}) {
-  const clockMs = options.clockMs ?? Date.parse('2026-09-17T03:00:00Z');
-  const rideStatus = options.rideStatus ?? 'collecting';
-  return {
-    ride: {
-      id: FIXTURE.requestId,
-      status: rideStatus,
-      revision: options.rideRevision ?? FIXTURE.revision,
-      assignedDriverId: options.assignedDriverId ?? (rideStatus === 'collecting' ? null : 'driver-assigned'),
-      vehicleConfirmation: options.vehicleConfirmation ? structuredClone(options.vehicleConfirmation) : null
-    },
-    offer: {
-      id: FIXTURE.offerId,
-      driverId: 'driver-reviewed',
-      status: 'active',
-      fareCents: 2300,
-      etaMinutes: 7,
-      expiresAtMs: options.offerExpiresAtMs ?? clockMs + 15 * 60 * 1000
-    },
-    driverEligibility: {
-      'driver-reviewed': options.offerDriverEligible ?? true,
-      'driver-assigned': options.assignedDriverEligible ?? true
-    },
-    bookedPlate: normalizePlate(options.bookedPlate ?? 'DEMO 001'),
-    commandDelays: {...(options.commandDelays || {})},
-    recoveryFailures: (options.recoveryFailures || []).map(failure => ({...failure})),
-    duplicateCurrentFor: options.duplicateCurrentFor || null,
-    clockMs,
-    auditEvents: [],
-    auditSequence: 0,
-    idempotency: new Map(),
-    lock: Promise.resolve()
-  };
-}
-
-function recordAudit(state, actor, event) {
-  const entry = Object.freeze({
-    id: `audit-${++state.auditSequence}`,
-    type: event.type,
-    outcome: event.outcome,
-    reason: event.reason || null,
-    actorRole: actor.role,
-    actorRef: actor.id,
-    requestId: FIXTURE.requestId,
-    offerId: event.offerId || null,
-    fromRevision: event.fromRevision,
-    toRevision: event.toRevision,
-    occurredAt: new Date(state.clockMs).toISOString()
-  });
-  state.auditEvents.push(entry);
-  return entry;
-}
-
-function serialize(state, action) {
-  const pending = state.lock.then(action, action);
-  state.lock = pending.then(() => undefined, () => undefined);
-  return pending;
-}
-
-function commandFingerprint(req, url, body) {
-  return JSON.stringify({method: req.method, path: url.pathname, body});
-}
-
-function idempotencyScopeKey(accountRef, idempotencyKey) {
-  return JSON.stringify([String(accountRef), String(idempotencyKey)]);
-}
-
-async function atomicCommand(state, actor, req, url, body, action) {
-  const key = idempotencyScopeKey(actor.id, req.headers['idempotency-key']);
-  const fingerprint = commandFingerprint(req, url, body);
-  return serialize(state, async () => {
-    const saved = state.idempotency.get(key);
-    if (saved) {
-      if (saved.fingerprint !== fingerprint) return {status: 409, body: errorBody('idempotency_conflict', 'Idempotency-Key was already used for different content.', 'idempotency-conflict')};
-      return structuredClone(saved.response);
-    }
-    // Let concurrent HTTP handlers overlap before the serialized state change.
-    await new Promise(resolve => setImmediate(resolve));
-    const response = action();
-    state.idempotency.set(key, {fingerprint, response: structuredClone(response)});
-    return response;
-  });
-}
-
-function createMockHandler(state = createMockState()) {
-  const handler = async (req, res) => {
-    const url = new URL(req.url, 'http://127.0.0.1');
-    const actor = actorFrom(req);
-    if (!actor) return send(res, 401, errorBody('authentication_required', 'Authentication is required.', 'auth'));
-    if (req.method === 'POST' && !req.headers['idempotency-key']) {
-      return send(res, 422, errorBody('invalid_request', 'Idempotency-Key is required.', 'idempotency'));
-    }
-    const body = req.method === 'POST' ? await readBody(req) : {};
-    if (body === null || hasForbiddenInput(body)) {
-      return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
-    }
-
-    const offersPath = `/v1/ride-requests/${FIXTURE.requestId}/offers`;
-    const selectPath = `/v1/offers/${FIXTURE.offerId}/select`;
-    const cancelPath = `/v1/ride-requests/${FIXTURE.requestId}/cancel`;
-    const currentRidePath = '/v1/rides/current';
-    const ridePath = `/v1/rides/${FIXTURE.requestId}`;
-    const confirmationPath = `/v1/rides/${FIXTURE.requestId}/vehicle-confirmations`;
-    const transitionPath = `/v1/rides/${FIXTURE.requestId}/transitions`;
-
-    if (req.method === 'GET' && url.pathname === currentRidePath) {
-      const headers = {'cache-control': 'private, no-cache', 'vary': 'Authorization'};
-      if (url.searchParams.size) return send(res, 422, errorBody('invalid_request', 'Current ride discovery does not accept ride identifiers.', 'current-input'), headers);
-      const isActive = ['collecting', 'assigned', 'arriving', 'on_trip'].includes(state.ride.status);
-      const ownsRide = actor.role === 'passenger' && actor.id === 'passenger-owner';
-      const isAssignedDriver = actor.role === 'driver' && actor.id === state.ride.assignedDriverId;
-      const candidates = isActive && (ownsRide || isAssignedDriver) ? [state.ride] : [];
-      if (state.duplicateCurrentFor === actor.id && candidates.length) candidates.push({...state.ride, id: 'ride-duplicate-fixture'});
-      if (candidates.length > 1) {
-        return send(res, 409, errorBody('ambiguous_current_ride', 'The current ride could not be selected safely.', 'current-ambiguous'), headers);
-      }
-      if (!candidates.length) return send(res, 204, null, headers);
-      return send(res, 200, rideStateView(state, actor), {...headers, etag: rideStateEtag(state, actor)});
-    }
-
-    if (req.method === 'GET' && url.pathname === ridePath) {
-      const ownsRide = actor.role === 'passenger' && actor.id === 'passenger-owner';
-      const isAssignedDriver = actor.role === 'driver' && actor.id === state.ride.assignedDriverId;
-      if (!ownsRide && !isAssignedDriver) return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      const failure = state.recoveryFailures.shift();
-      if (failure) {
-        const code = failure.status === 429 ? 'rate_limited' : 'service_unavailable';
-        const message = failure.status === 429 ? 'Too many recovery requests. Retry later.' : 'Ride recovery is temporarily unavailable.';
-        const headers = failure.retryAfter === undefined ? {} : {'retry-after': String(failure.retryAfter)};
-        return send(res, failure.status, errorBody(code, message, code), headers);
-      }
-      const etag = rideStateEtag(state, actor);
-      const headers = {'etag': etag, 'cache-control': 'private, no-cache', 'vary': 'Authorization'};
-      if (matchesIfNoneMatch(req.headers['if-none-match'], etag)) return send(res, 304, null, headers);
-      return send(res, 200, rideStateView(state, actor), headers);
-    }
-
-    if (req.method === 'GET' && url.pathname === offersPath) {
-      if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
-      if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      return send(res, 200, {offers: [], summary: {active: 0, expired: 0, unavailable: 0}});
-    }
-    if (req.method === 'POST' && url.pathname === offersPath) {
-      if (actor.role !== 'driver' || !actor.eligible) return send(res, 403, errorBody('role_or_eligibility_denied', 'This role or eligibility cannot perform the operation.', 'eligibility'));
-      return send(res, 201, {id: 'offer-new', requestId: FIXTURE.requestId, fareCents: body.fareCents, etaMinutes: body.etaMinutes, status: 'active', expiresAt: '2026-09-17T02:15:00Z'});
-    }
-    if (req.method === 'POST' && url.pathname === selectPath) {
-      if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
-      if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      if (Object.keys(body).some(key => key !== 'expectedRequestRevision')) return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
-      const response = await atomicCommand(state, actor, req, url, body, () => {
-        const fromRevision = state.ride.revision;
-        if (Number(body.expectedRequestRevision) !== state.ride.revision) {
-          recordAudit(state, actor, {type: 'offer.selection', outcome: 'rejected', reason: 'stale_revision', offerId: FIXTURE.offerId, fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('stale_revision', 'The request changed. Refresh before retrying.', 'stale'), revision: state.ride.revision}};
-        }
-        if (state.ride.status !== 'collecting') {
-          recordAudit(state, actor, {type: 'offer.selection', outcome: 'rejected', reason: 'invalid_transition', offerId: FIXTURE.offerId, fromRevision, toRevision: fromRevision});
-          return {status: 409, body: errorBody('invalid_transition', 'The request can no longer accept an offer.', 'transition')};
-        }
-        if (state.offer.status === 'expired' || state.clockMs >= state.offer.expiresAtMs) {
-          state.offer.status = 'expired'; state.offer.statusReason = 'time';
-          recordAudit(state, actor, {type: 'offer.selection', outcome: 'rejected', reason: 'offer_expired', offerId: FIXTURE.offerId, fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('offer_expired', 'The offer has expired. Request a new quote.', 'expired'), revision: state.ride.revision}};
-        }
-        if (state.offer.status === 'unavailable' || !state.driverEligibility[state.offer.driverId]) {
-          state.offer.status = 'unavailable'; state.offer.statusReason = 'eligibility';
-          recordAudit(state, actor, {type: 'offer.selection', outcome: 'rejected', reason: 'driver_unavailable', offerId: FIXTURE.offerId, fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('driver_unavailable', 'The driver is no longer eligible or available.', 'eligibility'), revision: state.ride.revision}};
-        }
-        state.ride.status = 'assigned'; state.ride.revision += 1; state.ride.selectedOfferId = FIXTURE.offerId; state.offer.status = 'selected';
-        state.ride.selectedQuote = {fareCents: state.offer.fareCents, etaMinutes: state.offer.etaMinutes, selectedAt: new Date(state.clockMs).toISOString()};
-        recordAudit(state, actor, {type: 'offer.selection', outcome: 'committed', offerId: FIXTURE.offerId, fromRevision, toRevision: state.ride.revision});
-        return {status: 200, body: structuredClone(state.ride)};
-      });
-      return send(res, response.status, response.body);
-    }
-    if (req.method === 'POST' && url.pathname === cancelPath) {
-      if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
-      if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      const cancelFields = ['expectedRevision', 'reason'];
-      if (Object.keys(body).some(key => !cancelFields.includes(key)) ||
-          !Number.isInteger(body.expectedRevision) || body.expectedRevision < 1 ||
-          !CANCELLATION_REASONS.includes(body.reason)) {
-        return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
-      }
-      if (state.commandDelays.cancel) await new Promise(resolve => setTimeout(resolve, state.commandDelays.cancel));
-      const response = await atomicCommand(state, actor, req, url, body, () => {
-        const fromRevision = state.ride.revision;
-        if (Number(body.expectedRevision) !== state.ride.revision) {
-          recordAudit(state, actor, {type: 'ride.cancellation', outcome: 'rejected', reason: 'stale_revision', fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('stale_revision', 'The request changed. Refresh before retrying.', 'stale'), revision: state.ride.revision}};
-        }
-        if (!['collecting', 'assigned', 'arriving'].includes(state.ride.status)) {
-          recordAudit(state, actor, {type: 'ride.cancellation', outcome: 'rejected', reason: 'invalid_transition', fromRevision, toRevision: fromRevision});
-          return {status: 409, body: errorBody('invalid_transition', 'The request can no longer be cancelled.', 'transition')};
-        }
-        state.ride.status = 'cancelled'; state.ride.revision += 1; state.ride.cancelReason = body.reason; state.ride.vehicleConfirmation = null;
-        recordAudit(state, actor, {type: 'ride.cancellation', outcome: 'committed', reason: body.reason, fromRevision, toRevision: state.ride.revision});
-        return {status: 200, body: structuredClone(state.ride)};
-      });
-      return send(res, response.status, response.body);
-    }
-    if (req.method === 'POST' && url.pathname === confirmationPath) {
-      if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
-      if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      const confirmationFields = ['observedPlate', 'samePerson', 'sameVehicle', 'expectedRevision'];
-      if (Object.keys(body).some(key => !confirmationFields.includes(key)) ||
-          typeof body.observedPlate !== 'string' || !body.observedPlate.trim() ||
-          typeof body.samePerson !== 'boolean' || typeof body.sameVehicle !== 'boolean') {
-        return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
-      }
-      const response = await atomicCommand(state, actor, req, url, body, () => {
-        const fromRevision = state.ride.revision;
-        if (Number(body.expectedRevision) !== fromRevision) {
-          recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'rejected', reason: 'stale_revision', fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('stale_revision', 'The ride changed. Refresh before retrying.', 'stale'), revision: fromRevision}};
-        }
-        if (state.ride.status !== 'arriving' || !state.ride.assignedDriverId) {
-          recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'rejected', reason: 'invalid_transition', fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('invalid_transition', 'Vehicle confirmation is not available in this ride state.', 'transition'), revision: fromRevision}};
-        }
-        if (!state.driverEligibility[state.ride.assignedDriverId]) {
-          recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'rejected', reason: 'driver_unavailable', fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('driver_unavailable', 'The assigned driver is no longer eligible.', 'eligibility'), revision: fromRevision}};
-        }
-        const matches = normalizePlate(body.observedPlate) === state.bookedPlate && body.samePerson && body.sameVehicle;
-        if (!matches) {
-          if (state.ride.vehicleConfirmation) {
-            state.ride.vehicleConfirmation = null;
-            state.ride.revision += 1;
-          }
-          recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'rejected', reason: 'vehicle_mismatch', fromRevision, toRevision: state.ride.revision});
-          return {status: 409, body: {...errorBody('vehicle_mismatch', 'The observed driver or vehicle does not match the booking.', 'vehicle-mismatch'), revision: state.ride.revision}};
-        }
-        const confirmation = {
-          requestId: FIXTURE.requestId,
-          assignmentRevision: fromRevision,
-          confirmedAt: new Date(state.clockMs).toISOString()
-        };
-        state.ride.revision += 1;
-        state.ride.vehicleConfirmation = {...confirmation, validForRevision: state.ride.revision};
-        recordAudit(state, actor, {type: 'vehicle.confirmation', outcome: 'committed', fromRevision, toRevision: state.ride.revision});
-        return {status: 201, body: confirmation};
-      });
-      return send(res, response.status, response.body);
-    }
-    if (req.method === 'POST' && url.pathname === transitionPath) {
-      if (actor.role !== 'driver') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
-      if (actor.id !== state.ride.assignedDriverId) return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      const transitionFields = ['from', 'to', 'expectedRevision'];
-      if (Object.keys(body).some(key => !transitionFields.includes(key)) ||
-          typeof body.from !== 'string' || typeof body.to !== 'string') {
-        return send(res, 422, errorBody('invalid_request', 'Request fields are invalid.', 'input'));
-      }
-      if (state.commandDelays.transition) await new Promise(resolve => setTimeout(resolve, state.commandDelays.transition));
-      const response = await atomicCommand(state, actor, req, url, body, () => {
-        const fromRevision = state.ride.revision;
-        if (Number(body.expectedRevision) !== fromRevision) {
-          recordAudit(state, actor, {type: 'ride.transition', outcome: 'rejected', reason: 'stale_revision', fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('stale_revision', 'The ride changed. Refresh before retrying.', 'stale'), revision: fromRevision}};
-        }
-        if (!state.driverEligibility[actor.id]) {
-          recordAudit(state, actor, {type: 'ride.transition', outcome: 'rejected', reason: 'driver_unavailable', fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('driver_unavailable', 'The assigned driver is no longer eligible.', 'eligibility'), revision: fromRevision}};
-        }
-        const next = {assigned: 'arriving', arriving: 'on_trip', on_trip: 'completed'}[state.ride.status];
-        if (body.from !== state.ride.status || body.to !== next) {
-          recordAudit(state, actor, {type: 'ride.transition', outcome: 'rejected', reason: 'invalid_transition', fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('invalid_transition', 'The requested ride transition is not allowed.', 'transition'), revision: fromRevision}};
-        }
-        if (body.to === 'on_trip' && state.ride.vehicleConfirmation?.validForRevision !== fromRevision) {
-          recordAudit(state, actor, {type: 'ride.transition', outcome: 'rejected', reason: 'vehicle_confirmation_required', fromRevision, toRevision: fromRevision});
-          return {status: 409, body: {...errorBody('vehicle_confirmation_required', 'A current vehicle confirmation is required before starting the ride.', 'vehicle-confirmation'), revision: fromRevision}};
-        }
-        state.ride.status = body.to;
-        state.ride.revision += 1;
-        recordAudit(state, actor, {type: 'ride.transition', outcome: 'committed', fromRevision, toRevision: state.ride.revision});
-        return {status: 200, body: {id: state.ride.id, status: state.ride.status, revision: state.ride.revision}};
-      });
-      return send(res, response.status, response.body);
-    }
-    return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'route'));
-  };
-  handler.state = state;
-  return handler;
-}
-
-function scenarios(tokens = FIXTURE.tokens) {
-  const idempotent = {'Idempotency-Key': 'test-key-0000000001'};
-  return [
-    {name: 'no session cannot read offers', method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, expected: [401, 'authentication_required']},
-    {name: 'owner can read offers', method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: tokens.owner, expected: [200]},
-    {name: 'unrelated passenger cannot discover offers', method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: tokens.otherPassenger, expected: [404, 'resource_not_found'], concealed: true},
-    {name: 'driver cannot use passenger offer-list API', method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: tokens.reviewedDriver, expected: [403, 'role_or_eligibility_denied']},
-    {name: 'passenger cannot create a driver offer', method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: tokens.owner, headers: idempotent, body: {fareCents: 2300, etaMinutes: 7, expectedRequestRevision: 2}, expected: [403, 'role_or_eligibility_denied']},
-    {name: 'pending driver cannot create an offer', method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: tokens.pendingDriver, headers: idempotent, body: {fareCents: 2300, etaMinutes: 7, expectedRequestRevision: 2}, expected: [403, 'role_or_eligibility_denied']},
-    {name: 'reviewed driver can create an offer', method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: tokens.reviewedDriver, headers: idempotent, body: {fareCents: 2300, etaMinutes: 7, expectedRequestRevision: 2}, expected: [201]},
-    {name: 'other passenger cannot select the owner offer', method: 'POST', path: `/v1/offers/${FIXTURE.offerId}/select`, token: tokens.otherPassenger, headers: idempotent, body: {expectedRequestRevision: 2}, expected: [404, 'resource_not_found'], concealed: true},
-    {name: 'other passenger cannot cancel the owner request', method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/cancel`, token: tokens.otherPassenger, headers: idempotent, body: {expectedRevision: 2, reason: 'passenger_requested'}, expected: [404, 'resource_not_found'], concealed: true},
-    {name: 'other passenger cannot confirm the owner vehicle', method: 'POST', path: `/v1/rides/${FIXTURE.requestId}/vehicle-confirmations`, token: tokens.otherPassenger, headers: idempotent, body: {observedPlate: 'DEMO 001', samePerson: true, sameVehicle: true, expectedRevision: 2}, expected: [404, 'resource_not_found'], concealed: true},
-    {name: 'unassigned driver cannot transition the ride', method: 'POST', path: `/v1/rides/${FIXTURE.requestId}/transitions`, token: tokens.otherDriver, headers: idempotent, body: {from: 'assigned', to: 'arriving', expectedRevision: 2}, expected: [404, 'resource_not_found'], concealed: true},
-    {name: 'assigned driver can transition the ride', method: 'POST', path: `/v1/rides/${FIXTURE.requestId}/transitions`, token: tokens.assignedDriver, headers: idempotent, body: {from: 'assigned', to: 'arriving', expectedRevision: 2}, expected: [200]},
-    {name: 'caller supplied driver identity is rejected', method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: tokens.reviewedDriver, headers: idempotent, body: {driverId: 'driver-assigned', fareCents: 2300, etaMinutes: 7, expectedRequestRevision: 2}, expected: [422, 'invalid_request']},
-    {name: 'missing idempotency key is rejected', method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/cancel`, token: tokens.owner, body: {expectedRevision: 2, reason: 'passenger_requested'}, expected: [422, 'invalid_request']}
-  ];
-}
-
-async function requestJson(baseUrl, scenario, fetchImpl) {
-  const headers = {...scenario.headers};
-  if (scenario.token) headers.authorization = `Bearer ${scenario.token}`;
-  if (scenario.body !== undefined) headers['content-type'] = 'application/json';
-  const response = await fetchImpl(`${baseUrl}${scenario.path}`, {method: scenario.method, headers, body: scenario.body === undefined ? undefined : JSON.stringify(scenario.body)});
-  const text = await response.text();
-  const result = {status: response.status, body: text ? JSON.parse(text) : null};
-  if (scenario.captureHeaders) {
-    result.headers = {
-      etag: response.headers.get('etag'),
-      cacheControl: response.headers.get('cache-control'),
-      vary: response.headers.get('vary')
-    };
-    const retryAfter = response.headers.get('retry-after');
-    if (retryAfter !== null) result.headers.retryAfter = retryAfter;
-  }
-  return result;
-}
-
-function parseRetryAfterMs(value, nowMs = Date.now()) {
-  if (value === null || value === undefined || String(value).trim() === '') return null;
-  const raw = String(value).trim();
-  let delayMs;
-  if (/^\d+$/.test(raw)) delayMs = Number(raw) * 1000;
-  else {
-    const at = Date.parse(raw);
-    if (!Number.isFinite(at)) return null;
-    delayMs = at - nowMs;
-  }
-  if (!Number.isFinite(delayMs)) return null;
-  return Math.min(60_000, Math.max(1_000, Math.ceil(delayMs)));
-}
-
-function exponentialBackoffMs(retryIndex, random = Math.random) {
-  const base = Math.min(30_000, 1000 * 2 ** retryIndex);
-  const jitter = 0.5 + Math.min(1, Math.max(0, Number(random())));
-  return Math.min(30_000, Math.max(500, Math.round(base * jitter)));
-}
-
-async function fetchRideStateWithRetry(options) {
-  const {
-    baseUrl,
-    token,
-    etag,
-    fetchImpl = fetch,
-    sleep = delay => new Promise(resolve => setTimeout(resolve, delay)),
-    random = Math.random,
-    now = Date.now,
-    isVisible = () => true,
-    maxAttempts = 4
-  } = options;
-  const attempts = [];
-  if (!isVisible()) return {result: null, attempts, stopped: 'hidden'};
-  for (let index = 0; index < maxAttempts; index += 1) {
-    if (!isVisible()) return {result: null, attempts, stopped: 'hidden'};
-    let result;
-    try {
-      result = await requestJson(baseUrl, {
-        method: 'GET', path: `/v1/rides/${FIXTURE.requestId}`, token,
-        headers: etag ? {'If-None-Match': etag} : {}, captureHeaders: true
-      }, fetchImpl);
-    } catch (error) {
-      result = {status: 0, body: null, headers: {retryAfter: null}, error: error.message};
-    }
-    const attempt = {status: result.status, delayMs: null};
-    attempts.push(attempt);
-    if (result.status === 200 || result.status === 304) return {result, attempts, stopped: 'success'};
-    if ([401, 403, 404].includes(result.status)) return {result, attempts, stopped: 'access'};
-    if (![0, 429, 500, 502, 503, 504].includes(result.status)) return {result, attempts, stopped: 'non_retryable'};
-    if (index === maxAttempts - 1) return {result, attempts, stopped: 'exhausted'};
-    attempt.delayMs = parseRetryAfterMs(result.headers?.retryAfter, now()) ?? exponentialBackoffMs(index, random);
-    await sleep(attempt.delayMs);
-  }
-  return {result: null, attempts, stopped: 'exhausted'};
-}
-
-const RIDE_STATE_FIELDS = Object.freeze(['id', 'status', 'revision', 'viewerRole', 'nextAction', 'updatedAt']);
-
-function rideStateFingerprint(value) {
-  return JSON.stringify(Object.fromEntries(RIDE_STATE_FIELDS.map(field => [field, value[field]])));
-}
-
-function mergeRideStateUpdate(current, incoming, source = 'notification') {
-  const validSource = source === 'notification' || source === 'recovery';
-  const validShape = incoming && typeof incoming === 'object' &&
-    typeof incoming.id === 'string' && incoming.id.length > 0 &&
-    typeof incoming.status === 'string' && incoming.status.length > 0 &&
-    Number.isInteger(incoming.revision) && incoming.revision > 0 &&
-    ['passenger', 'driver'].includes(incoming.viewerRole) &&
-    typeof incoming.nextAction === 'string' && incoming.nextAction.length > 0 &&
-    typeof incoming.updatedAt === 'string' && Number.isFinite(Date.parse(incoming.updatedAt));
-  if (!validSource || !validShape) {
-    return {state: current, applied: false, reason: 'invalid_update', needsRecovery: true};
-  }
-  if (!current) {
-    if (source !== 'recovery') return {state: null, applied: false, reason: 'missing_baseline', needsRecovery: true};
-    return {state: structuredClone(incoming), applied: true, reason: 'baseline', needsRecovery: false};
-  }
-  if (incoming.id !== current.id || incoming.viewerRole !== current.viewerRole) {
-    return {state: current, applied: false, reason: 'scope_mismatch', needsRecovery: false};
-  }
-  if (incoming.revision < current.revision) {
-    return {state: current, applied: false, reason: 'stale', needsRecovery: false};
-  }
-  if (incoming.revision === current.revision) {
-    if (rideStateFingerprint(incoming) === rideStateFingerprint(current)) {
-      return {state: current, applied: false, reason: 'duplicate', needsRecovery: false};
-    }
-    return {state: current, applied: false, reason: 'same_revision_conflict', needsRecovery: true};
-  }
-  if (source === 'notification' && incoming.revision !== current.revision + 1) {
-    return {state: current, applied: false, reason: 'revision_gap', needsRecovery: true};
-  }
-  return {state: structuredClone(incoming), applied: true, reason: source, needsRecovery: false};
-}
-
-const RIDE_NOTIFICATION_FIELDS = Object.freeze(['type', 'rideId', 'revision']);
-const RIDE_NOTIFICATION_TYPES = new Set(['ride.changed', 'ride.access_changed']);
-
-function parseRideNotificationHint(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const keys = Object.keys(value);
-  if (keys.length !== RIDE_NOTIFICATION_FIELDS.length || keys.some(key => !RIDE_NOTIFICATION_FIELDS.includes(key))) return null;
-  if (!RIDE_NOTIFICATION_TYPES.has(value.type) || typeof value.rideId !== 'string' || !value.rideId ||
-      !Number.isInteger(value.revision) || value.revision < 1) return null;
-  return Object.freeze({type: value.type, rideId: value.rideId, revision: value.revision});
-}
-
-async function handleRideNotificationHint(options) {
-  const {current, hint: rawHint, recover, expectedRideId, expectedViewerRole} = options;
-  const hint = parseRideNotificationHint(rawHint);
-  if (!hint) return {state: current, fetched: false, applied: false, reason: 'invalid_hint', needsRecovery: false};
-  const scopedRideId = current?.id ?? expectedRideId;
-  const scopedRole = current?.viewerRole ?? expectedViewerRole;
-  if (!scopedRideId || hint.rideId !== scopedRideId) {
-    return {state: current, fetched: false, applied: false, reason: 'foreign_hint', needsRecovery: false};
-  }
-  if (current && hint.revision <= current.revision) {
-    return {state: current, fetched: false, applied: false, reason: 'stale_or_duplicate_hint', needsRecovery: false};
-  }
-  const response = await recover({rideId: hint.rideId, revision: hint.revision, type: hint.type});
-  if ([401, 403, 404].includes(response?.status)) {
-    return {state: null, fetched: true, applied: false, reason: 'access_lost', needsRecovery: false};
-  }
-  if (response?.status === 304) {
-    return {state: current, fetched: true, applied: false, reason: 'hint_not_yet_visible', needsRecovery: true};
-  }
-  if (response?.status !== 200 || !response.body) {
-    return {state: current, fetched: true, applied: false, reason: 'recovery_failed', needsRecovery: true};
-  }
-  if (response.body.id !== scopedRideId || (scopedRole && response.body.viewerRole !== scopedRole)) {
-    return {state: current, fetched: true, applied: false, reason: 'recovery_scope_mismatch', needsRecovery: false};
-  }
-  const merged = mergeRideStateUpdate(current, response.body, 'recovery');
-  return {...merged, fetched: true};
-}
-
-function createRideSessionClient(initialBinding = null) {
-  const normalizeBinding = value => {
-    if (!value || typeof value.sessionId !== 'string' || !value.sessionId ||
-        !['passenger', 'driver'].includes(value.viewerRole) || typeof value.rideId !== 'string' || !value.rideId) return null;
-    return Object.freeze({sessionId: value.sessionId, viewerRole: value.viewerRole, rideId: value.rideId});
-  };
-  let binding = normalizeBinding(initialBinding);
-  let generation = 1;
-  let state = null;
-  let etag = null;
-  let retryCancel = null;
-  const inflight = new Set();
-
-  const clearRetry = () => {
-    if (!retryCancel) return;
-    const cancel = retryCancel;
-    retryCancel = null;
-    cancel();
-  };
-  const resetSession = nextBinding => {
-    generation += 1;
-    for (const handle of inflight) handle.controller.abort();
-    inflight.clear();
-    clearRetry();
-    state = null;
-    etag = null;
-    binding = normalizeBinding(nextBinding);
-    return snapshot();
-  };
-  const snapshot = () => ({
-    active: Boolean(binding),
-    viewerRole: binding?.viewerRole ?? null,
-    rideId: binding?.rideId ?? null,
-    state: state ? structuredClone(state) : null,
-    etag,
-    generation,
-    inFlight: inflight.size,
-    retryScheduled: Boolean(retryCancel)
-  });
-  const setCache = (nextState, nextEtag = null) => {
-    if (!binding || nextState?.id !== binding.rideId || nextState?.viewerRole !== binding.viewerRole) return false;
-    state = structuredClone(nextState);
-    etag = typeof nextEtag === 'string' ? nextEtag : null;
-    return true;
-  };
-  const scheduleRetry = cancel => {
-    if (!binding || typeof cancel !== 'function') return false;
-    clearRetry();
-    retryCancel = cancel;
-    return true;
-  };
-  const startRecovery = () => {
-    if (!binding) return null;
-    const controller = new AbortController();
-    const handle = Object.freeze({binding, generation, controller, signal: controller.signal});
-    inflight.add(handle);
-    return handle;
-  };
-  const finishRecovery = (handle, response) => {
-    if (!handle) return {state, applied: false, reason: 'no_session'};
-    inflight.delete(handle);
-    if (handle.signal.aborted || handle.generation !== generation || handle.binding !== binding) {
-      return {state, applied: false, reason: 'stale_session'};
-    }
-    if ([401, 403, 404].includes(response?.status)) {
-      state = null;
-      etag = null;
-      clearRetry();
-      return {state, applied: false, reason: 'access_lost'};
-    }
-    if (response?.status === 304) return {state, applied: false, reason: 'not_modified'};
-    if (response?.status !== 200 || !response.body) return {state, applied: false, reason: 'recovery_failed'};
-    if (response.body.id !== binding.rideId || response.body.viewerRole !== binding.viewerRole) {
-      return {state, applied: false, reason: 'scope_mismatch'};
-    }
-    const merged = mergeRideStateUpdate(state, response.body, 'recovery');
-    if (merged.applied) {
-      state = structuredClone(merged.state);
-      etag = typeof response.headers?.etag === 'string' ? response.headers.etag : null;
-    }
-    return {...merged, state};
-  };
-  return {snapshot, resetSession, setCache, scheduleRetry, startRecovery, finishRecovery};
-}
-
-function createSessionBoundCommandClient(initialBinding = null) {
-  const normalizeBinding = value => {
-    if (!value || typeof value.sessionId !== 'string' || !value.sessionId ||
-        typeof value.accountRef !== 'string' || !value.accountRef ||
-        !['passenger', 'driver'].includes(value.viewerRole)) return null;
-    return Object.freeze({sessionId: value.sessionId, accountRef: value.accountRef, viewerRole: value.viewerRole});
-  };
-  let binding = normalizeBinding(initialBinding);
-  let generation = 1;
-  const inflight = new Set();
-  const snapshot = () => ({active: Boolean(binding), viewerRole: binding?.viewerRole ?? null, generation, inFlight: inflight.size});
-  const resetSession = nextBinding => {
-    generation += 1;
-    for (const handle of inflight) handle.controller.abort();
-    inflight.clear();
-    binding = normalizeBinding(nextBinding);
-    return snapshot();
-  };
-  const startCommand = command => {
-    if (!binding || !command || typeof command.action !== 'string' || !command.action ||
-        typeof command.idempotencyKey !== 'string' || !command.idempotencyKey) return null;
-    const controller = new AbortController();
-    const handle = Object.freeze({
-      binding,
-      generation,
-      action: command.action,
-      idempotencyKey: command.idempotencyKey,
-      scopedKey: idempotencyScopeKey(binding.accountRef, command.idempotencyKey),
-      controller,
-      signal: controller.signal
-    });
-    inflight.add(handle);
-    return handle;
-  };
-  const finishCommand = (handle, response) => {
-    if (!handle) return {committed: false, reason: 'no_session', autoRetry: false};
-    inflight.delete(handle);
-    if (handle.signal.aborted || handle.generation !== generation || handle.binding !== binding) {
-      return {committed: false, reason: 'stale_session', autoRetry: false};
-    }
-    if ([200, 201].includes(response?.status)) return {committed: true, reason: 'committed', autoRetry: false};
-    if ([401, 403].includes(response?.status)) {
-      return {committed: false, reason: 'session_expired', autoRetry: false, needsReauth: true, needsRecovery: true};
-    }
-    if (response?.status === 409 && response.body?.code === 'stale_revision') {
-      return {committed: false, reason: 'stale_revision', autoRetry: false, needsRecovery: true};
-    }
-    if ([0, 429, 500, 502, 503, 504].includes(response?.status)) {
-      return {committed: false, reason: 'outcome_unknown', autoRetry: false, needsRecovery: true, reuseSameKey: true};
-    }
-    return {committed: false, reason: 'rejected', autoRetry: false, needsRecovery: false};
-  };
-  const recoverUnknownOutcome = async (handle, options = {}) => {
-    const {baselineRevision, recover, isApplied, resend} = options;
-    const handleIsCurrent = () => Boolean(handle) && !handle.signal.aborted &&
-      handle.generation === generation && handle.binding === binding;
-    if (!handleIsCurrent()) return {committed: false, reason: 'stale_session', resent: false};
-    if (!Number.isInteger(baselineRevision) || baselineRevision < 1 ||
-        typeof recover !== 'function' || typeof isApplied !== 'function' || typeof resend !== 'function') {
-      return {committed: false, reason: 'invalid_recovery', resent: false};
-    }
-    const controller = new AbortController();
-    const recoveryHandle = Object.freeze({binding: handle.binding, generation: handle.generation, controller, signal: controller.signal});
-    const recoveryIsCurrent = () => !recoveryHandle.signal.aborted &&
-      recoveryHandle.generation === generation && recoveryHandle.binding === binding;
-    inflight.add(recoveryHandle);
-    try {
-      let recovered;
-      try {
-        recovered = await recover({signal: recoveryHandle.signal});
-      } catch (error) {
-        return recoveryIsCurrent()
-          ? {committed: false, reason: 'recovery_failed', resent: false}
-          : {committed: false, reason: 'stale_session', resent: false};
-      }
-      if (!recoveryIsCurrent()) return {committed: false, reason: 'stale_session', resent: false};
-      if ([401, 403, 404].includes(recovered?.status)) {
-        return {committed: false, reason: 'access_lost', resent: false};
-      }
-      if (recovered?.status !== 200 || !Number.isInteger(recovered.body?.revision)) {
-        return {committed: false, reason: 'recovery_unresolved', resent: false};
-      }
-      if (isApplied(recovered.body)) {
-        return {committed: true, reason: 'confirmed_by_recovery', resent: false, state: recovered.body};
-      }
-      if (recovered.body.revision !== baselineRevision) {
-        return {committed: false, reason: 'state_changed', resent: false, state: recovered.body};
-      }
-      let replay;
-      try {
-        replay = await resend({
-          action: handle.action,
-          idempotencyKey: handle.idempotencyKey,
-          scopedKey: handle.scopedKey,
-          signal: recoveryHandle.signal
-        });
-      } catch (error) {
-        return recoveryIsCurrent()
-          ? {committed: false, reason: 'replay_outcome_unknown', resent: true}
-          : {committed: false, reason: 'stale_session', resent: true};
-      }
-      if (!recoveryIsCurrent()) return {committed: false, reason: 'stale_session', resent: true};
-      if ([200, 201].includes(replay?.status)) {
-        return {committed: true, reason: 'committed_by_replay', resent: true, response: replay.body ?? null};
-      }
-      return {committed: false, reason: 'replay_unresolved', resent: true, response: replay?.body ?? null};
-    } finally {
-      inflight.delete(recoveryHandle);
-    }
-  };
-  return {snapshot, resetSession, startCommand, finishCommand, recoverUnknownOutcome};
-}
-
-async function runHttpContract(baseUrl, tokens = FIXTURE.tokens, fetchImpl = fetch) {
-  const results = [];
-  for (const scenario of scenarios(tokens)) {
-    const actual = await requestJson(baseUrl, scenario, fetchImpl);
-    const [expectedStatus, expectedCode] = scenario.expected;
-    if (actual.status !== expectedStatus) throw new Error(`${scenario.name}: expected HTTP ${expectedStatus}, received ${actual.status}`);
-    if (expectedCode && actual.body?.code !== expectedCode) throw new Error(`${scenario.name}: expected ${expectedCode}, received ${actual.body?.code || 'no code'}`);
-    if (actual.status >= 400 && (!actual.body?.message || !actual.body?.requestId)) throw new Error(`${scenario.name}: unsafe or incomplete error envelope`);
-    if (scenario.concealed && JSON.stringify(actual.body).includes('passenger-owner')) throw new Error(`${scenario.name}: concealed owner identity leaked`);
-    results.push({name: scenario.name, status: actual.status, code: actual.body?.code || null});
-  }
-  return results;
-}
-
-async function startMockServer(options = {}) {
-  const state = createMockState(options);
-  const server = http.createServer(createMockHandler(state));
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  const address = server.address();
-  return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
-    state,
-    close: () => new Promise(resolve => server.close(resolve))
-  };
-}
-
-async function runCurrentRideDiscoveryContract() {
-  const assigned = await startMockServer({rideStatus: 'assigned', assignedDriverId: 'driver-assigned'});
-  const completed = await startMockServer({rideStatus: 'completed', assignedDriverId: 'driver-assigned'});
-  const cancelled = await startMockServer({rideStatus: 'cancelled', assignedDriverId: 'driver-assigned'});
-  const ambiguous = await startMockServer({rideStatus: 'assigned', assignedDriverId: 'driver-assigned', duplicateCurrentFor: 'passenger-owner'});
-  const read = (baseUrl, token, path = '/v1/rides/current') => requestJson(baseUrl, {
-    method: 'GET', path, token, captureHeaders: true
-  }, fetch);
-  try {
-    const before = {
-      revision: assigned.state.ride.revision,
-      idempotency: assigned.state.idempotency.size,
-      audit: assigned.state.auditEvents.length
-    };
-    const [passenger, driver, otherPassenger, otherDriver, unauthenticated, injectedId, completedPassenger, completedDriver, cancelledPassenger, cancelledDriver, multiple] = await Promise.all([
-      read(assigned.baseUrl, FIXTURE.tokens.owner),
-      read(assigned.baseUrl, FIXTURE.tokens.assignedDriver),
-      read(assigned.baseUrl, FIXTURE.tokens.otherPassenger),
-      read(assigned.baseUrl, FIXTURE.tokens.otherDriver),
-      read(assigned.baseUrl),
-      read(assigned.baseUrl, FIXTURE.tokens.owner, `/v1/rides/current?requestId=${FIXTURE.requestId}`),
-      read(completed.baseUrl, FIXTURE.tokens.owner),
-      read(completed.baseUrl, FIXTURE.tokens.assignedDriver),
-      read(cancelled.baseUrl, FIXTURE.tokens.owner),
-      read(cancelled.baseUrl, FIXTURE.tokens.assignedDriver),
-      read(ambiguous.baseUrl, FIXTURE.tokens.owner)
-    ]);
-    const after = {
-      revision: assigned.state.ride.revision,
-      idempotency: assigned.state.idempotency.size,
-      audit: assigned.state.auditEvents.length
-    };
-    if (passenger.status !== 200 || passenger.body?.viewerRole !== 'passenger') throw new Error('owning passenger could not discover the current ride');
-    if (driver.status !== 200 || driver.body?.viewerRole !== 'driver') throw new Error('assigned driver could not discover the current ride');
-    if ([otherPassenger, otherDriver].some(result => result.status !== 204 || result.body !== null)) throw new Error('unrelated actor learned that another current ride exists');
-    if (unauthenticated.status !== 401) throw new Error('unauthenticated current-ride discovery was not rejected');
-    if (injectedId.status !== 422 || injectedId.body?.code !== 'invalid_request') throw new Error('current-ride discovery accepted a caller-supplied ride identifier');
-    if ([completedPassenger, completedDriver, cancelledPassenger, cancelledDriver].some(result => result.status !== 204 || result.body !== null)) throw new Error('terminal ride was returned as current');
-    if (multiple.status !== 409 || multiple.body?.code !== 'ambiguous_current_ride') throw new Error('ambiguous current rides were not stopped safely');
-    if (JSON.stringify(multiple.body).includes('ride-duplicate-fixture')) throw new Error('ambiguous current-ride error leaked a candidate identifier');
-    if (JSON.stringify(before) !== JSON.stringify(after)) throw new Error('current-ride discovery changed business state');
-    return {passenger, driver, otherPassenger, otherDriver, unauthenticated, injectedId, completedPassenger, completedDriver, cancelledPassenger, cancelledDriver, multiple, before, after};
-  } finally {
-    await Promise.all([assigned.close(), completed.close(), cancelled.close(), ambiguous.close()]);
-  }
-}
-
-async function selectOnFreshMock(options, suffix, body = {expectedRequestRevision: FIXTURE.revision}) {
-  const mock = await startMockServer(options);
-  try {
-    const result = await requestJson(mock.baseUrl, {
-      method: 'POST',
-      path: `/v1/offers/${FIXTURE.offerId}/select`,
-      token: FIXTURE.tokens.owner,
-      headers: {'Idempotency-Key': `validity-key-${suffix}-0001`},
-      body
-    }, fetch);
-    return {result, ride: structuredClone(mock.state.ride), offer: structuredClone(mock.state.offer), auditEvents: structuredClone(mock.state.auditEvents)};
-  } finally {
-    await mock.close();
-  }
-}
-
-async function runOfferValidityContract() {
-  const clockMs = Date.parse('2026-09-17T03:00:00Z');
-  const [expired, boundary, ineligible, valid, clientClock] = await Promise.all([
-    selectOnFreshMock({clockMs, offerExpiresAtMs: clockMs - 1}, 'expired'),
-    selectOnFreshMock({clockMs, offerExpiresAtMs: clockMs}, 'boundary'),
-    selectOnFreshMock({clockMs, offerDriverEligible: false}, 'ineligible'),
-    selectOnFreshMock({clockMs, offerExpiresAtMs: clockMs + 1}, 'valid'),
-    selectOnFreshMock({clockMs, offerExpiresAtMs: clockMs - 1}, 'client-clock', {expectedRequestRevision: FIXTURE.revision, clientNow: new Date(clockMs - 60_000).toISOString()})
-  ]);
-  if (expired.result.status !== 409 || expired.result.body?.code !== 'offer_expired') throw new Error('server clock did not reject an expired offer');
-  if (boundary.result.status !== 409 || boundary.result.body?.code !== 'offer_expired') throw new Error('offer remained selectable at its exact expiry instant');
-  if (ineligible.result.status !== 409 || ineligible.result.body?.code !== 'driver_unavailable') throw new Error('selection did not recheck current driver eligibility');
-  if (valid.result.status !== 200 || valid.ride.status !== 'assigned' || valid.ride.revision !== 3) throw new Error('a current eligible offer could not be selected');
-  if (clientClock.result.status !== 422 || clientClock.result.body?.code !== 'invalid_request') throw new Error('client-controlled clock input was not rejected');
-  for (const rejected of [expired, boundary, ineligible]) {
-    if (rejected.ride.status !== 'collecting' || rejected.ride.revision !== FIXTURE.revision) throw new Error('invalid offer selection changed the ride');
-  }
-  return {expired, boundary, ineligible, valid, clientClock};
-}
-
-async function runMockContract() {
-  const mock = await startMockServer({rideStatus: 'assigned', assignedDriverId: 'driver-assigned'});
-  try {
-    return await runHttpContract(mock.baseUrl);
-  } finally {
-    await mock.close();
-  }
-}
-
-async function runCancellationReasonContract() {
-  const cancel = (mock, key, body) => requestJson(mock.baseUrl, {
-    method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/cancel`, token: FIXTURE.tokens.owner,
-    headers: {'Idempotency-Key': key}, body
-  }, fetch);
-  const allowed = await Promise.all(CANCELLATION_REASONS.map(async (reason, index) => {
-    const mock = await startMockServer();
-    try {
-      const key = `cancel-reason-allowed-${index}-0001`;
-      const command = {expectedRevision: FIXTURE.revision, reason};
-      const result = await cancel(mock, key, command);
-      if (result.status !== 200 || result.body?.cancelReason !== reason) throw new Error(`allowed cancellation reason was not preserved: ${reason}`);
-      if (mock.state.auditEvents.length !== 1 || mock.state.auditEvents[0].reason !== reason) throw new Error(`allowed cancellation reason was not audited: ${reason}`);
-      const replay = await cancel(mock, key, command);
-      if (replay.status !== 200 || JSON.stringify(replay.body) !== JSON.stringify(result.body)) throw new Error(`exact cancellation replay was not stable: ${reason}`);
-      const changedReason = CANCELLATION_REASONS[(index + 1) % CANCELLATION_REASONS.length];
-      const conflict = await cancel(mock, key, {expectedRevision: FIXTURE.revision, reason: changedReason});
-      if (conflict.status !== 409 || conflict.body?.code !== 'idempotency_conflict') throw new Error(`changed cancellation reason reused an idempotency key: ${reason} -> ${changedReason}`);
-      if (mock.state.ride.cancelReason !== reason || mock.state.auditEvents.length !== 1 || mock.state.idempotency.size !== 1) {
-        throw new Error(`cancellation replay changed state, audit, or idempotency records: ${reason}`);
-      }
-      return {reason, changedReason, result, replay, conflict, state: structuredClone(mock.state.ride), auditEvents: structuredClone(mock.state.auditEvents), storedKeys: mock.state.idempotency.size};
-    } finally {
-      await mock.close();
-    }
-  }));
-  const invalidMock = await startMockServer();
-  try {
-    const invalidBodies = [
-      {expectedRevision: FIXTURE.revision},
-      {expectedRevision: FIXTURE.revision, reason: 'search_edited'},
-      {expectedRevision: FIXTURE.revision, reason: 1},
-      {expectedRevision: FIXTURE.revision, reason: 'passenger_requested', note: 'untrusted'}
-    ];
-    const invalid = [];
-    for (const [index, body] of invalidBodies.entries()) {
-      invalid.push(await cancel(invalidMock, `cancel-reason-invalid-${index}-0001`, body));
-    }
-    if (invalid.some(result => result.status !== 422 || result.body?.code !== 'invalid_request')) throw new Error('invalid cancellation reason or field was accepted');
-    if (invalidMock.state.ride.status !== 'collecting' || invalidMock.state.ride.revision !== FIXTURE.revision ||
-        invalidMock.state.auditEvents.length || invalidMock.state.idempotency.size) {
-      throw new Error('invalid cancellation input changed state, audit, or idempotency records');
-    }
-    return {allowed, invalid, invalidState: structuredClone(invalidMock.state.ride), invalidAuditEvents: structuredClone(invalidMock.state.auditEvents), invalidStoredKeys: invalidMock.state.idempotency.size};
-  } finally {
-    await invalidMock.close();
-  }
-}
-
-async function runConcurrencyContract() {
-  const mock = await startMockServer();
-  const common = {method: 'POST', token: FIXTURE.tokens.owner};
-  const commands = [
-    {...common, name: 'select', path: `/v1/offers/${FIXTURE.offerId}/select`, headers: {'Idempotency-Key': 'race-key-select-0001'}, body: {expectedRequestRevision: FIXTURE.revision}},
-    {...common, name: 'cancel', path: `/v1/ride-requests/${FIXTURE.requestId}/cancel`, headers: {'Idempotency-Key': 'race-key-cancel-0001'}, body: {expectedRevision: FIXTURE.revision, reason: 'passenger_requested'}}
-  ];
-  try {
-    const pair = await Promise.all(commands.map(command => requestJson(mock.baseUrl, command, fetch)));
-    const winnerIndex = pair.findIndex(result => result.status === 200);
-    const loserIndex = pair.findIndex(result => result.status === 409 && result.body?.code === 'stale_revision');
-    if (winnerIndex < 0 || loserIndex < 0 || winnerIndex === loserIndex) throw new Error(`concurrent select/cancel must have one winner and one stale loser: ${JSON.stringify(pair)}`);
-    const winnerCommand = commands[winnerIndex], winner = pair[winnerIndex], loser = pair[loserIndex];
-    const replay = await requestJson(mock.baseUrl, winnerCommand, fetch);
-    if (replay.status !== 200 || JSON.stringify(replay.body) !== JSON.stringify(winner.body)) throw new Error('exact Idempotency-Key replay did not return the original success');
-    const changedCommand = structuredClone(winnerCommand);
-    changedCommand.body = winnerCommand.name === 'select' ? {expectedRequestRevision: 999} : {expectedRevision: FIXTURE.revision, reason: 'route_changed'};
-    const conflict = await requestJson(mock.baseUrl, changedCommand, fetch);
-    if (conflict.status !== 409 || conflict.body?.code !== 'idempotency_conflict') throw new Error('Idempotency-Key reuse with changed content was not rejected');
-    if (mock.state.ride.revision !== FIXTURE.revision + 1 || mock.state.ride.status !== winner.body.status) throw new Error('race changed the ride more than once');
-    return {
-      pair,
-      winner: {command: winnerCommand.name, ...winner},
-      loser: {command: commands[loserIndex].name, ...loser},
-      replay,
-      conflict,
-      state: structuredClone(mock.state.ride),
-      storedKeys: mock.state.idempotency.size,
-      auditEvents: structuredClone(mock.state.auditEvents)
-    };
-  } finally {
-    await mock.close();
-  }
-}
-
-async function runAuditContract() {
-  const [race, validity, rideSafety, boardingRace] = await Promise.all([runConcurrencyContract(), runOfferValidityContract(), runRideSafetyContract(), runBoardingRaceContract()]);
-  if (race.auditEvents.length !== 2) throw new Error('concurrent commands and exact replay did not produce exactly two audit events');
-  if (race.auditEvents.filter(event => event.outcome === 'committed').length !== 1) throw new Error('race audit did not record exactly one committed command');
-  if (race.auditEvents.filter(event => event.reason === 'stale_revision').length !== 1) throw new Error('race audit did not record the stale loser');
-  if (validity.expired.auditEvents[0]?.reason !== 'offer_expired') throw new Error('expired selection rejection was not audited');
-  if (validity.ineligible.auditEvents[0]?.reason !== 'driver_unavailable') throw new Error('eligibility rejection was not audited');
-  if (validity.valid.auditEvents[0]?.outcome !== 'committed') throw new Error('successful selection was not audited');
-  const events = [...race.auditEvents, ...validity.expired.auditEvents, ...validity.ineligible.auditEvents, ...validity.valid.auditEvents, ...rideSafety.auditEvents, ...boardingRace.cancelFirst.auditEvents, ...boardingRace.startFirst.auditEvents];
-  for (const event of events) {
-    if (Object.keys(event).join('|') !== AUDIT_FIELDS.join('|')) throw new Error(`audit event contains unexpected fields: ${Object.keys(event).join(',')}`);
-  }
-  const encoded = JSON.stringify(events);
-  const forbidden = [...Object.values(FIXTURE.tokens), 'Idempotency-Key', 'phone', 'email', 'observedPlate', 'permit', '+679', '@'];
-  if (forbidden.some(value => encoded.toLowerCase().includes(value.toLowerCase()))) throw new Error('audit events contain a credential or private input');
-  return {race, validity, rideSafety, boardingRace, events};
-}
-
-async function runRideSafetyContract() {
-  const mock = await startMockServer({rideStatus: 'assigned', rideRevision: 2, assignedDriverId: 'driver-assigned'});
-  const transition = (key, body) => requestJson(mock.baseUrl, {
-    method: 'POST', path: `/v1/rides/${FIXTURE.requestId}/transitions`, token: FIXTURE.tokens.assignedDriver,
-    headers: {'Idempotency-Key': key}, body
-  }, fetch);
-  const confirm = (key, body) => requestJson(mock.baseUrl, {
-    method: 'POST', path: `/v1/rides/${FIXTURE.requestId}/vehicle-confirmations`, token: FIXTURE.tokens.owner,
-    headers: {'Idempotency-Key': key}, body
-  }, fetch);
-  try {
-    const arrivingCommand = {from: 'assigned', to: 'arriving', expectedRevision: 2};
-    const arriving = await transition('ride-arriving-0001', arrivingCommand);
-    const arrivingReplay = await transition('ride-arriving-0001', arrivingCommand);
-    const confirmationCommand = {observedPlate: 'пј¤пјҐпј­пјЇпјЌпјђпјђпј‘', samePerson: true, sameVehicle: true, expectedRevision: 3};
-    const confirmation = await confirm('vehicle-confirm-0001', confirmationCommand);
-    const confirmationReplay = await confirm('vehicle-confirm-0001', confirmationCommand);
-    const mismatch = await confirm('vehicle-mismatch-0001', {observedPlate: 'DEMO 999', samePerson: true, sameVehicle: true, expectedRevision: 4});
-    const startWithoutConfirmation = await transition('ride-start-blocked-0001', {from: 'arriving', to: 'on_trip', expectedRevision: 5});
-    const reconfirmation = await confirm('vehicle-reconfirm-0001', {observedPlate: 'DEMO 001', samePerson: true, sameVehicle: true, expectedRevision: 5});
-    mock.state.driverEligibility['driver-assigned'] = false;
-    const revokedDriver = await transition('ride-start-revoked-0001', {from: 'arriving', to: 'on_trip', expectedRevision: 6});
-    mock.state.driverEligibility['driver-assigned'] = true;
-    const started = await transition('ride-start-0001', {from: 'arriving', to: 'on_trip', expectedRevision: 6});
-    const completed = await transition('ride-complete-0001', {from: 'on_trip', to: 'completed', expectedRevision: 7});
-    if (arriving.status !== 200 || arriving.body.revision !== 3 || JSON.stringify(arrivingReplay.body) !== JSON.stringify(arriving.body)) throw new Error('assigned-to-arriving transition or replay failed');
-    if (confirmation.status !== 201 || confirmation.body.assignmentRevision !== 3 || JSON.stringify(confirmationReplay.body) !== JSON.stringify(confirmation.body)) throw new Error('vehicle confirmation or replay failed');
-    if (mismatch.status !== 409 || mismatch.body?.code !== 'vehicle_mismatch' || mismatch.body.revision !== 5) throw new Error('vehicle mismatch did not invalidate current confirmation');
-    if (startWithoutConfirmation.status !== 409 || startWithoutConfirmation.body?.code !== 'vehicle_confirmation_required') throw new Error('ride start was not blocked without current confirmation');
-    if (revokedDriver.status !== 409 || revokedDriver.body?.code !== 'driver_unavailable') throw new Error('ride start did not recheck assigned driver eligibility');
-    if (started.status !== 200 || started.body.status !== 'on_trip' || completed.status !== 200 || completed.body.status !== 'completed') throw new Error('confirmed eligible ride could not complete the allowed transition path');
-    return {
-      arriving, arrivingReplay, confirmation, confirmationReplay, mismatch, startWithoutConfirmation,
-      reconfirmation, revokedDriver, started, completed,
-      state: structuredClone(mock.state.ride),
-      auditEvents: structuredClone(mock.state.auditEvents),
-      storedKeys: mock.state.idempotency.size
-    };
-  } finally {
-    await mock.close();
-  }
-}
-
-async function runBoardingRaceCase(winner) {
-  const delayLoser = winner === 'cancel' ? {transition: 15} : {cancel: 15};
-  const mock = await startMockServer({
-    rideStatus: 'arriving',
-    rideRevision: 6,
-    assignedDriverId: 'driver-assigned',
-    vehicleConfirmation: {
-      requestId: FIXTURE.requestId,
-      assignmentRevision: 5,
-      confirmedAt: '2026-09-17T03:00:00.000Z',
-      validForRevision: 6
-    },
-    commandDelays: delayLoser
-  });
-  const commands = {
-    cancel: {
-      method: 'POST', path: `/v1/ride-requests/${FIXTURE.requestId}/cancel`, token: FIXTURE.tokens.owner,
-      headers: {'Idempotency-Key': `boarding-race-${winner}-cancel-0001`},
-      body: {expectedRevision: 6, reason: 'passenger_requested'}
-    },
-    start: {
-      method: 'POST', path: `/v1/rides/${FIXTURE.requestId}/transitions`, token: FIXTURE.tokens.assignedDriver,
-      headers: {'Idempotency-Key': `boarding-race-${winner}-start-0001`},
-      body: {from: 'arriving', to: 'on_trip', expectedRevision: 6}
-    }
-  };
-  try {
-    const [cancel, start] = await Promise.all([
-      requestJson(mock.baseUrl, commands.cancel, fetch),
-      requestJson(mock.baseUrl, commands.start, fetch)
-    ]);
-    const expected = winner === 'cancel' ? {cancel: 200, start: 409} : {cancel: 409, start: 200};
-    if (cancel.status !== expected.cancel || start.status !== expected.start) throw new Error(`${winner}-first boarding race produced an unexpected winner`);
-    const loser = winner === 'cancel' ? start : cancel;
-    if (loser.body?.code !== 'stale_revision' || loser.body?.revision !== 7) throw new Error(`${winner}-first boarding race loser did not receive current revision`);
-    const winningCommand = commands[winner];
-    const winningResult = winner === 'cancel' ? cancel : start;
-    const replay = await requestJson(mock.baseUrl, winningCommand, fetch);
-    if (replay.status !== 200 || JSON.stringify(replay.body) !== JSON.stringify(winningResult.body)) throw new Error(`${winner}-first exact replay was not stable`);
-    if (mock.state.ride.revision !== 7 || mock.state.auditEvents.length !== 2) throw new Error(`${winner}-first race changed state or audit more than once`);
-    if (winner === 'cancel' && mock.state.ride.vehicleConfirmation !== null) throw new Error('cancellation winner retained vehicle confirmation');
-    const read = (token, headers = {}) => requestJson(mock.baseUrl, {
-      method: 'GET', path: `/v1/rides/${FIXTURE.requestId}`, token, headers, captureHeaders: true
-    }, fetch);
-    const auditCount = mock.state.auditEvents.length;
-    const storedKeys = mock.state.idempotency.size;
-    const [passenger, driver, otherPassenger, otherDriver] = await Promise.all([
-      read(FIXTURE.tokens.owner),
-      read(FIXTURE.tokens.assignedDriver),
-      read(FIXTURE.tokens.otherPassenger),
-      read(FIXTURE.tokens.otherDriver)
-    ]);
-    if (passenger.status !== 200 || driver.status !== 200) throw new Error(`${winner}-first participants could not recover current ride state`);
-    if (passenger.body.status !== mock.state.ride.status || driver.body.status !== mock.state.ride.status || passenger.body.revision !== 7 || driver.body.revision !== 7) {
-      throw new Error(`${winner}-first recovery returned stale state`);
-    }
-    if (otherPassenger.status !== 404 || otherDriver.status !== 404) throw new Error(`${winner}-first recovery exposed the ride to a non-participant`);
-    const [passengerNotModified, driverNotModified, stalePassenger, crossRoleValidator, wildcardPassenger, wildcardOther] = await Promise.all([
-      read(FIXTURE.tokens.owner, {'If-None-Match': passenger.headers.etag}),
-      read(FIXTURE.tokens.assignedDriver, {'If-None-Match': `W/${driver.headers.etag}`}),
-      read(FIXTURE.tokens.owner, {'If-None-Match': '"obsolete-validator"'}),
-      read(FIXTURE.tokens.assignedDriver, {'If-None-Match': passenger.headers.etag}),
-      read(FIXTURE.tokens.owner, {'If-None-Match': '*'}),
-      read(FIXTURE.tokens.otherPassenger, {'If-None-Match': '*'})
-    ]);
-    if (passengerNotModified.status !== 304 || driverNotModified.status !== 304 || passengerNotModified.body !== null || driverNotModified.body !== null) {
-      throw new Error(`${winner}-first matching validator did not return an empty 304`);
-    }
-    if (stalePassenger.status !== 200 || stalePassenger.body.revision !== 7 || stalePassenger.headers.etag !== passenger.headers.etag) {
-      throw new Error(`${winner}-first stale validator did not return current state`);
-    }
-    if (crossRoleValidator.status !== 200 || crossRoleValidator.body.viewerRole !== 'driver') throw new Error(`${winner}-first shared a passenger validator with the driver representation`);
-    if (wildcardPassenger.status !== 304 || wildcardOther.status !== 404) throw new Error(`${winner}-first evaluated a validator before participant authorization`);
-    if (mock.state.auditEvents.length !== auditCount || mock.state.idempotency.size !== storedKeys || mock.state.ride.revision !== 7) {
-      throw new Error(`${winner}-first recovery read mutated command state`);
-    }
-    return {
-      winner,
-      cancel,
-      start,
-      replay,
-      recovery: {passenger, driver, otherPassenger, otherDriver, passengerNotModified, driverNotModified, stalePassenger, crossRoleValidator, wildcardPassenger, wildcardOther},
-      state: structuredClone(mock.state.ride),
-      auditEvents: structuredClone(mock.state.auditEvents),
-      storedKeys
-    };
-  } finally {
-    await mock.close();
-  }
-}
-
-async function runBoardingRaceContract() {
-  const [cancelFirst, startFirst] = await Promise.all([
-    runBoardingRaceCase('cancel'),
-    runBoardingRaceCase('start')
-  ]);
-  return {cancelFirst, startFirst};
-}
-
-async function runRecoveryRetryContract() {
-  const run = async (serverOptions, clientOptions = {}) => {
-    const mock = await startMockServer({rideStatus: 'arriving', rideRevision: 7, assignedDriverId: 'driver-assigned', ...serverOptions});
-    const delays = [];
-    try {
-      const result = await fetchRideStateWithRetry({
-        baseUrl: mock.baseUrl,
-        token: FIXTURE.tokens.owner,
-        sleep: async delay => { delays.push(delay); },
-        random: () => 0.5,
-        ...clientOptions
-      });
-      return {result, delays, remainingFailures: mock.state.recoveryFailures.length};
-    } finally {
-      await mock.close();
-    }
-  };
-  const [rateLimited, unavailable, exhausted, accessDenied] = await Promise.all([
-    run({recoveryFailures: [{status: 429, retryAfter: '3'}]}),
-    run({recoveryFailures: [{status: 503}, {status: 503}]}),
-    run({recoveryFailures: Array.from({length: 4}, () => ({status: 503, retryAfter: '120'}))}),
-    run({}, {token: FIXTURE.tokens.otherPassenger})
-  ]);
-  let networkCalls = 0;
-  const networkMock = await startMockServer({rideStatus: 'arriving', rideRevision: 7, assignedDriverId: 'driver-assigned'});
-  const networkDelays = [];
-  let network;
-  try {
-    network = await fetchRideStateWithRetry({
-      baseUrl: networkMock.baseUrl,
-      token: FIXTURE.tokens.owner,
-      fetchImpl: (...args) => (++networkCalls === 1 ? Promise.reject(new Error('simulated network failure')) : fetch(...args)),
-      sleep: async delay => { networkDelays.push(delay); },
-      random: () => 0.5
-    });
-  } finally {
-    await networkMock.close();
-  }
-  let hiddenCalls = 0;
-  const hidden = await fetchRideStateWithRetry({
-    baseUrl: 'http://127.0.0.1:1', token: FIXTURE.tokens.owner,
-    fetchImpl: async () => { hiddenCalls += 1; throw new Error('must not fetch while hidden'); },
-    isVisible: () => false,
-    sleep: async () => {}
-  });
-  return {rateLimited, unavailable, exhausted, accessDenied, network: {result: network, delays: networkDelays, calls: networkCalls}, hidden: {result: hidden, calls: hiddenCalls}};
-}
-
-function runRevisionMergeContract() {
-  const action = {
-    arriving: 'confirm_vehicle',
-    cancelled: 'show_cancelled_history',
-    on_trip: 'show_on_trip',
-    completed: 'show_completed'
-  };
-  const snapshot = (revision, status, overrides = {}) => ({
-    id: FIXTURE.requestId,
-    status,
-    revision,
-    viewerRole: 'passenger',
-    nextAction: action[status],
-    updatedAt: new Date(Date.parse('2026-09-17T03:00:00Z') + revision * 1000).toISOString(),
-    ...overrides
-  });
-  const base = snapshot(7, 'arriving');
-
-  const newerNotification = mergeRideStateUpdate(base, snapshot(8, 'cancelled'), 'notification');
-  const delayedRecovery = mergeRideStateUpdate(newerNotification.state, base, 'recovery');
-
-  const newerRecovery = mergeRideStateUpdate(base, snapshot(9, 'on_trip'), 'recovery');
-  const delayedNotification = mergeRideStateUpdate(newerRecovery.state, snapshot(8, 'cancelled'), 'notification');
-
-  const firstDelivery = mergeRideStateUpdate(base, snapshot(8, 'cancelled'), 'notification');
-  const duplicate = mergeRideStateUpdate(firstDelivery.state, snapshot(8, 'cancelled'), 'notification');
-  const conflicting = mergeRideStateUpdate(firstDelivery.state, snapshot(8, 'arriving'), 'notification');
-
-  const gap = mergeRideStateUpdate(base, snapshot(10, 'completed'), 'notification');
-  const gapRecovery = mergeRideStateUpdate(gap.state, snapshot(10, 'completed'), 'recovery');
-
-  const wrongRide = mergeRideStateUpdate(base, snapshot(8, 'cancelled', {id: 'ride-foreign'}), 'notification');
-  const wrongRole = mergeRideStateUpdate(base, snapshot(8, 'cancelled', {viewerRole: 'driver'}), 'notification');
-  const missingBaseline = mergeRideStateUpdate(null, snapshot(8, 'cancelled'), 'notification');
-  const recoveredBaseline = mergeRideStateUpdate(null, snapshot(8, 'cancelled'), 'recovery');
-
-  return {base, newerNotification, delayedRecovery, newerRecovery, delayedNotification, firstDelivery, duplicate, conflicting, gap, gapRecovery, wrongRide, wrongRole, missingBaseline, recoveredBaseline};
-}
-
-async function runNotificationHintContract() {
-  const snapshot = (revision, status, nextAction, overrides = {}) => ({
-    id: FIXTURE.requestId,
-    status,
-    revision,
-    viewerRole: 'passenger',
-    nextAction,
-    updatedAt: new Date(Date.parse('2026-09-17T03:00:00Z') + revision * 1000).toISOString(),
-    ...overrides
-  });
-  const base = snapshot(8, 'cancelled', 'show_cancelled_history');
-  const changedHint = {type: 'ride.changed', rideId: FIXTURE.requestId, revision: 9};
-  let authorizedCalls = 0;
-  let recoveredFrom;
-  const authorized = await handleRideNotificationHint({
-    current: base,
-    hint: changedHint,
-    recover: async hint => {
-      authorizedCalls += 1;
-      recoveredFrom = hint;
-      return {status: 200, body: snapshot(9, 'on_trip', 'show_on_trip')};
-    }
-  });
-
-  let rejectedCalls = 0;
-  const sensitive = await handleRideNotificationHint({
-    current: base,
-    hint: {...changedHint, status: 'on_trip', fareCents: 2300, driverId: 'driver-assigned', plate: 'DEMO 001'},
-    recover: async () => { rejectedCalls += 1; return {status: 500}; }
-  });
-  const stale = await handleRideNotificationHint({current: base, hint: {...changedHint, revision: 7}, recover: async () => { rejectedCalls += 1; return {status: 500}; }});
-  const duplicate = await handleRideNotificationHint({current: base, hint: {...changedHint, revision: 8}, recover: async () => { rejectedCalls += 1; return {status: 500}; }});
-  const foreign = await handleRideNotificationHint({current: base, hint: {...changedHint, rideId: 'ride-foreign'}, recover: async () => { rejectedCalls += 1; return {status: 500}; }});
-
-  const accessLost = await handleRideNotificationHint({current: base, hint: changedHint, recover: async () => ({status: 404, body: errorBody('resource_not_found', 'Resource was not found.', 'hidden')})});
-  const notYetVisible = await handleRideNotificationHint({current: base, hint: changedHint, recover: async () => ({status: 304, body: null})});
-  const initial = await handleRideNotificationHint({
-    current: null,
-    expectedRideId: FIXTURE.requestId,
-    expectedViewerRole: 'passenger',
-    hint: {...changedHint, revision: 4},
-    recover: async () => ({status: 200, body: snapshot(4, 'assigned', 'track_pickup')})
-  });
-  return {base, authorized: {...authorized, calls: authorizedCalls, recoveredFrom}, sensitive, stale, duplicate, foreign, rejectedCalls, accessLost, notYetVisible, initial};
-}
-
-function runSessionIsolationContract() {
-  const snapshot = (revision, status, viewerRole, nextAction) => ({
-    id: FIXTURE.requestId,
-    status,
-    revision,
-    viewerRole,
-    nextAction,
-    updatedAt: new Date(Date.parse('2026-09-17T03:00:00Z') + revision * 1000).toISOString()
-  });
-  const passengerBinding = {sessionId: 'session-passenger-a', viewerRole: 'passenger', rideId: FIXTURE.requestId};
-  const driverBinding = {sessionId: 'session-driver-a', viewerRole: 'driver', rideId: FIXTURE.requestId};
-  const otherPassengerBinding = {sessionId: 'session-passenger-b', viewerRole: 'passenger', rideId: FIXTURE.requestId};
-
-  let retryCancelled = 0;
-  const logoutClient = createRideSessionClient(passengerBinding);
-  logoutClient.setCache(snapshot(8, 'cancelled', 'passenger', 'show_cancelled_history'), '"passenger-etag"');
-  logoutClient.scheduleRetry(() => { retryCancelled += 1; });
-  const logoutHandle = logoutClient.startRecovery();
-  const loggedOut = logoutClient.resetSession(null);
-  const delayedAfterLogout = logoutClient.finishRecovery(logoutHandle, {status: 200, body: snapshot(9, 'on_trip', 'passenger', 'show_on_trip'), headers: {etag: '"late"'}});
-
-  const roleClient = createRideSessionClient(passengerBinding);
-  roleClient.setCache(snapshot(8, 'cancelled', 'passenger', 'show_cancelled_history'), '"passenger-etag"');
-  const passengerHandle = roleClient.startRecovery();
-  const afterRoleSwitch = roleClient.resetSession(driverBinding);
-  const delayedPassenger = roleClient.finishRecovery(passengerHandle, {status: 200, body: snapshot(9, 'on_trip', 'passenger', 'show_on_trip'), headers: {etag: '"passenger-late"'}});
-  const driverHandle = roleClient.startRecovery();
-  const driverRecovery = roleClient.finishRecovery(driverHandle, {status: 200, body: snapshot(9, 'on_trip', 'driver', 'continue_trip'), headers: {etag: '"driver-etag"'}});
-  const driverState = roleClient.snapshot();
-
-  const accountClient = createRideSessionClient(passengerBinding);
-  accountClient.setCache(snapshot(8, 'cancelled', 'passenger', 'show_cancelled_history'), '"account-a"');
-  const accountAHandle = accountClient.startRecovery();
-  accountClient.resetSession(otherPassengerBinding);
-  const delayedAccountA = accountClient.finishRecovery(accountAHandle, {status: 200, body: snapshot(9, 'on_trip', 'passenger', 'show_on_trip'), headers: {etag: '"account-a-late"'}});
-  const accountBState = accountClient.snapshot();
-
-  return {loggedOut, logoutSignalAborted: logoutHandle.signal.aborted, retryCancelled, delayedAfterLogout, afterRoleSwitch, passengerSignalAborted: passengerHandle.signal.aborted, delayedPassenger, driverRecovery, driverState, delayedAccountA, accountBState};
-}
-
-function runCommandSessionContract() {
-  const accountA = {sessionId: 'session-a', accountRef: 'account-passenger-a', viewerRole: 'passenger'};
-  const accountAReauth = {sessionId: 'session-a-reauth', accountRef: 'account-passenger-a', viewerRole: 'passenger'};
-  const accountB = {sessionId: 'session-b', accountRef: 'account-passenger-b', viewerRole: 'passenger'};
-  const command = {action: 'cancel_ride', idempotencyKey: 'command-shared-key'};
-
-  const logoutClient = createSessionBoundCommandClient(accountA);
-  const logoutHandle = logoutClient.startCommand(command);
-  const loggedOut = logoutClient.resetSession(null);
-  const delayedSuccess = logoutClient.finishCommand(logoutHandle, {status: 200, body: {status: 'cancelled'}});
-
-  const expiryClient = createSessionBoundCommandClient(accountA);
-  const expiryHandle = expiryClient.startCommand(command);
-  const sessionExpired = expiryClient.finishCommand(expiryHandle, {status: 401, body: errorBody('authentication_required', 'Authentication is required.', 'expired-session')});
-
-  const unknownClient = createSessionBoundCommandClient(accountA);
-  const unknownHandle = unknownClient.startCommand(command);
-  const outcomeUnknown = unknownClient.finishCommand(unknownHandle, {status: 0, body: null});
-
-  const switchClient = createSessionBoundCommandClient(accountA);
-  const accountAHandle = switchClient.startCommand(command);
-  switchClient.resetSession(accountB);
-  const delayedAccountA = switchClient.finishCommand(accountAHandle, {status: 200, body: {status: 'cancelled'}});
-  const accountBHandle = switchClient.startCommand(command);
-  const accountBCommitted = switchClient.finishCommand(accountBHandle, {status: 200, body: {status: 'cancelled'}});
-
-  const accountAScope = idempotencyScopeKey(accountA.accountRef, command.idempotencyKey);
-  const reauthScope = idempotencyScopeKey(accountAReauth.accountRef, command.idempotencyKey);
-  const accountBScope = idempotencyScopeKey(accountB.accountRef, command.idempotencyKey);
-  const delimiterA = idempotencyScopeKey('account:a', 'key');
-  const delimiterB = idempotencyScopeKey('account', 'a:key');
-  return {loggedOut, logoutAborted: logoutHandle.signal.aborted, delayedSuccess, sessionExpired, outcomeUnknown, delayedAccountA, accountBCommitted, accountAScope, reauthScope, accountBScope, accountAHandleScope: accountAHandle.scopedKey, accountBHandleScope: accountBHandle.scopedKey, delimiterA, delimiterB};
-}
-
-async function runCommandRecoveryContract() {
-  const snapshot = (revision, status, viewerRole, nextAction) => ({
-    id: FIXTURE.requestId,
-    status,
-    revision,
-    viewerRole,
-    nextAction,
-    updatedAt: new Date(Date.parse('2026-09-17T04:00:00Z') + revision * 1000).toISOString()
-  });
-  const accountA = {sessionId: 'session-recovery-a', accountRef: 'account-passenger-a', viewerRole: 'passenger'};
-  const accountB = {sessionId: 'session-recovery-b', accountRef: 'account-passenger-b', viewerRole: 'passenger'};
-  const command = {action: 'cancel_ride', idempotencyKey: 'recover-cancel-key'};
-  const applied = state => state?.id === FIXTURE.requestId && state?.viewerRole === 'passenger' && state?.status === 'cancelled';
-  const beginUnknown = client => {
-    const handle = client.startCommand(command);
-    const result = client.finishCommand(handle, {status: 0, body: null});
-    if (result.reason !== 'outcome_unknown') throw new Error('expected an unknown command outcome');
-    return handle;
-  };
-
-  let appliedReplayCalls = 0;
-  const appliedClient = createSessionBoundCommandClient(accountA);
-  const appliedHandle = beginUnknown(appliedClient);
-  const alreadyApplied = await appliedClient.recoverUnknownOutcome(appliedHandle, {
-    baselineRevision: 4,
-    recover: async () => ({status: 200, body: snapshot(5, 'cancelled', 'passenger', 'show_cancelled_history')}),
-    isApplied: applied,
-    resend: async () => { appliedReplayCalls += 1; return {status: 200}; }
-  });
-
-  const replayCalls = [];
-  const replayClient = createSessionBoundCommandClient(accountA);
-  const replayHandle = beginUnknown(replayClient);
-  const replayed = await replayClient.recoverUnknownOutcome(replayHandle, {
-    baselineRevision: 4,
-    recover: async () => ({status: 200, body: snapshot(4, 'assigned', 'passenger', 'track_driver')}),
-    isApplied: applied,
-    resend: async request => { replayCalls.push(request); return {status: 200, body: {status: 'cancelled'}}; }
-  });
-
-  let changedReplayCalls = 0;
-  const changedClient = createSessionBoundCommandClient(accountA);
-  const changedHandle = beginUnknown(changedClient);
-  const changed = await changedClient.recoverUnknownOutcome(changedHandle, {
-    baselineRevision: 4,
-    recover: async () => ({status: 200, body: snapshot(5, 'on_trip', 'passenger', 'show_on_trip')}),
-    isApplied: applied,
-    resend: async () => { changedReplayCalls += 1; return {status: 200}; }
-  });
-
-  let deniedReplayCalls = 0;
-  const deniedClient = createSessionBoundCommandClient(accountA);
-  const deniedHandle = beginUnknown(deniedClient);
-  const denied = await deniedClient.recoverUnknownOutcome(deniedHandle, {
-    baselineRevision: 4,
-    recover: async () => ({status: 401, body: errorBody('authentication_required', 'Authentication is required.', 'recover-denied')}),
-    isApplied: applied,
-    resend: async () => { deniedReplayCalls += 1; return {status: 200}; }
-  });
-
-  let unknownReplayCalls = 0;
-  const unknownClient = createSessionBoundCommandClient(accountA);
-  const unknownHandle = beginUnknown(unknownClient);
-  const replayUnknown = await unknownClient.recoverUnknownOutcome(unknownHandle, {
-    baselineRevision: 4,
-    recover: async () => ({status: 200, body: snapshot(4, 'assigned', 'passenger', 'track_driver')}),
-    isApplied: applied,
-    resend: async () => { unknownReplayCalls += 1; return {status: 503, body: errorBody('temporarily_unavailable', 'Try later.', 'replay-unknown')}; }
-  });
-
-  let staleReplayCalls = 0;
-  const staleClient = createSessionBoundCommandClient(accountA);
-  const staleHandle = beginUnknown(staleClient);
-  const staleSession = await staleClient.recoverUnknownOutcome(staleHandle, {
-    baselineRevision: 4,
-    recover: async () => {
-      staleClient.resetSession(accountB);
-      return {status: 200, body: snapshot(4, 'assigned', 'passenger', 'track_driver')};
-    },
-    isApplied: applied,
-    resend: async () => { staleReplayCalls += 1; return {status: 200}; }
-  });
-  return {alreadyApplied, appliedReplayCalls, replayed, replayCalls, changed, changedReplayCalls, denied, deniedReplayCalls, replayUnknown, unknownReplayCalls, staleSession, staleReplayCalls};
-}
-
-if (require.main === module) {
-  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract(), runCommandRecoveryContract(), runCurrentRideDiscoveryContract(), runCancellationReasonContract()]).then(([results, audit, retry, notification, commandRecovery, currentRide, cancellationReasons]) => {
-    const {race, validity, rideSafety, boardingRace} = audit;
-    const merge = runRevisionMergeContract();
-    const session = runSessionIsolationContract();
-    const commandSession = runCommandSessionContract();
-    const denied = results.filter(r => r.status >= 400).length;
-    console.log(`HTTP contract OK: ${results.length} scenarios (${denied} safe denials, ${results.length - denied} positive controls)`);
-    console.log(`HTTP race OK: ${race.winner.command} won, ${race.loser.command} received stale_revision, exact replay was stable, changed replay was rejected`);
-    console.log(`HTTP validity OK: ${validity.expired.result.body.code}, exact-boundary expiry, ${validity.ineligible.result.body.code}, client clock rejected, current offer selected`);
-    console.log(`HTTP ride safety OK: vehicle mismatch invalidated confirmation, unconfirmed/revoked start blocked, allowed path completed at revision ${rideSafety.state.revision}`);
-    console.log(`HTTP boarding race OK: ${boardingRace.cancelFirst.winner} and ${boardingRace.startFirst.winner} each won; role-safe recovery returned current state or an empty conditional 304`);
-    console.log(`HTTP recovery retry OK: Retry-After ${retry.rateLimited.delays[0]}ms, exponential ${retry.unavailable.delays.join('/')}ms, capped and access/visibility stops`);
-    console.log(`Client revision merge OK: revision ${merge.newerNotification.state.revision} resisted delayed recovery, gaps/conflicts requested recovery, scope mismatches were rejected`);
-    console.log(`Notification hint OK: ${notification.authorized.calls} authorized recovery applied revision ${notification.authorized.state.revision}; private, stale and foreign hints made ${notification.rejectedCalls} requests`);
-    console.log(`Session isolation OK: logout and role/account switches cleared cache, cancelled retry, aborted old reads and accepted only ${session.driverState.viewerRole} recovery`);
-    console.log(`Command session OK: expired and stale-session results stopped without auto-retry; same raw key separated ${commandSession.accountAScope !== commandSession.accountBScope ? 'by account' : 'incorrectly'}`);
-    console.log(`Command recovery OK: applied state skipped replay; unchanged state replayed once; changed/access-lost/stale sessions stopped (${commandRecovery.replayCalls.length} explicit replay)`);
-    console.log(`Current ride discovery OK: ${currentRide.passenger.body.viewerRole}/${currentRide.driver.body.viewerRole} found one active ride; unrelated and terminal viewers received bodyless 204; ambiguity stopped with 409`);
-    console.log(`HTTP cancellation reason OK: ${cancellationReasons.allowed.map(item => item.reason).join('/')}; exact replays stable, changed reasons conflicted, invalid values changed no state`);
-    console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
-  }).catch(error => {
-    console.error(`HTTP contract failed: ${error.message}`);
-    process.exitCode = 1;
-  });
-}
-
-module.exports = {FIXTURE, AUDIT_FIELDS, CANCELLATION_REASONS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runCancellationReasonContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
+YЄзЉx-®йЬjЧќўлiєЪ+Љ§j[h‘йЬўйнЫOyл„иµ©hєЪn¶X§zОIЭ\ЩHЭљXЭ	ОВ‚ЫЫњЭH™\]Z\™J	Ы›ЩNљ	КNВЫЫњЭЬћ\ИH™\]Z\™J	Ы›ЩNЬћ\ЙКNВ‚ЫЫњЭ’VT‘HHШљ™XЭ™њ™Y^™JВ€™\]Y\ЭY€	ЬљYK[ЭЫ™\‹LIЛ€Щ™™\’Y€	ЫЩ™™\‹\™]љY]ЩYLIЛ€™]љ\Ъ[ЫЋ€‹€ЪЩ[њО€Шљ™XЭ™њ™Y^™JВ€ЭЫ™\Ћ€	ЭЪЩ[‹\\ЬЩ[™Щ\‹[ЭЫ™\‰Л€Э\”\ЬЩ[™Щ\Ћ€	ЭЪЩ[‹\\ЬЩ[™Щ\‹[Э\‰Л€\ЬЪYЫ™Yљ]™\Ћ€	ЭЪЩ[‹Yљ]™\‹X\ЬЪYЫ™Y	Л€™]љY]ЩYљ]™\Ћ€	ЭЪЩ[‹Yљ]™\‹\™]љY]ЩY	Л€Э\‘љ]™\Ћ€	ЭЪЩ[‹Yљ]™\‹[Э\‰Л€[™[™Сљ]™\Ћ€	ЭЪЩ[‹Yљ]™\‹\[™[™ЙВ€JBџJNВ‚ЫЫњЭPХФ”ИH™]ИX\
+В€С’VT‘KќЪЩ[њЛ›ЭЫ™\‹ЪY€	Ь\ЬЩ[™Щ\‹[ЭЫ™\‰Л›ЫN€	Ь\ЬЩ[™Щ\‰ЯWK€С’VT‘KќЪЩ[њЛ›Э\”\ЬЩ[™Щ\‹ЪY€	Ь\ЬЩ[™Щ\‹[Э\‰Л›ЫN€	Ь\ЬЩ[™Щ\‰ЯWK€С’VT‘KќЪЩ[њЛ\ЬЪYЫ™Yљ]™\‹ЪY€	Щљ]™\‹X\ЬЪYЫ™Y	Л›ЫN€	Щљ]™\‰Л[YЪX›N€ќY_WK€С’VT‘KќЪЩ[њЛњ™]љY]ЩYљ]™\‹ЪY€	Щљ]™\‹\™]љY]ЩY	Л›ЫN€	Щљ]™\‰Л[YЪX›N€ќY_WK€С’VT‘KќЪЩ[њЛ›Э\‘љ]™\‹ЪY€	Щљ]™\‹[Э\‰Л›ЫN€	Щљ]™\‰Л[YЪX›N€ќY_WK€С’VT‘KќЪЩ[њЛњ[™[™Сљ]™\‹ЪY€	Щљ]™\‹\[™[™ЙЛ›ЫN€	Щљ]™\‰Л[YЪX›N€[Щ_WB—JNВЫЫњЭ“Фђ’QS—ТS”UИH™]ИЩ]
+ЙЬ\ЬЩ[™Щ\’Y	Л	Щљ]™\’Y	Л	Ь™]љY]Щ\’Y	Л	Ш\›Э™Y	Л	Щ[YЪX›IЛ	Ь™]љY]ФЭ]\ЙЧJNВЫЫњЭUQUС’QSИHШљ™XЭ™њ™Y^™JЙЪY	Л	Э\IЛ	ЫЭ]ЫЫYIЛ	Ь™X\ЫЫ‰Л	ШXЭЬ”›ЫIЛ	ШXЭЬ”™Y‰Л	Ь™\]Y\ЭY	Л	ЫЩ™™\’Y	Л	Щњ›ЫT™]љ\Ъ[Ы‰Л	ЭФ™]љ\Ъ[Ы‰Л	ЫШШЭ\њ™Y]	ЧJNВЫЫњЭРSђСSUSУ—Ф‘PTУУ”ИHШљ™XЭ™њ™Y^™JЙЬ\ЬЩ[™Щ\—Ь™\]Y\ЭY	Л	Ь›Э]WШЪ[™ЩY	Л	ЬШЪY[WШЪ[™ЩY	ЧJNВ‚™ќ[Э[Ы€\њ›Ьђ›ЩJЫЩKY\ЬШYЩKЭY™љ^H	Щ\њ›Ь‰КHВ€™]\›€ШЫЩKY\ЬШYЩK™\]Y\ЭY€XЩK[[ШЪЛIЬЭY™љ^XNВџB‚™ќ[Э[Ы€Щ[™
+™\ЛЭ]\Л›ЩKXY\њИHЯJHВ€Y€
+Э]\ИOOHЊЭ]\ИOOHМ
+HВ€™\ЛќЬљ]RXY
+Э]\ЛXY\њКNВ€™]\›€™\Л™[™
+
+NВ€B€ЫЫњЭ[ЫЩYH”УУ‹њЭљ[™ЪYћJ›ЩJNВ€™\ЛќЬљ]RXY
+Э]\ЛЛ‹‹љXY\њЛ	ШЫЫќ[ќ]\IО€	Ш\XШ][Ы‹ЪњЫЫ‰Л	ШЫЫќ[ќ[[™Э	О€ќY™™\‹ћ]S[™Э
+[ЫЩY
+_JNВ€™\Л™[™
+[ЫЩY
+NВџB‚\Ю[Иќ[Э[Ы€™XY›ЩJ™\JHВ€ЫЫњЭЪ[љЬИHЧNВ€›Ь€]ШZ]
+ЫЫњЭЪ[љИЩ€™\JHЪ[љЬЛњ\Ъ
+Ъ[љКNВ€Y€
+XЪ[љЬЛ›[™Э
+H™]\›€ЯNВ€ћHИ™]\›€”УУ‹њ\њЩJќY™™\‹ЫЫШ]
+Ъ[љЬКKќФЭљ[™К	Э]Ћ	КJNИB€Ш]ЪИ™]\›€ќ[ИBџB‚™ќ[Э[Ы€\С›ЬљY[’[њ]
+[YJHВ€Y€
+][YH\[Щ€[YHOOH	ЫШљ™XЭ	КH™]\›€[ЩNВ€Y€
+\њ^Kљ\Р\њ^J[YJJH™]\›€[YKњЫЫYJ\С›ЬљY[’[њ]
+NВ€™]\›€Шљ™XЭ™[ќљY\К[YJKњЫЫYJ
+ЪЩ^KЪ[JHO€“Фђ’QS—ТS”UЛљ\КЩ^JH\С›ЬљY[’[њ]
+Ъ[
+JNВџB‚™ќ[Э[Ы€XЭЬ‘њ›ЫJ™\JHВ€ЫЫњЭX]ЪHЧђ™X\™\€
+ЉКIЪK™^XК™\KљXY\њЛ]]Ьљ^][Ы€	ЙКNВ€™]\›€X]ЪИPХФ”Л™Щ]
+X]ЪМWJH€ќ[ВџB‚™ќ[Э[Ы€›Ь›X[^™T]J[YJHВ€™]\›€Эљ[™К[YH	ЙКK››Ь›X[^™J	У‘’РЙКKќХ\\ђШ\ЩJ
+Kњ™\XЩJЦЧђKVЊNWKЩЛ	ЙКNВџB‚™ќ[Э[Ы€љYTЭ]UљY]КЭ]KXЭЬЉHВ€ЫЫњЭ\ЬЩ[™Щ\ђXЭ[ЫњИHВ€ЫЫXЭ[™О€	ШЫЫ\\™WЫЩ™™\њЙЛ€\ЬЪYЫ™Y€	ЭXЪЧЬXЪЭ\	Л€\њљ]љ[™О€	ШЫЫ™љ\›WЭ™ZXЫIЛ€Ы—Эљ\€	ЬЪЭЧЫЫ—Эљ\	Л€ЫЫ\]Y€	ЬЪЭЧШЫЫ\]Y	Л€Ш[Щ[Y€	ЬЪЭЧШШ[Щ[YЪ\ЭЬћIВ€NВ€ЫЫњЭљ]™\ђXЭ[ЫњИHВ€\ЬЪYЫ™Y€	ЬЭ\ќЬXЪЭ\	Л€\њљ]љ[™О€	ЭШZ]Щ›Ь—Э™ZXЫWШЫЫ™љ\›X][Ы‰Л€Ы—Эљ\€	ШЫЫќ[ќYWЭљ\	Л€ЫЫ\]Y€	ЬЪЭЧШЫЫ\]Y	Л€Ш[Щ[Y€	ЬЪЭЧШШ[Щ[YЭљ\	В€NВ€™]\›€В€Y€Э]KњљYKљY€Э]\О€Э]KњљYKњЭ]\Л€™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[Ы‹€љY]Щ\”›ЫN€XЭЬ‹њ›ЫK€™^XЭ[ЫЋ€
+XЭЬ‹њ›ЫHOOH	Ь\ЬЩ[™Щ\‰ИИ\ЬЩ[™Щ\ђXЭ[ЫњИ€љ]™\ђXЭ[ЫњКVЬЭ]KњљYKњЭ]\ЧK€\]Y]€™]И]JЭ]KЫШЪУ\КKќТTУФЭљ[™К
+B€NВџB‚™ќ[Э[Ы€љYTЭ]Q]YКЭ]KXЭЬЉHВ€ЫЫњЭYЩ\ЭHЬћ\ЛЬ™X]R\Ъ
+	ЬЪLЌM‰КKќ\]J”УУ‹њЭљ[™ЪYћJљYTЭ]UљY]КЭ]KXЭЬЉJJK™YЩ\Э
+	Ш\ЩMЌ\›	КKњЫXЩJЌ
+NВ€™]\›€‰ЩYЩ\ЭHВџB‚™ќ[Э[Ы€X]Ъ\ТY“›Ы™SX]Ъ
+[YK]YКHВ€Y€
+][YJH™]\›€[ЩNВ€ЫЫњЭ›Ь›X[^™YHЪЩ[€O€ЪЩ[‹ќљ[J
+Kњ™\XЩJЧ•ЧЛЪK	ЙКNВ€™]\›€Эљ[™К[YJKњЬ]
+	Л	КKњЫЫYJШ[™Y]HO€Ш[™Y]Kќљ[J
+HOOH	К‰И›Ь›X[^™Y
+Ш[™Y]JHOOH]YКNВџB‚™ќ[Э[Ы€Ь™X]S[ШЪФЭ]JЬ[ЫњИHЯJHВ€ЫЫњЭЫШЪУ\ИHЬ[ЫњЛЫШЪУ\ИПИ]Kњ\њЩJ	МЊЌ‹LKLMХОЊЊ‰КNВ€ЫЫњЭљYTЭ]\ИHЬ[ЫњЛњљYTЭ]\ИПИ	ШЫЫXЭ[™ЙОВ€™]\›€В€љYN€В€Y€’VT‘Kњ™\]Y\ЭY€Э]\О€љYTЭ]\Л€™]љ\Ъ[ЫЋ€Ь[ЫњЛњљYT™]љ\Ъ[Ы€ПИ’VT‘Kњ™]љ\Ъ[Ы‹€\ЬЪYЫ™Yљ]™\’Y€Ь[ЫњЛ\ЬЪYЫ™Yљ]™\’YПИ
+љYTЭ]\ИOOH	ШЫЫXЭ[™ЙИИќ[€	Щљ]™\‹X\ЬЪYЫ™Y	КK€™ZXЫPЫЫ™љ\›X][ЫЋ€Ь[ЫњЛќ™ZXЫPЫЫ™љ\›X][Ы€ИЭќXЭ\™YЫЫ™JЬ[ЫњЛќ™ZXЫPЫЫ™љ\›X][ЫЉH€ќ[€K€Щ™™\Ћ€В€Y€’VT‘K›Щ™™\’Y€љ]™\’Y€	Щљ]™\‹\™]љY]ЩY	Л€Э]\О€	ШXЭ]™IЛ€\™PЩ[ќО€ЊМ€]SZ[ќ]\О€Л€^\™\Р]\О€Ь[ЫњЛ›Щ™™\‘^\™\Р]\ИПИЫШЪУ\И
+ИMH
+€Њ
+€L€K€љ]™\‘[YЪXљ[]N€В€	Щљ]™\‹\™]љY]ЩY	О€Ь[ЫњЛ›Щ™™\‘љ]™\‘[YЪX›HПИќYK€	Щљ]™\‹X\ЬЪYЫ™Y	О€Ь[ЫњЛ\ЬЪYЫ™Yљ]™\‘[YЪX›HПИќYB€K€›ЫЪЩY]N€›Ь›X[^™T]JЬ[ЫњЛ›ЫЪЩY]HПИ	СSSИIКK€ЫЫ[X[™[^\О€Л‹‹ЉЬ[ЫњЛЫЫ[X[™[^\ИЯJ_K€™XЫЭ™\ћQZ[\™\О€
+Ь[ЫњЛњ™XЫЭ™\ћQZ[\™\ИЧJK›X\
+Z[\™HO€
+Л‹‹™Z[\™_JJK€\XШ]PЭ\њ™[ќ›ЬЋ€Ь[ЫњЛ™\XШ]PЭ\њ™[ќ›Ь€ќ[€ЫШЪУ\Л€]Y]]™[ќО€ЧK€]Y]Щ\]Y[ЩN€€Y[\Э[ЮN€™]ИX\
+
+K€ШЪО€›ЫZ\ЩKњ™\ЫЫ™J
+B€NВџB‚™ќ[Э[Ы€™XЫЬ™]Y]
+Э]KXЭЬ‹]™[ќ
+HВ€ЫЫњЭ[ќћHHШљ™XЭ™њ™Y^™JВ€Y€]Y]IККЬЭ]K]Y]Щ\]Y[Щ_X€\N€]™[ќќ\K€Э]ЫЫYN€]™[ќ›Э]ЫЫYK€™X\ЫЫЋ€]™[ќњ™X\ЫЫ€ќ[€XЭЬ”›ЫN€XЭЬ‹њ›ЫK€XЭЬ”™YЋ€XЭЬ‹љY€™\]Y\ЭY€’VT‘Kњ™\]Y\ЭY€Щ™™\’Y€]™[ќ›Щ™™\’Yќ[€њ›ЫT™]љ\Ъ[ЫЋ€]™[ќ™њ›ЫT™]љ\Ъ[Ы‹€Ф™]љ\Ъ[ЫЋ€]™[ќќФ™]љ\Ъ[Ы‹€ШШЭ\њ™Y]€™]И]JЭ]KЫШЪУ\КKќТTУФЭљ[™К
+B€JNВ€Э]K]Y]]™[ќЛњ\Ъ
+[ќћJNВ€™]\›€[ќћNВџB‚™ќ[Э[Ы€Щ\љX[^™JЭ]KXЭ[ЫЉHВ€ЫЫњЭ[™[™ИHЭ]K›ШЪЛќ[ЉXЭ[Ы‹XЭ[ЫЉNВ€Э]K›ШЪИH[™[™Лќ[Љ
+
+HO€[™Yљ[™Y
+
+HO€[™Yљ[™Y
+NВ€™]\›€[™[™ОВџB‚™ќ[Э[Ы€ЫЫ[X[™љ[™Щ\њљ[ќ
+™\K\››ЩJHВ€™]\›€”УУ‹њЭљ[™ЪYћJЫY]Щ€™\K›Y]Щ]€\›њ][YK›Щ_JNВџB‚™ќ[Э[Ы€Y[\Э[ЮTШЫЬRЩ^JXШЫЭ[ќ™Y‹Y[\Э[ЮRЩ^JHВ€™]\›€”УУ‹њЭљ[™ЪYћJФЭљ[™КXШЫЭ[ќ™YЉKЭљ[™КY[\Э[ЮRЩ^JWJNВџB‚\Ю[Иќ[Э[Ы€]ЫZXРЫЫ[X[™
+Э]KXЭЬ‹™\K\››ЩKXЭ[ЫЉHВ€ЫЫњЭЩ^HHY[\Э[ЮTШЫЬRЩ^JXЭЬ‹љY™\KљXY\њЦЙЪY[\Э[ЮKZЩ^IЧJNВ€ЫЫњЭљ[™Щ\њљ[ќHЫЫ[X[™љ[™Щ\њљ[ќ
+™\K\››ЩJNВ€™]\›€Щ\љX[^™JЭ]K\Ю[И
+
+HO€В€ЫЫњЭШ]™YHЭ]KљY[\Э[ЮK™Щ]
+Щ^JNВ€Y€
+Ш]™Y
+HВ€Y€
+Ш]™Y™љ[™Щ\њљ[ќOOHљ[™Щ\њљ[ќ
+H™]\›€ЬЭ]\О€K›ЩN€\њ›Ьђ›ЩJ	ЪY[\Э[ЮWШЫЫ™›XЭ	Л	ТY[\Э[ЮKRЩ^HШ\И[™XYH\ЩY›Ь€Y™™\™[ќЫЫќ[ќ‰Л	ЪY[\Э[ЮKXЫЫ™›XЭ	К_NВ€™]\›€ЭќXЭ\™YЫЫ™JШ]™Yњ™\ЬЫњЩJNВ€B€ЛИ]ЫЫЭ\њ™[ќ[™\њИЭ™\›\™Y›Ь™HHЩ\љX[^™YЭ]HЪ[™ЩK‚€]ШZ]™]И›ЫZ\ЩJ™\ЫЫ™HO€Щ][[YYX]J™\ЫЫ™JJNВ€ЫЫњЭ™\ЬЫњЩHHXЭ[ЫЉ
+NВ€Э]KљY[\Э[ЮKњЩ]
+Щ^KЩљ[™Щ\њљ[ќ™\ЬЫњЩN€ЭќXЭ\™YЫЫ™J™\ЬЫњЩJ_JNВ€™]\›€™\ЬЫњЩNВ€JNВџB‚™ќ[Э[Ы€Ь™X]S[ШЪТ[™\ЉЭ]HHЬ™X]S[ШЪФЭ]J
+JHВ€ЫЫњЭ[™\€H\Ю[И
+™\K™\КHO€В€ЫЫњЭ\›H™]ИT“
+™\Kќ\›	Ъ‹ЛМLЌЛЊЊЊIКNВ€ЫЫњЭXЭЬ€HXЭЬ‘њ›ЫJ™\JNВ€Y€
+XXЭЬЉH™]\›€Щ[™
+™\ЛK\њ›Ьђ›ЩJ	Ш]][ќXШ][Ы—Ь™\]Z\™Y	Л	Р]][ќXШ][Ы€\И™\]Z\™Y‰Л	Ш]]	КJNВ€Y€
+™\K›Y]ЩOOH	ФФХ	И	‰€\™\KљXY\њЦЙЪY[\Э[ЮKZЩ^IЧJHВ€™]\›€Щ[™
+™\ЛЊ‹\њ›Ьђ›ЩJ	Ъ[ќ[YЬ™\]Y\Э	Л	ТY[\Э[ЮKRЩ^H\И™\]Z\™Y‰Л	ЪY[\Э[ЮIКJNВ€B€ЫЫњЭ›ЩHH™\K›Y]ЩOOH	ФФХ	ИИ]ШZ]™XY›ЩJ™\JH€ЯNВ€Y€
+›ЩHOOHќ[\С›ЬљY[’[њ]
+›ЩJJHВ€™]\›€Щ[™
+™\ЛЊ‹\њ›Ьђ›ЩJ	Ъ[ќ[YЬ™\]Y\Э	Л	Ф™\]Y\ЭљY[И\™H[ќ[Y‰Л	Ъ[њ]	КJNВ€B‚€ЫЫњЭЩ™™\њФ]HЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKЫЩ™™\њШВ€ЫЫњЭЩ[XЭ]HЭЊKЫЩ™™\њЛЙС’VT‘K›Щ™™\’YKЬЩ[XЭВ€ЫЫњЭШ[Щ[]HЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKШШ[Щ[В€ЫЫњЭЭ\њ™[ќљYT]H	ЛЭЊKЬљY\ЛШЭ\њ™[ќ	ОВ€ЫЫњЭљYT]HЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYXВ€ЫЫњЭЫЫ™љ\›X][Ы”]HЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYKЭ™ZXЫKXЫЫ™љ\›X][ЫњШВ€ЫЫњЭ[њЪ][Ы”]HЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYKЭ[њЪ][ЫњШВ‚€Y€
+™\K›Y]ЩOOH	ССU	И	‰€\›њ][YHOOHЭ\њ™[ќљYT]
+HВ€ЫЫњЭXY\њИHЙШШXЪKXЫЫќ›Ы	О€	Ьљ]]K›ЛXШXЪIЛ	Э\ћIО€	Р]]Ьљ^][Ы‰ЯNВ€Y€
+\›њЩX\Ъ\[\ЛњЪ^™JH™]\›€Щ[™
+™\ЛЊ‹\њ›Ьђ›ЩJ	Ъ[ќ[YЬ™\]Y\Э	Л	РЭ\њ™[ќљYH\ШЫЭ™\ћHЩ\И›ЭXШЩ\љYHY[ќYљY\њЛ‰Л	ШЭ\њ™[ќZ[њ]	КKXY\њКNВ€ЫЫњЭ\РXЭ]™HHЙШЫЫXЭ[™ЙЛ	Ш\ЬЪYЫ™Y	Л	Ш\њљ]љ[™ЙЛ	ЫЫ—Эљ\	ЧKљ[ЫY\КЭ]KњљYKњЭ]\КNВ€ЫЫњЭЭЫњФљYHHXЭЬ‹њ›ЫHOOH	Ь\ЬЩ[™Щ\‰И	‰€XЭЬ‹љYOOH	Ь\ЬЩ[™Щ\‹[ЭЫ™\‰ОВ€ЫЫњЭ\Р\ЬЪYЫ™Yљ]™\€HXЭЬ‹њ›ЫHOOH	Щљ]™\‰И	‰€XЭЬ‹љYOOHЭ]KњљYK\ЬЪYЫ™Yљ]™\’YВ€ЫЫњЭШ[™Y]\ИH\РXЭ]™H	‰€
+ЭЫњФљYH\Р\ЬЪYЫ™Yљ]™\ЉHИЬЭ]KњљYWH€ЧNВ€Y€
+Э]K™\XШ]PЭ\њ™[ќ›Ь€OOHXЭЬ‹љY	‰€Ш[™Y]\Л›[™Э
+HШ[™Y]\Лњ\Ъ
+Л‹‹њЭ]KњљYKY€	ЬљYKY\XШ]KYљ^\™IЯJNВ€Y€
+Ш[™Y]\Л›[™Э€JHВ€™]\›€Щ[™
+™\ЛK\њ›Ьђ›ЩJ	Ш[XљYЭ[Э\ЧШЭ\њ™[ќЬљYIЛ	ХHЭ\њ™[ќљYHЫЭ[›Э™HЩ[XЭYШY™[K‰Л	ШЭ\њ™[ќX[XљYЭ[Э\ЙКKXY\њКNВ€B€Y€
+XШ[™Y]\Л›[™Э
+H™]\›€Щ[™
+™\ЛЊќ[XY\њКNВ€™]\›€Щ[™
+™\ЛЊљYTЭ]UљY]КЭ]KXЭЬЉKЛ‹‹љXY\њЛ]YО€љYTЭ]Q]YКЭ]KXЭЬЉ_JNВ€B‚€Y€
+™\K›Y]ЩOOH	ССU	И	‰€\›њ][YHOOHљYT]
+HВ€ЫЫњЭЭЫњФљYHHXЭЬ‹њ›ЫHOOH	Ь\ЬЩ[™Щ\‰И	‰€XЭЬ‹љYOOH	Ь\ЬЩ[™Щ\‹[ЭЫ™\‰ОВ€ЫЫњЭ\Р\ЬЪYЫ™Yљ]™\€HXЭЬ‹њ›ЫHOOH	Щљ]™\‰И	‰€XЭЬ‹љYOOHЭ]KњљYK\ЬЪYЫ™Yљ]™\’YВ€Y€
+[ЭЫњФљYH	‰€Z\Р\ЬЪYЫ™Yљ]™\ЉH™]\›€Щ[™
+™\Л\њ›Ьђ›ЩJ	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	Л	Ф™\ЫЭ\ЩHШ\И›Э›Э[™‰Л	ЪY[‰КJNВ€ЫЫњЭZ[\™HHЭ]Kњ™XЫЭ™\ћQZ[\™\ЛњЪYќ
+
+NВ€Y€
+Z[\™JHВ€ЫЫњЭЫЩHHZ[\™KњЭ]\ИOOHЋHИ	Ь]WЫ[Z]Y	И€	ЬЩ\ќљXЩWЭ[]Z[X›IОВ€ЫЫњЭY\ЬШYЩHHZ[\™KњЭ]\ИOOHЋHИ	ХЫИX[ћH™XЫЭ™\ћH™\]Y\ЭЛ€™]ћH]\‹‰И€	ФљYH™XЫЭ™\ћH\И[\Ь\љ[H[]Z[X›K‰ОВ€ЫЫњЭXY\њИHZ[\™Kњ™]ћPYќ\€OOH[™Yљ[™YИЯH€ЙЬ™]ћKXYќ\‰О€Эљ[™КZ[\™Kњ™]ћPYќ\Љ_NВ€™]\›€Щ[™
+™\ЛZ[\™KњЭ]\Л\њ›Ьђ›ЩJЫЩKY\ЬШYЩKЫЩJKXY\њКNВ€B€ЫЫњЭ]YИHљYTЭ]Q]YКЭ]KXЭЬЉNВ€ЫЫњЭXY\њИHЙЩ]YЙО€]YЛ	ШШXЪKXЫЫќ›Ы	О€	Ьљ]]K›ЛXШXЪIЛ	Э\ћIО€	Р]]Ьљ^][Ы‰ЯNВ€Y€
+X]Ъ\ТY“›Ы™SX]Ъ
+™\KљXY\њЦЙЪY‹[›Ы™K[X]Ъ	ЧK]YКJH™]\›€Щ[™
+™\ЛМќ[XY\њКNВ€™]\›€Щ[™
+™\ЛЊљYTЭ]UљY]КЭ]KXЭЬЉKXY\њКNВ€B‚€Y€
+™\K›Y]ЩOOH	ССU	И	‰€\›њ][YHOOHЩ™™\њФ]
+HВ€Y€
+XЭЬ‹њ›ЫHOOH	Ь\ЬЩ[™Щ\‰КH™]\›€Щ[™
+™\ЛЛ\њ›Ьђ›ЩJ	Ь›ЫWЫЬ—Щ[YЪXљ[]WЩ[љYY	Л	Х\И›ЫHШ[››Э\™›Ь›HHЬ\][Ы‹‰Л	Ь›ЫIКJNВ€Y€
+XЭЬ‹љYOOH	Ь\ЬЩ[™Щ\‹[ЭЫ™\‰КH™]\›€Щ[™
+™\Л\њ›Ьђ›ЩJ	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	Л	Ф™\ЫЭ\ЩHШ\И›Э›Э[™‰Л	ЪY[‰КJNВ€™]\›€Щ[™
+™\ЛЊЫЩ™™\њО€ЧKЭ[[X\ћN€ШXЭ]™N€^\™Y€[]Z[X›N€_JNВ€B€Y€
+™\K›Y]ЩOOH	ФФХ	И	‰€\›њ][YHOOHЩ™™\њФ]
+HВ€Y€
+XЭЬ‹њ›ЫHOOH	Щљ]™\‰ИXXЭЬ‹™[YЪX›JH™]\›€Щ[™
+™\ЛЛ\њ›Ьђ›ЩJ	Ь›ЫWЫЬ—Щ[YЪXљ[]WЩ[љYY	Л	Х\И›ЫHЬ€[YЪXљ[]HШ[››Э\™›Ь›HHЬ\][Ы‹‰Л	Щ[YЪXљ[]IКJNВ€™]\›€Щ[™
+™\ЛЊKЪY€	ЫЩ™™\‹[™]ЙЛ™\]Y\ЭY€’VT‘Kњ™\]Y\ЭY\™PЩ[ќО€›ЩK™\™PЩ[ќЛ]SZ[ќ]\О€›ЩK™]SZ[ќ]\ЛЭ]\О€	ШXЭ]™IЛ^\™\Р]€	МЊЌ‹LKLMХЋЊMNЊ‰ЯJNВ€B€Y€
+™\K›Y]ЩOOH	ФФХ	И	‰€\›њ][YHOOHЩ[XЭ]
+HВ€Y€
+XЭЬ‹њ›ЫHOOH	Ь\ЬЩ[™Щ\‰КH™]\›€Щ[™
+™\ЛЛ\њ›Ьђ›ЩJ	Ь›ЫWЫЬ—Щ[YЪXљ[]WЩ[љYY	Л	Х\И›ЫHШ[››Э\™›Ь›HHЬ\][Ы‹‰Л	Ь›ЫIКJNВ€Y€
+XЭЬ‹љYOOH	Ь\ЬЩ[™Щ\‹[ЭЫ™\‰КH™]\›€Щ[™
+™\Л\њ›Ьђ›ЩJ	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	Л	Ф™\ЫЭ\ЩHШ\И›Э›Э[™‰Л	ЪY[‰КJNВ€Y€
+Шљ™XЭљЩ^\К›ЩJKњЫЫYJЩ^HO€Щ^HOOH	Щ^XЭY™\]Y\Э™]љ\Ъ[Ы‰КJH™]\›€Щ[™
+™\ЛЊ‹\њ›Ьђ›ЩJ	Ъ[ќ[YЬ™\]Y\Э	Л	Ф™\]Y\ЭљY[И\™H[ќ[Y‰Л	Ъ[њ]	КJNВ€ЫЫњЭ™\ЬЫњЩHH]ШZ]]ЫZXРЫЫ[X[™
+Э]KXЭЬ‹™\K\››ЩK
+
+HO€В€ЫЫњЭњ›ЫT™]љ\Ъ[Ы€HЭ]KњљYKњ™]љ\Ъ[ЫЋВ€Y€
+ќ[X™\Љ›ЩK™^XЭY™\]Y\Э™]љ\Ъ[ЫЉHOOHЭ]KњљYKњ™]љ\Ъ[ЫЉHВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЫЩ™™\‹њЩ[XЭ[Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	ЬЭ[WЬ™]љ\Ъ[Ы‰ЛЩ™™\’Y€’VT‘K›Щ™™\’Yњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	ЬЭ[WЬ™]љ\Ъ[Ы‰Л	ХH™\]Y\ЭЪ[™ЩY€™Yњ™\Ъ™Y›Ь™H™]ћZ[™Л‰Л	ЬЭ[IКK™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[Ыџ_NВ€B€Y€
+Э]KњљYKњЭ]\ИOOH	ШЫЫXЭ[™ЙКHВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЫЩ™™\‹њЩ[XЭ[Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	Ъ[ќ[YЭ[њЪ][Ы‰ЛЩ™™\’Y€’VT‘K›Щ™™\’Yњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€\њ›Ьђ›ЩJ	Ъ[ќ[YЭ[њЪ][Ы‰Л	ХH™\]Y\ЭШ[€›ИЫ™Щ\€XШЩ\[€Щ™™\‹‰Л	Э[њЪ][Ы‰К_NВ€B€Y€
+Э]K›Щ™™\‹њЭ]\ИOOH	Щ^\™Y	ИЭ]KЫШЪУ\ИЏHЭ]K›Щ™™\‹™^\™\Р]\КHВ€Э]K›Щ™™\‹њЭ]\ИH	Щ^\™Y	ОИЭ]K›Щ™™\‹њЭ]\Ф™X\ЫЫ€H	Э[YIОВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЫЩ™™\‹њЩ[XЭ[Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	ЫЩ™™\—Щ^\™Y	ЛЩ™™\’Y€’VT‘K›Щ™™\’Yњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	ЫЩ™™\—Щ^\™Y	Л	ХHЩ™™\€\И^\™Y€™\]Y\ЭH™]И][ЭK‰Л	Щ^\™Y	КK™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[Ыџ_NВ€B€Y€
+Э]K›Щ™™\‹њЭ]\ИOOH	Э[]Z[X›IИ\Э]K™љ]™\‘[YЪXљ[]VЬЭ]K›Щ™™\‹™љ]™\’YJHВ€Э]K›Щ™™\‹њЭ]\ИH	Э[]Z[X›IОИЭ]K›Щ™™\‹њЭ]\Ф™X\ЫЫ€H	Щ[YЪXљ[]IОВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЫЩ™™\‹њЩ[XЭ[Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	Щљ]™\—Э[]Z[X›IЛЩ™™\’Y€’VT‘K›Щ™™\’Yњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	Щљ]™\—Э[]Z[X›IЛ	ХHљ]™\€\И›ИЫ™Щ\€[YЪX›HЬ€]Z[X›K‰Л	Щ[YЪXљ[]IКK™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[Ыџ_NВ€B€Э]KњљYKњЭ]\ИH	Ш\ЬЪYЫ™Y	ОИЭ]KњљYKњ™]љ\Ъ[Ы€
+ПHNИЭ]KњљYKњЩ[XЭYЩ™™\’YH’VT‘K›Щ™™\’YИЭ]K›Щ™™\‹њЭ]\ИH	ЬЩ[XЭY	ОВ€Э]KњљYKњЩ[XЭY][ЭHHЩ\™PЩ[ќО€Э]K›Щ™™\‹™\™PЩ[ќЛ]SZ[ќ]\О€Э]K›Щ™™\‹™]SZ[ќ]\ЛЩ[XЭY]€™]И]JЭ]KЫШЪУ\КKќТTУФЭљ[™К
+_NВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЫЩ™™\‹њЩ[XЭ[Ы‰ЛЭ]ЫЫYN€	ШЫЫ[Z]Y	ЛЩ™™\’Y€’VT‘K›Щ™™\’Yњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€Њ›ЩN€ЭќXЭ\™YЫЫ™JЭ]KњљYJ_NВ€JNВ€™]\›€Щ[™
+™\Л™\ЬЫњЩKњЭ]\Л™\ЬЫњЩK›ЩJNВ€B€Y€
+™\K›Y]ЩOOH	ФФХ	И	‰€\›њ][YHOOHШ[Щ[]
+HВ€Y€
+XЭЬ‹њ›ЫHOOH	Ь\ЬЩ[™Щ\‰КH™]\›€Щ[™
+™\ЛЛ\њ›Ьђ›ЩJ	Ь›ЫWЫЬ—Щ[YЪXљ[]WЩ[љYY	Л	Х\И›ЫHШ[››Э\™›Ь›HHЬ\][Ы‹‰Л	Ь›ЫIКJNВ€Y€
+XЭЬ‹љYOOH	Ь\ЬЩ[™Щ\‹[ЭЫ™\‰КH™]\›€Щ[™
+™\Л\њ›Ьђ›ЩJ	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	Л	Ф™\ЫЭ\ЩHШ\И›Э›Э[™‰Л	ЪY[‰КJNВ€ЫЫњЭШ[Щ[љY[ИHЙЩ^XЭY™]љ\Ъ[Ы‰Л	Ь™X\ЫЫ‰ЧNВ€Y€
+Шљ™XЭљЩ^\К›ЩJKњЫЫYJЩ^HO€XШ[Щ[љY[Лљ[ЫY\КЩ^JJH€Sќ[X™\‹љ\Т[ќYЩ\Љ›ЩK™^XЭY™]љ\Ъ[ЫЉH›ЩK™^XЭY™]љ\Ъ[Ы€H€PРSђСSUSУ—Ф‘PTУУ”Лљ[ЫY\К›ЩKњ™X\ЫЫЉJHВ€™]\›€Щ[™
+™\ЛЊ‹\њ›Ьђ›ЩJ	Ъ[ќ[YЬ™\]Y\Э	Л	Ф™\]Y\ЭљY[И\™H[ќ[Y‰Л	Ъ[њ]	КJNВ€B€Y€
+Э]KЫЫ[X[™[^\ЛШ[Щ[
+H]ШZ]™]И›ЫZ\ЩJ™\ЫЫ™HO€Щ][Y[Э]
+™\ЫЫ™KЭ]KЫЫ[X[™[^\ЛШ[Щ[
+JNВ€ЫЫњЭ™\ЬЫњЩHH]ШZ]]ЫZXРЫЫ[X[™
+Э]KXЭЬ‹™\K\››ЩK
+
+HO€В€ЫЫњЭњ›ЫT™]љ\Ъ[Ы€HЭ]KњљYKњ™]љ\Ъ[ЫЋВ€Y€
+ќ[X™\Љ›ЩK™^XЭY™]љ\Ъ[ЫЉHOOHЭ]KњљYKњ™]љ\Ъ[ЫЉHВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЬљYKШ[Щ[][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	ЬЭ[WЬ™]љ\Ъ[Ы‰Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	ЬЭ[WЬ™]љ\Ъ[Ы‰Л	ХH™\]Y\ЭЪ[™ЩY€™Yњ™\Ъ™Y›Ь™H™]ћZ[™Л‰Л	ЬЭ[IКK™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[Ыџ_NВ€B€Y€
+VЙШЫЫXЭ[™ЙЛ	Ш\ЬЪYЫ™Y	Л	Ш\њљ]љ[™ЙЧKљ[ЫY\КЭ]KњљYKњЭ]\КJHВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЬљYKШ[Щ[][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	Ъ[ќ[YЭ[њЪ][Ы‰Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€\њ›Ьђ›ЩJ	Ъ[ќ[YЭ[њЪ][Ы‰Л	ХH™\]Y\ЭШ[€›ИЫ™Щ\€™HШ[Щ[Y‰Л	Э[њЪ][Ы‰К_NВ€B€Э]KњљYKњЭ]\ИH	ШШ[Щ[Y	ОИЭ]KњљYKњ™]љ\Ъ[Ы€
+ПHNИЭ]KњљYKШ[Щ[™X\ЫЫ€H›ЩKњ™X\ЫЫЋИЭ]KњљYKќ™ZXЫPЫЫ™љ\›X][Ы€Hќ[В€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЬљYKШ[Щ[][Ы‰ЛЭ]ЫЫYN€	ШЫЫ[Z]Y	Л™X\ЫЫЋ€›ЩKњ™X\ЫЫ‹њ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€Њ›ЩN€ЭќXЭ\™YЫЫ™JЭ]KњљYJ_NВ€JNВ€™]\›€Щ[™
+™\Л™\ЬЫњЩKњЭ]\Л™\ЬЫњЩK›ЩJNВ€B€Y€
+™\K›Y]ЩOOH	ФФХ	И	‰€\›њ][YHOOHЫЫ™љ\›X][Ы”]
+HВ€Y€
+XЭЬ‹њ›ЫHOOH	Ь\ЬЩ[™Щ\‰КH™]\›€Щ[™
+™\ЛЛ\њ›Ьђ›ЩJ	Ь›ЫWЫЬ—Щ[YЪXљ[]WЩ[љYY	Л	Х\И›ЫHШ[››Э\™›Ь›HHЬ\][Ы‹‰Л	Ь›ЫIКJNВ€Y€
+XЭЬ‹љYOOH	Ь\ЬЩ[™Щ\‹[ЭЫ™\‰КH™]\›€Щ[™
+™\Л\њ›Ьђ›ЩJ	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	Л	Ф™\ЫЭ\ЩHШ\И›Э›Э[™‰Л	ЪY[‰КJNВ€ЫЫњЭЫЫ™љ\›X][Ы‘љY[ИHЙЫШњЩ\ќ™Y]IЛ	ЬШ[YT\њЫЫ‰Л	ЬШ[YU™ZXЫIЛ	Щ^XЭY™]љ\Ъ[Ы‰ЧNВ€Y€
+Шљ™XЭљЩ^\К›ЩJKњЫЫYJЩ^HO€XЫЫ™љ\›X][Ы‘љY[Лљ[ЫY\КЩ^JJH€\[Щ€›ЩK›ШњЩ\ќ™Y]HOOH	ЬЭљ[™ЙИX›ЩK›ШњЩ\ќ™Y]Kќљ[J
+H€\[Щ€›ЩKњШ[YT\њЫЫ€OOH	Ш›ЫЫX[‰И\[Щ€›ЩKњШ[YU™ZXЫHOOH	Ш›ЫЫX[‰КHВ€™]\›€Щ[™
+™\ЛЊ‹\њ›Ьђ›ЩJ	Ъ[ќ[YЬ™\]Y\Э	Л	Ф™\]Y\ЭљY[И\™H[ќ[Y‰Л	Ъ[њ]	КJNВ€B€ЫЫњЭ™\ЬЫњЩHH]ШZ]]ЫZXРЫЫ[X[™
+Э]KXЭЬ‹™\K\››ЩK
+
+HO€В€ЫЫњЭњ›ЫT™]љ\Ъ[Ы€HЭ]KњљYKњ™]љ\Ъ[ЫЋВ€Y€
+ќ[X™\Љ›ЩK™^XЭY™]љ\Ъ[ЫЉHOOHњ›ЫT™]љ\Ъ[ЫЉHВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	Э™ZXЫKЫЫ™љ\›X][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	ЬЭ[WЬ™]љ\Ъ[Ы‰Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	ЬЭ[WЬ™]љ\Ъ[Ы‰Л	ХHљYHЪ[™ЩY€™Yњ™\Ъ™Y›Ь™H™]ћZ[™Л‰Л	ЬЭ[IКK™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[Ыџ_NВ€B€Y€
+Э]KњљYKњЭ]\ИOOH	Ш\њљ]љ[™ЙИ\Э]KњљYK\ЬЪYЫ™Yљ]™\’Y
+HВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	Э™ZXЫKЫЫ™љ\›X][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	Ъ[ќ[YЭ[њЪ][Ы‰Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	Ъ[ќ[YЭ[њЪ][Ы‰Л	Х™ZXЫHЫЫ™љ\›X][Ы€\И›Э]Z[X›H[€\ИљYHЭ]K‰Л	Э[њЪ][Ы‰КK™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[Ыџ_NВ€B€Y€
+\Э]K™љ]™\‘[YЪXљ[]VЬЭ]KњљYK\ЬЪYЫ™Yљ]™\’YJHВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	Э™ZXЫKЫЫ™љ\›X][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	Щљ]™\—Э[]Z[X›IЛњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	Щљ]™\—Э[]Z[X›IЛ	ХH\ЬЪYЫ™Yљ]™\€\И›ИЫ™Щ\€[YЪX›K‰Л	Щ[YЪXљ[]IКK™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[Ыџ_NВ€B€ЫЫњЭX]Ъ\ИH›Ь›X[^™T]J›ЩK›ШњЩ\ќ™Y]JHOOHЭ]K›ЫЪЩY]H	‰€›ЩKњШ[YT\њЫЫ€	‰€›ЩKњШ[YU™ZXЫNВ€Y€
+[X]Ъ\КHВ€Y€
+Э]KњљYKќ™ZXЫPЫЫ™љ\›X][ЫЉHВ€Э]KњљYKќ™ZXЫPЫЫ™љ\›X][Ы€Hќ[В€Э]KњљYKњ™]љ\Ъ[Ы€
+ПHNВ€B€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	Э™ZXЫKЫЫ™љ\›X][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	Э™ZXЫWЫZ\ЫX]Ъ	Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	Э™ZXЫWЫZ\ЫX]Ъ	Л	ХHШњЩ\ќ™Yљ]™\€Ь€™ZXЫHЩ\И›ЭX]ЪH›ЫЪЪ[™Л‰Л	Э™ZXЫK[Z\ЫX]Ъ	КK™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[Ыџ_NВ€B€ЫЫњЭЫЫ™љ\›X][Ы€HВ€™\]Y\ЭY€’VT‘Kњ™\]Y\ЭY€\ЬЪYЫ›Y[ќ™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[Ы‹€ЫЫ™љ\›YY]€™]И]JЭ]KЫШЪУ\КKќТTУФЭљ[™К
+B€NВ€Э]KњљYKњ™]љ\Ъ[Ы€
+ПHNВ€Э]KњљYKќ™ZXЫPЫЫ™љ\›X][Ы€HЛ‹‹ЫЫ™љ\›X][Ы‹[Y›Ь”™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[ЫџNВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	Э™ZXЫKЫЫ™љ\›X][Ы‰ЛЭ]ЫЫYN€	ШЫЫ[Z]Y	Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€ЊK›ЩN€ЫЫ™љ\›X][ЫџNВ€JNВ€™]\›€Щ[™
+™\Л™\ЬЫњЩKњЭ]\Л™\ЬЫњЩK›ЩJNВ€B€Y€
+™\K›Y]ЩOOH	ФФХ	И	‰€\›њ][YHOOH[њЪ][Ы”]
+HВ€Y€
+XЭЬ‹њ›ЫHOOH	Щљ]™\‰КH™]\›€Щ[™
+™\ЛЛ\њ›Ьђ›ЩJ	Ь›ЫWЫЬ—Щ[YЪXљ[]WЩ[љYY	Л	Х\И›ЫHШ[››Э\™›Ь›HHЬ\][Ы‹‰Л	Ь›ЫIКJNВ€Y€
+XЭЬ‹љYOOHЭ]KњљYK\ЬЪYЫ™Yљ]™\’Y
+H™]\›€Щ[™
+™\Л\њ›Ьђ›ЩJ	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	Л	Ф™\ЫЭ\ЩHШ\И›Э›Э[™‰Л	ЪY[‰КJNВ€ЫЫњЭ[њЪ][Ы‘љY[ИHЙЩњ›ЫIЛ	ЭЙЛ	Щ^XЭY™]љ\Ъ[Ы‰ЧNВ€Y€
+Шљ™XЭљЩ^\К›ЩJKњЫЫYJЩ^HO€][њЪ][Ы‘љY[Лљ[ЫY\КЩ^JJH€\[Щ€›ЩK™њ›ЫHOOH	ЬЭљ[™ЙИ\[Щ€›ЩKќИOOH	ЬЭљ[™ЙКHВ€™]\›€Щ[™
+™\ЛЊ‹\њ›Ьђ›ЩJ	Ъ[ќ[YЬ™\]Y\Э	Л	Ф™\]Y\ЭљY[И\™H[ќ[Y‰Л	Ъ[њ]	КJNВ€B€Y€
+Э]KЫЫ[X[™[^\Лќ[њЪ][ЫЉH]ШZ]™]И›ЫZ\ЩJ™\ЫЫ™HO€Щ][Y[Э]
+™\ЫЫ™KЭ]KЫЫ[X[™[^\Лќ[њЪ][ЫЉJNВ€ЫЫњЭ™\ЬЫњЩHH]ШZ]]ЫZXРЫЫ[X[™
+Э]KXЭЬ‹™\K\››ЩK
+
+HO€В€ЫЫњЭњ›ЫT™]љ\Ъ[Ы€HЭ]KњљYKњ™]љ\Ъ[ЫЋВ€Y€
+ќ[X™\Љ›ЩK™^XЭY™]љ\Ъ[ЫЉHOOHњ›ЫT™]љ\Ъ[ЫЉHВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЬљYKќ[њЪ][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	ЬЭ[WЬ™]љ\Ъ[Ы‰Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	ЬЭ[WЬ™]љ\Ъ[Ы‰Л	ХHљYHЪ[™ЩY€™Yњ™\Ъ™Y›Ь™H™]ћZ[™Л‰Л	ЬЭ[IКK™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[Ыџ_NВ€B€Y€
+\Э]K™љ]™\‘[YЪXљ[]VШXЭЬ‹љYJHВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЬљYKќ[њЪ][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	Щљ]™\—Э[]Z[X›IЛњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	Щљ]™\—Э[]Z[X›IЛ	ХH\ЬЪYЫ™Yљ]™\€\И›ИЫ™Щ\€[YЪX›K‰Л	Щ[YЪXљ[]IКK™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[Ыџ_NВ€B€ЫЫњЭ™^HШ\ЬЪYЫ™Y€	Ш\њљ]љ[™ЙЛ\њљ]љ[™О€	ЫЫ—Эљ\	ЛЫ—Эљ\€	ШЫЫ\]Y	ЯVЬЭ]KњљYKњЭ]\ЧNВ€Y€
+›ЩK™њ›ЫHOOHЭ]KњљYKњЭ]\И›ЩKќИOOH™^
+HВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЬљYKќ[њЪ][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	Ъ[ќ[YЭ[њЪ][Ы‰Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	Ъ[ќ[YЭ[њЪ][Ы‰Л	ХH™\]Y\ЭYљYH[њЪ][Ы€\И›Э[ЭЩY‰Л	Э[њЪ][Ы‰КK™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[Ыџ_NВ€B€Y€
+›ЩKќИOOH	ЫЫ—Эљ\	И	‰€Э]KњљYKќ™ZXЫPЫЫ™љ\›X][ЫЏЛќ[Y›Ь”™]љ\Ъ[Ы€OOHњ›ЫT™]љ\Ъ[ЫЉHВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЬљYKќ[њЪ][Ы‰ЛЭ]ЫЫYN€	Ь™Z™XЭY	Л™X\ЫЫЋ€	Э™ZXЫWШЫЫ™љ\›X][Ы—Ь™\]Z\™Y	Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€K›ЩN€Л‹‹™\њ›Ьђ›ЩJ	Э™ZXЫWШЫЫ™љ\›X][Ы—Ь™\]Z\™Y	Л	РHЭ\њ™[ќ™ZXЫHЫЫ™љ\›X][Ы€\И™\]Z\™Y™Y›Ь™HЭ\ќ[™ИHљYK‰Л	Э™ZXЫKXЫЫ™љ\›X][Ы‰КK™]љ\Ъ[ЫЋ€њ›ЫT™]љ\Ъ[Ыџ_NВ€B€Э]KњљYKњЭ]\ИH›ЩKќОВ€Э]KњљYKњ™]љ\Ъ[Ы€
+ПHNВ€™XЫЬ™]Y]
+Э]KXЭЬ‹Э\N€	ЬљYKќ[њЪ][Ы‰ЛЭ]ЫЫYN€	ШЫЫ[Z]Y	Лњ›ЫT™]љ\Ъ[Ы‹Ф™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[ЫџJNВ€™]\›€ЬЭ]\О€Њ›ЩN€ЪY€Э]KњљYKљYЭ]\О€Э]KњљYKњЭ]\Л™]љ\Ъ[ЫЋ€Э]KњљYKњ™]љ\Ъ[Ыџ_NВ€JNВ€™]\›€Щ[™
+™\Л™\ЬЫњЩKњЭ]\Л™\ЬЫњЩK›ЩJNВ€B€™]\›€Щ[™
+™\Л\њ›Ьђ›ЩJ	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	Л	Ф™\ЫЭ\ЩHШ\И›Э›Э[™‰Л	Ь›Э]IКJNВ€NВ€[™\‹њЭ]HHЭ]NВ€™]\›€[™\ЋВџB‚™ќ[Э[Ы€ШЩ[\љ[ЬКЪЩ[њИH’VT‘KќЪЩ[њКHВ€ЫЫњЭY[\Э[ќHЙТY[\Э[ЮKRЩ^IО€	Э\ЭZЩ^KLIЯNВ€™]\›€В€Ы[YN€	Ы›ИЩ\ЬЪ[Ы€Ш[››Э™XYЩ™™\њЙЛY]Щ€	ССU	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKЫЩ™™\њШ^XЭY€НK	Ш]][ќXШ][Ы—Ь™\]Z\™Y	Ч_K€Ы[YN€	ЫЭЫ™\€Ш[€™XYЩ™™\њЙЛY]Щ€	ССU	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKЫЩ™™\њШЪЩ[Ћ€ЪЩ[њЛ›ЭЫ™\‹^XЭY€МЊ_K€Ы[YN€	Э[њ™[]Y\ЬЩ[™Щ\€Ш[››Э\ШЫЭ™\€Щ™™\њЙЛY]Щ€	ССU	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKЫЩ™™\њШЪЩ[Ћ€ЪЩ[њЛ›Э\”\ЬЩ[™Щ\‹^XЭY€Н	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	ЧKЫЫЩX[Y€ќY_K€Ы[YN€	Щљ]™\€Ш[››Э\ЩH\ЬЩ[™Щ\€Щ™™\‹[\ЭTIЛY]Щ€	ССU	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKЫЩ™™\њШЪЩ[Ћ€ЪЩ[њЛњ™]љY]ЩYљ]™\‹^XЭY€НЛ	Ь›ЫWЫЬ—Щ[YЪXљ[]WЩ[љYY	Ч_K€Ы[YN€	Ь\ЬЩ[™Щ\€Ш[››ЭЬ™X]HHљ]™\€Щ™™\‰ЛY]Щ€	ФФХ	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKЫЩ™™\њШЪЩ[Ћ€ЪЩ[њЛ›ЭЫ™\‹XY\њО€Y[\Э[ќ›ЩN€Щ\™PЩ[ќО€ЊМ]SZ[ќ]\О€Л^XЭY™\]Y\Э™]љ\Ъ[ЫЋ€џK^XЭY€НЛ	Ь›ЫWЫЬ—Щ[YЪXљ[]WЩ[љYY	Ч_K€Ы[YN€	Ь[™[™Иљ]™\€Ш[››ЭЬ™X]H[€Щ™™\‰ЛY]Щ€	ФФХ	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKЫЩ™™\њШЪЩ[Ћ€ЪЩ[њЛњ[™[™Сљ]™\‹XY\њО€Y[\Э[ќ›ЩN€Щ\™PЩ[ќО€ЊМ]SZ[ќ]\О€Л^XЭY™\]Y\Э™]љ\Ъ[ЫЋ€џK^XЭY€НЛ	Ь›ЫWЫЬ—Щ[YЪXљ[]WЩ[љYY	Ч_K€Ы[YN€	Ь™]љY]ЩYљ]™\€Ш[€Ь™X]H[€Щ™™\‰ЛY]Щ€	ФФХ	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKЫЩ™™\њШЪЩ[Ћ€ЪЩ[њЛњ™]љY]ЩYљ]™\‹XY\њО€Y[\Э[ќ›ЩN€Щ\™PЩ[ќО€ЊМ]SZ[ќ]\О€Л^XЭY™\]Y\Э™]љ\Ъ[ЫЋ€џK^XЭY€МЊW_K€Ы[YN€	ЫЭ\€\ЬЩ[™Щ\€Ш[››ЭЩ[XЭHЭЫ™\€Щ™™\‰ЛY]Щ€	ФФХ	Л]€ЭЊKЫЩ™™\њЛЙС’VT‘K›Щ™™\’YKЬЩ[XЭЪЩ[Ћ€ЪЩ[њЛ›Э\”\ЬЩ[™Щ\‹XY\њО€Y[\Э[ќ›ЩN€Щ^XЭY™\]Y\Э™]љ\Ъ[ЫЋ€џK^XЭY€Н	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	ЧKЫЫЩX[Y€ќY_K€Ы[YN€	ЫЭ\€\ЬЩ[™Щ\€Ш[››ЭШ[Щ[HЭЫ™\€™\]Y\Э	ЛY]Щ€	ФФХ	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKШШ[Щ[ЪЩ[Ћ€ЪЩ[њЛ›Э\”\ЬЩ[™Щ\‹XY\њО€Y[\Э[ќ›ЩN€Щ^XЭY™]љ\Ъ[ЫЋ€‹™X\ЫЫЋ€	Ь\ЬЩ[™Щ\—Ь™\]Y\ЭY	ЯK^XЭY€Н	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	ЧKЫЫЩX[Y€ќY_K€Ы[YN€	ЫЭ\€\ЬЩ[™Щ\€Ш[››ЭЫЫ™љ\›HHЭЫ™\€™ZXЫIЛY]Щ€	ФФХ	Л]€ЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYKЭ™ZXЫKXЫЫ™љ\›X][ЫњШЪЩ[Ћ€ЪЩ[њЛ›Э\”\ЬЩ[™Щ\‹XY\њО€Y[\Э[ќ›ЩN€ЫШњЩ\ќ™Y]N€	СSSИIЛШ[YT\њЫЫЋ€ќYKШ[YU™ZXЫN€ќYK^XЭY™]љ\Ъ[ЫЋ€џK^XЭY€Н	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	ЧKЫЫЩX[Y€ќY_K€Ы[YN€	Э[\ЬЪYЫ™Yљ]™\€Ш[››Э[њЪ][Ы€HљYIЛY]Щ€	ФФХ	Л]€ЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYKЭ[њЪ][ЫњШЪЩ[Ћ€ЪЩ[њЛ›Э\‘љ]™\‹XY\њО€Y[\Э[ќ›ЩN€Щњ›ЫN€	Ш\ЬЪYЫ™Y	ЛО€	Ш\њљ]љ[™ЙЛ^XЭY™]љ\Ъ[ЫЋ€џK^XЭY€Н	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	ЧKЫЫЩX[Y€ќY_K€Ы[YN€	Ш\ЬЪYЫ™Yљ]™\€Ш[€[њЪ][Ы€HљYIЛY]Щ€	ФФХ	Л]€ЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYKЭ[њЪ][ЫњШЪЩ[Ћ€ЪЩ[њЛ\ЬЪYЫ™Yљ]™\‹XY\њО€Y[\Э[ќ›ЩN€Щњ›ЫN€	Ш\ЬЪYЫ™Y	ЛО€	Ш\њљ]љ[™ЙЛ^XЭY™]љ\Ъ[ЫЋ€џK^XЭY€МЊ_K€Ы[YN€	ШШ[\€Э\YYљ]™\€Y[ќ]H\И™Z™XЭY	ЛY]Щ€	ФФХ	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKЫЩ™™\њШЪЩ[Ћ€ЪЩ[њЛњ™]љY]ЩYљ]™\‹XY\њО€Y[\Э[ќ›ЩN€Щљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	Л\™PЩ[ќО€ЊМ]SZ[ќ]\О€Л^XЭY™\]Y\Э™]љ\Ъ[ЫЋ€џK^XЭY€НЊ‹	Ъ[ќ[YЬ™\]Y\Э	Ч_K€Ы[YN€	ЫZ\ЬЪ[™ИY[\Э[ЮHЩ^H\И™Z™XЭY	ЛY]Щ€	ФФХ	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKШШ[Щ[ЪЩ[Ћ€ЪЩ[њЛ›ЭЫ™\‹›ЩN€Щ^XЭY™]љ\Ъ[ЫЋ€‹™X\ЫЫЋ€	Ь\ЬЩ[™Щ\—Ь™\]Y\ЭY	ЯK^XЭY€НЊ‹	Ъ[ќ[YЬ™\]Y\Э	Ч_B€NВџB‚\Ю[Иќ[Э[Ы€™\]Y\ЭњЫЫЉ\ЩU\›ШЩ[\љ[Л™]Ъ[\
+HВ€ЫЫњЭXY\њИHЛ‹‹њШЩ[\љ[ЛљXY\њЯNВ€Y€
+ШЩ[\љ[ЛќЪЩ[ЉHXY\њЛ]]Ьљ^][Ы€H™X\™\€	ЬШЩ[\љ[ЛќЪЩ[џXВ€Y€
+ШЩ[\љ[Л›ЩHOOH[™Yљ[™Y
+HXY\њЦЙШЫЫќ[ќ]\IЧHH	Ш\XШ][Ы‹ЪњЫЫ‰ОВ€ЫЫњЭ™\ЬЫњЩHH]ШZ]™]Ъ[\
+	Ш\ЩU\›IЬШЩ[\љ[Лњ]XЫY]Щ€ШЩ[\љ[Л›Y]ЩXY\њЛ›ЩN€ШЩ[\љ[Л›ЩHOOH[™Yљ[™YИ[™Yљ[™Y€”УУ‹њЭљ[™ЪYћJШЩ[\љ[Л›ЩJ_JNВ€ЫЫњЭ^H]ШZ]™\ЬЫњЩKќ^
+
+NВ€ЫЫњЭ™\Э[HЬЭ]\О€™\ЬЫњЩKњЭ]\Л›ЩN€^И”УУ‹њ\њЩJ^
+H€ќ[NВ€Y€
+ШЩ[\љ[ЛШ\\™RXY\њКHВ€™\Э[љXY\њИHВ€]YО€™\ЬЫњЩKљXY\њЛ™Щ]
+	Щ]YЙКK€ШXЪPЫЫќ›Ы€™\ЬЫњЩKљXY\њЛ™Щ]
+	ШШXЪKXЫЫќ›Ы	КK€\ћN€™\ЬЫњЩKљXY\њЛ™Щ]
+	Э\ћIКB€NВ€ЫЫњЭ™]ћPYќ\€H™\ЬЫњЩKљXY\њЛ™Щ]
+	Ь™]ћKXYќ\‰КNВ€Y€
+™]ћPYќ\€OOHќ[
+H™\Э[љXY\њЛњ™]ћPYќ\€H™]ћPYќ\ЋВ€B€™]\›€™\Э[ВџB‚™ќ[Э[Ы€\њЩT™]ћPYќ\“\К[YK›ЭУ\ИH]K››ЭК
+JHВ€Y€
+[YHOOHќ[[YHOOH[™Yљ[™YЭљ[™К[YJKќљ[J
+HOOH	ЙКH™]\›€ќ[В€ЫЫњЭ]ИHЭљ[™К[YJKќљ[J
+NВ€][^S\ОВ€Y€
+Ч—
+ЙЛќ\Э
+]КJH[^S\ИHќ[X™\Љ]КH
+€LВ€[ЩHВ€ЫЫњЭ]H]Kњ\њЩJ]КNВ€Y€
+Sќ[X™\‹љ\Сљ[љ]J]
+JH™]\›€ќ[В€[^S\ИH]H›ЭУ\ОВ€B€Y€
+Sќ[X™\‹љ\Сљ[љ]J[^S\КJH™]\›€ќ[В€™]\›€X]›Z[ЉЊМX]›X^
+WМX]ЩZ[
+[^S\КJJNВџB‚™ќ[Э[Ы€^Ы™[ќX[XЪЫЩ™“\К™]ћR[™^[™ЫHHX]њ[™ЫJHВ€ЫЫњЭ\ЩHHX]›Z[ЉММL
+€€
+Љ€™]ћR[™^
+NВ€ЫЫњЭљ]\€HЌH
+ИX]›Z[ЉKX]›X^
+ќ[X™\Љ[™ЫJ
+JJJNВ€™]\›€X]›Z[ЉММX]›X^
+LX]њ›Э[™
+\ЩH
+€љ]\ЉJJNВџB‚\Ю[Иќ[Э[Ы€™]ЪљYTЭ]UЪ]™]ћJЬ[ЫњКHВ€ЫЫњЭВ€\ЩU\›€ЪЩ[‹€]YЛ€™]Ъ[\H™]Ъ€ЫY\H[^HO€™]И›ЫZ\ЩJ™\ЫЫ™HO€Щ][Y[Э]
+™\ЫЫ™K[^JJK€[™ЫHHX]њ[™ЫK€›ЭИH]K››ЭЛ€\Хљ\ЪX›HH
+
+HO€ќYK€X^][\ИH€HHЬ[ЫњОВ€ЫЫњЭ][\ИHЧNВ€Y€
+Z\Хљ\ЪX›J
+JH™]\›€Ь™\Э[€ќ[][\ЛЭЬY€	ЪY[‰ЯNВ€›Ь€
+][™^HИ[™^X^][\ОИ[™^
+ПHJHВ€Y€
+Z\Хљ\ЪX›J
+JH™]\›€Ь™\Э[€ќ[][\ЛЭЬY€	ЪY[‰ЯNВ€]™\Э[В€ћHВ€™\Э[H]ШZ]™\]Y\ЭњЫЫЉ\ЩU\›В€Y]Щ€	ССU	Л]€ЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYXЪЩ[‹€XY\њО€]YИИЙТY‹S›Ы™KSX]Ъ	О€]YЯH€ЯKШ\\™RXY\њО€ќYB€K™]Ъ[\
+NВ€HШ]Ъ
+\њ›ЬЉHВ€™\Э[HЬЭ]\О€›ЩN€ќ[XY\њО€Ь™]ћPYќ\Ћ€ќ[K\њ›ЬЋ€\њ›Ь‹›Y\ЬШYЩ_NВ€B€ЫЫњЭ][\HЬЭ]\О€™\Э[њЭ]\Л[^S\О€ќ[NВ€][\Лњ\Ъ
+][\
+NВ€Y€
+™\Э[њЭ]\ИOOHЊ™\Э[њЭ]\ИOOHМ
+H™]\›€Ь™\Э[][\ЛЭЬY€	ЬЭXШЩ\ЬЙЯNВ€Y€
+НKЛKљ[ЫY\К™\Э[њЭ]\КJH™]\›€Ь™\Э[][\ЛЭЬY€	ШXШЩ\ЬЙЯNВ€Y€
+VМЋKLL‹LЛLKљ[ЫY\К™\Э[њЭ]\КJH™]\›€Ь™\Э[][\ЛЭЬY€	Ы›Ы—Ь™]ћXX›IЯNВ€Y€
+[™^OOHX^][\ИHJH™]\›€Ь™\Э[][\ЛЭЬY€	Щ^]\ЭY	ЯNВ€][\™[^S\ИH\њЩT™]ћPYќ\“\К™\Э[љXY\њПЛњ™]ћPYќ\‹›ЭК
+JHПИ^Ы™[ќX[XЪЫЩ™“\К[™^[™ЫJNВ€]ШZ]ЫY\
+][\™[^S\КNВ€B€™]\›€Ь™\Э[€ќ[][\ЛЭЬY€	Щ^]\ЭY	ЯNВџB‚ЫЫњЭ’QWФХUWС’QSИHШљ™XЭ™њ™Y^™JЙЪY	Л	ЬЭ]\ЙЛ	Ь™]љ\Ъ[Ы‰Л	ЭљY]Щ\”›ЫIЛ	Ы™^XЭ[Ы‰Л	Э\]Y]	ЧJNВ‚™ќ[Э[Ы€љYTЭ]Qљ[™Щ\њљ[ќ
+[YJHВ€™]\›€”УУ‹њЭљ[™ЪYћJШљ™XЭ™њ›ЫQ[ќљY\К’QWФХUWС’QSЛ›X\
+љY[O€ЩљY[[YVЩљY[WJJJNВџB‚™ќ[Э[Ы€Y\™ЩTљYTЭ]U\]JЭ\њ™[ќ[ЫЫZ[™ЛЫЭ\ЩHH	Ы›ЭYљXШ][Ы‰КHВ€ЫЫњЭ[YЫЭ\ЩHHЫЭ\ЩHOOH	Ы›ЭYљXШ][Ы‰ИЫЭ\ЩHOOH	Ь™XЫЭ™\ћIОВ€ЫЫњЭ[YЪ\HH[ЫЫZ[™И	‰€\[Щ€[ЫЫZ[™ИOOH	ЫШљ™XЭ	И	‰‚€\[Щ€[ЫЫZ[™ЛљYOOH	ЬЭљ[™ЙИ	‰€[ЫЫZ[™ЛљY›[™Э€	‰‚€\[Щ€[ЫЫZ[™ЛњЭ]\ИOOH	ЬЭљ[™ЙИ	‰€[ЫЫZ[™ЛњЭ]\Л›[™Э€	‰‚€ќ[X™\‹љ\Т[ќYЩ\Љ[ЫЫZ[™Лњ™]љ\Ъ[ЫЉH	‰€[ЫЫZ[™Лњ™]љ\Ъ[Ы€€	‰‚€ЙЬ\ЬЩ[™Щ\‰Л	Щљ]™\‰ЧKљ[ЫY\К[ЫЫZ[™ЛќљY]Щ\”›ЫJH	‰‚€\[Щ€[ЫЫZ[™Л›™^XЭ[Ы€OOH	ЬЭљ[™ЙИ	‰€[ЫЫZ[™Л›™^XЭ[Ы‹›[™Э€	‰‚€\[Щ€[ЫЫZ[™Лќ\]Y]OOH	ЬЭљ[™ЙИ	‰€ќ[X™\‹љ\Сљ[љ]J]Kњ\њЩJ[ЫЫZ[™Лќ\]Y]
+JNВ€Y€
+][YЫЭ\ЩH][YЪ\JHВ€™]\›€ЬЭ]N€Э\њ™[ќ\YY€[ЩK™X\ЫЫЋ€	Ъ[ќ[YЭ\]IЛ™YYФ™XЫЭ™\ћN€ќY_NВ€B€Y€
+XЭ\њ™[ќ
+HВ€Y€
+ЫЭ\ЩHOOH	Ь™XЫЭ™\ћIКH™]\›€ЬЭ]N€ќ[\YY€[ЩK™X\ЫЫЋ€	ЫZ\ЬЪ[™ЧШ\Щ[[™IЛ™YYФ™XЫЭ™\ћN€ќY_NВ€™]\›€ЬЭ]N€ЭќXЭ\™YЫЫ™J[ЫЫZ[™КK\YY€ќYK™X\ЫЫЋ€	Ш\Щ[[™IЛ™YYФ™XЫЭ™\ћN€[Щ_NВ€B€Y€
+[ЫЫZ[™ЛљYOOHЭ\њ™[ќљY[ЫЫZ[™ЛќљY]Щ\”›ЫHOOHЭ\њ™[ќќљY]Щ\”›ЫJHВ€™]\›€ЬЭ]N€Э\њ™[ќ\YY€[ЩK™X\ЫЫЋ€	ЬШЫЬWЫZ\ЫX]Ъ	Л™YYФ™XЫЭ™\ћN€[Щ_NВ€B€Y€
+[ЫЫZ[™Лњ™]љ\Ъ[Ы€Э\њ™[ќњ™]љ\Ъ[ЫЉHВ€™]\›€ЬЭ]N€Э\њ™[ќ\YY€[ЩK™X\ЫЫЋ€	ЬЭ[IЛ™YYФ™XЫЭ™\ћN€[Щ_NВ€B€Y€
+[ЫЫZ[™Лњ™]љ\Ъ[Ы€OOHЭ\њ™[ќњ™]љ\Ъ[ЫЉHВ€Y€
+љYTЭ]Qљ[™Щ\њљ[ќ
+[ЫЫZ[™КHOOHљYTЭ]Qљ[™Щ\њљ[ќ
+Э\њ™[ќ
+JHВ€™]\›€ЬЭ]N€Э\њ™[ќ\YY€[ЩK™X\ЫЫЋ€	Щ\XШ]IЛ™YYФ™XЫЭ™\ћN€[Щ_NВ€B€™]\›€ЬЭ]N€Э\њ™[ќ\YY€[ЩK™X\ЫЫЋ€	ЬШ[YWЬ™]љ\Ъ[Ы—ШЫЫ™›XЭ	Л™YYФ™XЫЭ™\ћN€ќY_NВ€B€Y€
+ЫЭ\ЩHOOH	Ы›ЭYљXШ][Ы‰И	‰€[ЫЫZ[™Лњ™]љ\Ъ[Ы€OOHЭ\њ™[ќњ™]љ\Ъ[Ы€
+ИJHВ€™]\›€ЬЭ]N€Э\њ™[ќ\YY€[ЩK™X\ЫЫЋ€	Ь™]љ\Ъ[Ы—ЩШ\	Л™YYФ™XЫЭ™\ћN€ќY_NВ€B€™]\›€ЬЭ]N€ЭќXЭ\™YЫЫ™J[ЫЫZ[™КK\YY€ќYK™X\ЫЫЋ€ЫЭ\ЩK™YYФ™XЫЭ™\ћN€[Щ_NВџB‚ЫЫњЭ’QWУ“ХQ’PРUSУ—С’QSИHШљ™XЭ™њ™Y^™JЙЭ\IЛ	ЬљYRY	Л	Ь™]љ\Ъ[Ы‰ЧJNВЫЫњЭ’QWУ“ХQ’PРUSУ—ХTTИH™]ИЩ]
+ЙЬљYKЪ[™ЩY	Л	ЬљYKXШЩ\ЬЧШЪ[™ЩY	ЧJNВ‚™ќ[Э[Ы€\њЩTљYS›ЭYљXШ][Ы’[ќ
+[YJHВ€Y€
+][YH\[Щ€[YHOOH	ЫШљ™XЭ	И\њ^Kљ\Р\њ^J[YJJH™]\›€ќ[В€ЫЫњЭЩ^\ИHШљ™XЭљЩ^\К[YJNВ€Y€
+Щ^\Л›[™ЭOOH’QWУ“ХQ’PРUSУ—С’QSЛ›[™ЭЩ^\ЛњЫЫYJЩ^HO€T’QWУ“ХQ’PРUSУ—С’QSЛљ[ЫY\КЩ^JJJH™]\›€ќ[В€Y€
+T’QWУ“ХQ’PРUSУ—ХTTЛљ\К[YKќ\JH\[Щ€[YKњљYRYOOH	ЬЭљ[™ЙИ][YKњљYRY€Sќ[X™\‹љ\Т[ќYЩ\Љ[YKњ™]љ\Ъ[ЫЉH[YKњ™]љ\Ъ[Ы€JH™]\›€ќ[В€™]\›€Шљ™XЭ™њ™Y^™JЭ\N€[YKќ\KљYRY€[YKњљYRY™]љ\Ъ[ЫЋ€[YKњ™]љ\Ъ[ЫџJNВџB‚\Ю[Иќ[Э[Ы€[™TљYS›ЭYљXШ][Ы’[ќ
+Ь[ЫњКHВ€ЫЫњЭШЭ\њ™[ќ[ќ€]Т[ќ™XЫЭ™\‹^XЭYљYRY^XЭYљY]Щ\”›Ы_HHЬ[ЫњОВ€ЫЫњЭ[ќH\њЩTљYS›ЭYљXШ][Ы’[ќ
+]Т[ќ
+NВ€Y€
+Z[ќ
+H™]\›€ЬЭ]N€Э\њ™[ќ™]ЪY€[ЩK\YY€[ЩK™X\ЫЫЋ€	Ъ[ќ[YЪ[ќ	Л™YYФ™XЫЭ™\ћN€[Щ_NВ€ЫЫњЭШЫЬYљYRYHЭ\њ™[ќЛљYПИ^XЭYљYRYВ€ЫЫњЭШЫЬY›ЫHHЭ\њ™[ќЛќљY]Щ\”›ЫHПИ^XЭYљY]Щ\”›ЫNВ€Y€
+\ШЫЬYљYRY[ќњљYRYOOHШЫЬYљYRY
+HВ€™]\›€ЬЭ]N€Э\њ™[ќ™]ЪY€[ЩK\YY€[ЩK™X\ЫЫЋ€	Щ›Ь™ZYЫ—Ъ[ќ	Л™YYФ™XЫЭ™\ћN€[Щ_NВ€B€Y€
+Э\њ™[ќ	‰€[ќњ™]љ\Ъ[Ы€HЭ\њ™[ќњ™]љ\Ъ[ЫЉHВ€™]\›€ЬЭ]N€Э\њ™[ќ™]ЪY€[ЩK\YY€[ЩK™X\ЫЫЋ€	ЬЭ[WЫЬ—Щ\XШ]WЪ[ќ	Л™YYФ™XЫЭ™\ћN€[Щ_NВ€B€ЫЫњЭ™\ЬЫњЩHH]ШZ]™XЫЭ™\ЉЬљYRY€[ќњљYRY™]љ\Ъ[ЫЋ€[ќњ™]љ\Ъ[Ы‹\N€[ќќ\_JNВ€Y€
+НKЛKљ[ЫY\К™\ЬЫњЩOЛњЭ]\КJHВ€™]\›€ЬЭ]N€ќ[™]ЪY€ќYK\YY€[ЩK™X\ЫЫЋ€	ШXШЩ\ЬЧЫЬЭ	Л™YYФ™XЫЭ™\ћN€[Щ_NВ€B€Y€
+™\ЬЫњЩOЛњЭ]\ИOOHМ
+HВ€™]\›€ЬЭ]N€Э\њ™[ќ™]ЪY€ќYK\YY€[ЩK™X\ЫЫЋ€	Ъ[ќЫ›ЭЮY]Эљ\ЪX›IЛ™YYФ™XЫЭ™\ћN€ќY_NВ€B€Y€
+™\ЬЫњЩOЛњЭ]\ИOOHЊ\™\ЬЫњЩK›ЩJHВ€™]\›€ЬЭ]N€Э\њ™[ќ™]ЪY€ќYK\YY€[ЩK™X\ЫЫЋ€	Ь™XЫЭ™\ћWЩZ[Y	Л™YYФ™XЫЭ™\ћN€ќY_NВ€B€Y€
+™\ЬЫњЩK›ЩKљYOOHШЫЬYљYRY
+ШЫЬY›ЫH	‰€™\ЬЫњЩK›ЩKќљY]Щ\”›ЫHOOHШЫЬY›ЫJJHВ€™]\›€ЬЭ]N€Э\њ™[ќ™]ЪY€ќYK\YY€[ЩK™X\ЫЫЋ€	Ь™XЫЭ™\ћWЬШЫЬWЫZ\ЫX]Ъ	Л™YYФ™XЫЭ™\ћN€[Щ_NВ€B€ЫЫњЭY\™ЩYHY\™ЩTљYTЭ]U\]JЭ\њ™[ќ™\ЬЫњЩK›ЩK	Ь™XЫЭ™\ћIКNВ€™]\›€Л‹‹›Y\™ЩY™]ЪY€ќY_NВџB‚™ќ[Э[Ы€Ь™X]TљYTЩ\ЬЪ[ЫђЫY[ќ
+[љ]X[љ[™[™ИHќ[
+HВ€ЫЫњЭ›Ь›X[^™Pљ[™[™ИH[YHO€В€Y€
+][YH\[Щ€[YKњЩ\ЬЪ[Ы’YOOH	ЬЭљ[™ЙИ][YKњЩ\ЬЪ[Ы’Y€VЙЬ\ЬЩ[™Щ\‰Л	Щљ]™\‰ЧKљ[ЫY\К[YKќљY]Щ\”›ЫJH\[Щ€[YKњљYRYOOH	ЬЭљ[™ЙИ][YKњљYRY
+H™]\›€ќ[В€™]\›€Шљ™XЭ™њ™Y^™JЬЩ\ЬЪ[Ы’Y€[YKњЩ\ЬЪ[Ы’YљY]Щ\”›ЫN€[YKќљY]Щ\”›ЫKљYRY€[YKњљYRYJNВ€NВ€]љ[™[™ИH›Ь›X[^™Pљ[™[™К[љ]X[љ[™[™КNВ€]Щ[™\][Ы€HNВ€]Э]HHќ[В€]]YИHќ[В€]™]ћPШ[Щ[Hќ[В€ЫЫњЭ[™›YЪH™]ИЩ]
+
+NВ‚€ЫЫњЭЫX\”™]ћHH
+
+HO€В€Y€
+\™]ћPШ[Щ[
+H™]\›ЋВ€ЫЫњЭШ[Щ[H™]ћPШ[Щ[В€™]ћPШ[Щ[Hќ[В€Ш[Щ[
+
+NВ€NВ€ЫЫњЭ™\Щ]Щ\ЬЪ[Ы€H™^љ[™[™ИO€В€Щ[™\][Ы€
+ПHNВ€›Ь€
+ЫЫњЭ[™HЩ€[™›YЪ
+H[™KЫЫќ›Ы\‹X›Ьќ
+
+NВ€[™›YЪЫX\Љ
+NВ€ЫX\”™]ћJ
+NВ€Э]HHќ[В€]YИHќ[В€љ[™[™ИH›Ь›X[^™Pљ[™[™К™^љ[™[™КNВ€™]\›€Ы\ЪЭ
+
+NВ€NВ€ЫЫњЭЫ\ЪЭH
+
+HO€
+В€XЭ]™N€›ЫЫX[Љљ[™[™КK€љY]Щ\”›ЫN€љ[™[™ПЛќљY]Щ\”›ЫHПИќ[€љYRY€љ[™[™ПЛњљYRYПИќ[€Э]N€Э]HИЭќXЭ\™YЫЫ™JЭ]JH€ќ[€]YЛ€Щ[™\][Ы‹€[‘›YЪ€[™›YЪњЪ^™K€™]ћTШЪY[Y€›ЫЫX[Љ™]ћPШ[Щ[
+B€JNВ€ЫЫњЭЩ]ШXЪHH
+™^Э]K™^]YИHќ[
+HO€В€Y€
+Xљ[™[™И™^Э]OЛљYOOHљ[™[™ЛњљYRY™^Э]OЛќљY]Щ\”›ЫHOOHљ[™[™ЛќљY]Щ\”›ЫJH™]\›€[ЩNВ€Э]HHЭќXЭ\™YЫЫ™J™^Э]JNВ€]YИH\[Щ€™^]YИOOH	ЬЭљ[™ЙИИ™^]YИ€ќ[В€™]\›€ќYNВ€NВ€ЫЫњЭШЪY[T™]ћHHШ[Щ[O€В€Y€
+Xљ[™[™И\[Щ€Ш[Щ[OOH	Щќ[Э[Ы‰КH™]\›€[ЩNВ€ЫX\”™]ћJ
+NВ€™]ћPШ[Щ[HШ[Щ[В€™]\›€ќYNВ€NВ€ЫЫњЭЭ\ќ™XЫЭ™\ћHH
+
+HO€В€Y€
+Xљ[™[™КH™]\›€ќ[В€ЫЫњЭЫЫќ›Ы\€H™]ИX›ЬќЫЫќ›Ы\Љ
+NВ€ЫЫњЭ[™HHШљ™XЭ™њ™Y^™JШљ[™[™ЛЩ[™\][Ы‹ЫЫќ›Ы\‹ЪYЫ[€ЫЫќ›Ы\‹њЪYЫ[JNВ€[™›YЪY
+[™JNВ€™]\›€[™NВ€NВ€ЫЫњЭљ[љ\Ъ™XЫЭ™\ћHH
+[™K™\ЬЫњЩJHO€В€Y€
+Z[™JH™]\›€ЬЭ]K\YY€[ЩK™X\ЫЫЋ€	Ы›ЧЬЩ\ЬЪ[Ы‰ЯNВ€[™›YЪ™[]J[™JNВ€Y€
+[™KњЪYЫ[X›ЬќY[™K™Щ[™\][Ы€OOHЩ[™\][Ы€[™Kљ[™[™ИOOHљ[™[™КHВ€™]\›€ЬЭ]K\YY€[ЩK™X\ЫЫЋ€	ЬЭ[WЬЩ\ЬЪ[Ы‰ЯNВ€B€Y€
+НKЛKљ[ЫY\К™\ЬЫњЩOЛњЭ]\КJHВ€Э]HHќ[В€]YИHќ[В€ЫX\”™]ћJ
+NВ€™]\›€ЬЭ]K\YY€[ЩK™X\ЫЫЋ€	ШXШЩ\ЬЧЫЬЭ	ЯNВ€B€Y€
+™\ЬЫњЩOЛњЭ]\ИOOHМ
+H™]\›€ЬЭ]K\YY€[ЩK™X\ЫЫЋ€	Ы›ЭЫ[ЩYљYY	ЯNВ€Y€
+™\ЬЫњЩOЛњЭ]\ИOOHЊ\™\ЬЫњЩK›ЩJH™]\›€ЬЭ]K\YY€[ЩK™X\ЫЫЋ€	Ь™XЫЭ™\ћWЩZ[Y	ЯNВ€Y€
+™\ЬЫњЩK›ЩKљYOOHљ[™[™ЛњљYRY™\ЬЫњЩK›ЩKќљY]Щ\”›ЫHOOHљ[™[™ЛќљY]Щ\”›ЫJHВ€™]\›€ЬЭ]K\YY€[ЩK™X\ЫЫЋ€	ЬШЫЬWЫZ\ЫX]Ъ	ЯNВ€B€ЫЫњЭY\™ЩYHY\™ЩTљYTЭ]U\]JЭ]K™\ЬЫњЩK›ЩK	Ь™XЫЭ™\ћIКNВ€Y€
+Y\™ЩY\YY
+HВ€Э]HHЭќXЭ\™YЫЫ™JY\™ЩYњЭ]JNВ€]YИH\[Щ€™\ЬЫњЩKљXY\њПЛ™]YИOOH	ЬЭљ[™ЙИИ™\ЬЫњЩKљXY\њЛ™]YИ€ќ[В€B€™]\›€Л‹‹›Y\™ЩYЭ]_NВ€NВ€™]\›€ЬЫ\ЪЭ™\Щ]Щ\ЬЪ[Ы‹Щ]ШXЪKШЪY[T™]ћKЭ\ќ™XЫЭ™\ћKљ[љ\Ъ™XЫЭ™\ћ_NВџB‚™ќ[Э[Ы€Ь™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+[љ]X[љ[™[™ИHќ[
+HВ€ЫЫњЭ›Ь›X[^™Pљ[™[™ИH[YHO€В€Y€
+][YH\[Щ€[YKњЩ\ЬЪ[Ы’YOOH	ЬЭљ[™ЙИ][YKњЩ\ЬЪ[Ы’Y€\[Щ€[YKXШЫЭ[ќ™Y€OOH	ЬЭљ[™ЙИ][YKXШЫЭ[ќ™Y€€VЙЬ\ЬЩ[™Щ\‰Л	Щљ]™\‰ЧKљ[ЫY\К[YKќљY]Щ\”›ЫJJH™]\›€ќ[В€™]\›€Шљ™XЭ™њ™Y^™JЬЩ\ЬЪ[Ы’Y€[YKњЩ\ЬЪ[Ы’YXШЫЭ[ќ™YЋ€[YKXШЫЭ[ќ™Y‹љY]Щ\”›ЫN€[YKќљY]Щ\”›Ы_JNВ€NВ€]љ[™[™ИH›Ь›X[^™Pљ[™[™К[љ]X[љ[™[™КNВ€]Щ[™\][Ы€HNВ€ЫЫњЭ[™›YЪH™]ИЩ]
+
+NВ€ЫЫњЭЫ\ЪЭH
+
+HO€
+ШXЭ]™N€›ЫЫX[Љљ[™[™КKљY]Щ\”›ЫN€љ[™[™ПЛќљY]Щ\”›ЫHПИќ[Щ[™\][Ы‹[‘›YЪ€[™›YЪњЪ^™_JNВ€ЫЫњЭ™\Щ]Щ\ЬЪ[Ы€H™^љ[™[™ИO€В€Щ[™\][Ы€
+ПHNВ€›Ь€
+ЫЫњЭ[™HЩ€[™›YЪ
+H[™KЫЫќ›Ы\‹X›Ьќ
+
+NВ€[™›YЪЫX\Љ
+NВ€љ[™[™ИH›Ь›X[^™Pљ[™[™К™^љ[™[™КNВ€™]\›€Ы\ЪЭ
+
+NВ€NВ€ЫЫњЭЭ\ќЫЫ[X[™HЫЫ[X[™O€В€Y€
+Xљ[™[™ИXЫЫ[X[™\[Щ€ЫЫ[X[™XЭ[Ы€OOH	ЬЭљ[™ЙИXЫЫ[X[™XЭ[Ы€€\[Щ€ЫЫ[X[™љY[\Э[ЮRЩ^HOOH	ЬЭљ[™ЙИXЫЫ[X[™љY[\Э[ЮRЩ^JH™]\›€ќ[В€ЫЫњЭЫЫќ›Ы\€H™]ИX›ЬќЫЫќ›Ы\Љ
+NВ€ЫЫњЭ[™HHШљ™XЭ™њ™Y^™JВ€љ[™[™Л€Щ[™\][Ы‹€XЭ[ЫЋ€ЫЫ[X[™XЭ[Ы‹€Y[\Э[ЮRЩ^N€ЫЫ[X[™љY[\Э[ЮRЩ^K€ШЫЬYЩ^N€Y[\Э[ЮTШЫЬRЩ^Jљ[™[™ЛXШЫЭ[ќ™Y‹ЫЫ[X[™љY[\Э[ЮRЩ^JK€ЫЫќ›Ы\‹€ЪYЫ[€ЫЫќ›Ы\‹њЪYЫ[€JNВ€[™›YЪY
+[™JNВ€™]\›€[™NВ€NВ€ЫЫњЭљ[љ\ЪЫЫ[X[™H
+[™K™\ЬЫњЩJHO€В€Y€
+Z[™JH™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	Ы›ЧЬЩ\ЬЪ[Ы‰Л]]Ф™]ћN€[Щ_NВ€[™›YЪ™[]J[™JNВ€Y€
+[™KњЪYЫ[X›ЬќY[™K™Щ[™\][Ы€OOHЩ[™\][Ы€[™Kљ[™[™ИOOHљ[™[™КHВ€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЬЭ[WЬЩ\ЬЪ[Ы‰Л]]Ф™]ћN€[Щ_NВ€B€Y€
+МЊЊWKљ[ЫY\К™\ЬЫњЩOЛњЭ]\КJH™]\›€ШЫЫ[Z]Y€ќYK™X\ЫЫЋ€	ШЫЫ[Z]Y	Л]]Ф™]ћN€[Щ_NВ€Y€
+НKЧKљ[ЫY\К™\ЬЫњЩOЛњЭ]\КJHВ€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЬЩ\ЬЪ[Ы—Щ^\™Y	Л]]Ф™]ћN€[ЩK™YYФ™X]]€ќYK™YYФ™XЫЭ™\ћN€ќY_NВ€B€Y€
+™\ЬЫњЩOЛњЭ]\ИOOHH	‰€™\ЬЫњЩK›ЩOЛЫЩHOOH	ЬЭ[WЬ™]љ\Ъ[Ы‰КHВ€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЬЭ[WЬ™]љ\Ъ[Ы‰Л]]Ф™]ћN€[ЩK™YYФ™XЫЭ™\ћN€ќY_NВ€B€Y€
+МЋKLL‹LЛLKљ[ЫY\К™\ЬЫњЩOЛњЭ]\КJHВ€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЫЭ]ЫЫYWЭ[љЫ›ЭЫ‰Л]]Ф™]ћN€[ЩK™YYФ™XЫЭ™\ћN€ќYK™]\ЩTШ[YRЩ^N€ќY_NВ€B€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	Ь™Z™XЭY	Л]]Ф™]ћN€[ЩK™YYФ™XЫЭ™\ћN€[Щ_NВ€NВ€ЫЫњЭ™XЫЭ™\•[љЫ›ЭЫ“Э]ЫЫYHH\Ю[И
+[™KЬ[ЫњИHЯJHO€В€ЫЫњЭШ\Щ[[™T™]љ\Ъ[Ы‹™XЫЭ™\‹\Р\YY™\Щ[™HHЬ[ЫњОВ€ЫЫњЭ[™R\РЭ\њ™[ќH
+
+HO€›ЫЫX[Љ[™JH	‰€Z[™KњЪYЫ[X›ЬќY	‰‚€[™K™Щ[™\][Ы€OOHЩ[™\][Ы€	‰€[™Kљ[™[™ИOOHљ[™[™ОВ€Y€
+Z[™R\РЭ\њ™[ќ
+
+JH™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЬЭ[WЬЩ\ЬЪ[Ы‰Л™\Щ[ќ€[Щ_NВ€Y€
+Sќ[X™\‹љ\Т[ќYЩ\Љ\Щ[[™T™]љ\Ъ[ЫЉH\Щ[[™T™]љ\Ъ[Ы€H€\[Щ€™XЫЭ™\€OOH	Щќ[Э[Ы‰И\[Щ€\Р\YYOOH	Щќ[Э[Ы‰И\[Щ€™\Щ[™OOH	Щќ[Э[Ы‰КHВ€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	Ъ[ќ[YЬ™XЫЭ™\ћIЛ™\Щ[ќ€[Щ_NВ€B€ЫЫњЭЫЫќ›Ы\€H™]ИX›ЬќЫЫќ›Ы\Љ
+NВ€ЫЫњЭ™XЫЭ™\ћR[™HHШљ™XЭ™њ™Y^™JШљ[™[™О€[™Kљ[™[™ЛЩ[™\][ЫЋ€[™K™Щ[™\][Ы‹ЫЫќ›Ы\‹ЪYЫ[€ЫЫќ›Ы\‹њЪYЫ[JNВ€ЫЫњЭ™XЫЭ™\ћR\РЭ\њ™[ќH
+
+HO€\™XЫЭ™\ћR[™KњЪYЫ[X›ЬќY	‰‚€™XЫЭ™\ћR[™K™Щ[™\][Ы€OOHЩ[™\][Ы€	‰€™XЫЭ™\ћR[™Kљ[™[™ИOOHљ[™[™ОВ€[™›YЪY
+™XЫЭ™\ћR[™JNВ€ћHВ€]™XЫЭ™\™YВ€ћHВ€™XЫЭ™\™YH]ШZ]™XЫЭ™\ЉЬЪYЫ[€™XЫЭ™\ћR[™KњЪYЫ[JNВ€HШ]Ъ
+\њ›ЬЉHВ€™]\›€™XЫЭ™\ћR\РЭ\њ™[ќ
+
+B€ИШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	Ь™XЫЭ™\ћWЩZ[Y	Л™\Щ[ќ€[Щ_B€€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЬЭ[WЬЩ\ЬЪ[Ы‰Л™\Щ[ќ€[Щ_NВ€B€Y€
+\™XЫЭ™\ћR\РЭ\њ™[ќ
+
+JH™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЬЭ[WЬЩ\ЬЪ[Ы‰Л™\Щ[ќ€[Щ_NВ€Y€
+НKЛKљ[ЫY\К™XЫЭ™\™YЛњЭ]\КJHВ€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ШXШЩ\ЬЧЫЬЭ	Л™\Щ[ќ€[Щ_NВ€B€Y€
+™XЫЭ™\™YЛњЭ]\ИOOHЊSќ[X™\‹љ\Т[ќYЩ\Љ™XЫЭ™\™Y›ЩOЛњ™]љ\Ъ[ЫЉJHВ€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	Ь™XЫЭ™\ћWЭ[њ™\ЫЫ™Y	Л™\Щ[ќ€[Щ_NВ€B€Y€
+\Р\YY
+™XЫЭ™\™Y›ЩJJHВ€™]\›€ШЫЫ[Z]Y€ќYK™X\ЫЫЋ€	ШЫЫ™љ\›YYШћWЬ™XЫЭ™\ћIЛ™\Щ[ќ€[ЩKЭ]N€™XЫЭ™\™Y›Щ_NВ€B€Y€
+™XЫЭ™\™Y›ЩKњ™]љ\Ъ[Ы€OOH\Щ[[™T™]љ\Ъ[ЫЉHВ€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЬЭ]WШЪ[™ЩY	Л™\Щ[ќ€[ЩKЭ]N€™XЫЭ™\™Y›Щ_NВ€B€]™\^NВ€ћHВ€™\^HH]ШZ]™\Щ[™
+В€XЭ[ЫЋ€[™KXЭ[Ы‹€Y[\Э[ЮRЩ^N€[™KљY[\Э[ЮRЩ^K€ШЫЬYЩ^N€[™KњШЫЬYЩ^K€ЪYЫ[€™XЫЭ™\ћR[™KњЪYЫ[€JNВ€HШ]Ъ
+\њ›ЬЉHВ€™]\›€™XЫЭ™\ћR\РЭ\њ™[ќ
+
+B€ИШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	Ь™\^WЫЭ]ЫЫYWЭ[љЫ›ЭЫ‰Л™\Щ[ќ€ќY_B€€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЬЭ[WЬЩ\ЬЪ[Ы‰Л™\Щ[ќ€ќY_NВ€B€Y€
+\™XЫЭ™\ћR\РЭ\њ™[ќ
+
+JH™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	ЬЭ[WЬЩ\ЬЪ[Ы‰Л™\Щ[ќ€ќY_NВ€Y€
+МЊЊWKљ[ЫY\К™\^OЛњЭ]\КJHВ€™]\›€ШЫЫ[Z]Y€ќYK™X\ЫЫЋ€	ШЫЫ[Z]YШћWЬ™\^IЛ™\Щ[ќ€ќYK™\ЬЫњЩN€™\^K›ЩHПИќ[NВ€B€™]\›€ШЫЫ[Z]Y€[ЩK™X\ЫЫЋ€	Ь™\^WЭ[њ™\ЫЫ™Y	Л™\Щ[ќ€ќYK™\ЬЫњЩN€™\^OЛ›ЩHПИќ[NВ€Hљ[[HВ€[™›YЪ™[]J™XЫЭ™\ћR[™JNВ€B€NВ€™]\›€ЬЫ\ЪЭ™\Щ]Щ\ЬЪ[Ы‹Э\ќЫЫ[X[™љ[љ\ЪЫЫ[X[™™XЫЭ™\•[љЫ›ЭЫ“Э]ЫЫY_NВџB‚\Ю[Иќ[Э[Ы€ќ[’ЫЫќXЭ
+\ЩU\›ЪЩ[њИH’VT‘KќЪЩ[њЛ™]Ъ[\H™]Ъ
+HВ€ЫЫњЭ™\Э[ИHЧNВ€›Ь€
+ЫЫњЭШЩ[\љ[ИЩ€ШЩ[\љ[ЬКЪЩ[њКJHВ€ЫЫњЭXЭX[H]ШZ]™\]Y\ЭњЫЫЉ\ЩU\›ШЩ[\љ[Л™]Ъ[\
+NВ€ЫЫњЭЩ^XЭYЭ]\Л^XЭYЫЩWHHШЩ[\љ[Л™^XЭYВ€Y€
+XЭX[њЭ]\ИOOH^XЭYЭ]\КH›ЭИ™]И\њ›ЬЉ	ЬШЩ[\љ[Л›[Y_N€^XЭY	Щ^XЭYЭ]\ЯK™XЩZ]™Y	ШXЭX[њЭ]\ЯX
+NВ€Y€
+^XЭYЫЩH	‰€XЭX[›ЩOЛЫЩHOOH^XЭYЫЩJH›ЭИ™]И\њ›ЬЉ	ЬШЩ[\љ[Л›[Y_N€^XЭY	Щ^XЭYЫЩ_K™XЩZ]™Y	ШXЭX[›ЩOЛЫЩH	Ы›ИЫЩIЯX
+NВ€Y€
+XЭX[њЭ]\ИЏH	‰€
+XXЭX[›ЩOЛ›Y\ЬШYЩHXXЭX[›ЩOЛњ™\]Y\ЭY
+JH›ЭИ™]И\њ›ЬЉ	ЬШЩ[\љ[Л›[Y_N€[њШY™HЬ€[ЫЫ\]H\њ›Ь€[ќ™[ЬX
+NВ€Y€
+ШЩ[\љ[ЛЫЫЩX[Y	‰€”УУ‹њЭљ[™ЪYћJXЭX[›ЩJKљ[ЫY\К	Ь\ЬЩ[™Щ\‹[ЭЫ™\‰КJH›ЭИ™]И\њ›ЬЉ	ЬШЩ[\љ[Л›[Y_N€ЫЫЩX[YЭЫ™\€Y[ќ]HXZЩY
+NВ€™\Э[Лњ\Ъ
+Ы[YN€ШЩ[\љ[Л›[YKЭ]\О€XЭX[њЭ]\ЛЫЩN€XЭX[›ЩOЛЫЩHќ[JNВ€B€™]\›€™\Э[ОВџB‚\Ю[Иќ[Э[Ы€Э\ќ[ШЪФЩ\ќ™\ЉЬ[ЫњИHЯJHВ€ЫЫњЭЭ]HHЬ™X]S[ШЪФЭ]JЬ[ЫњКNВ€ЫЫњЭЩ\ќ™\€HЬ™X]TЩ\ќ™\ЉЬ™X]S[ШЪТ[™\ЉЭ]JJNВ€]ШZ]™]И›ЫZ\ЩJ
+™\ЫЫ™K™Z™XЭ
+HO€В€Щ\ќ™\‹›ЫЩJ	Щ\њ›Ь‰Л™Z™XЭ
+NВ€Щ\ќ™\‹›\Э[Љ	МLЌЛЊЊЊIЛ™\ЫЫ™JNВ€JNВ€ЫЫњЭY™\ЬИHЩ\ќ™\‹Y™\ЬК
+NВ€™]\›€В€\ЩU\›€‹ЛМLЌЛЊЊЊN‰ШY™\ЬЛњЬќX€Э]K€ЫЬЩN€
+
+HO€™]И›ЫZ\ЩJ™\ЫЫ™HO€Щ\ќ™\‹ЫЬЩJ™\ЫЫ™JJB€NВџB‚\Ю[Иќ[Э[Ы€ќ[ђЭ\њ™[ќљYQ\ШЫЭ™\ћPЫЫќXЭ
+
+HВ€ЫЫњЭ\ЬЪYЫ™YH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉЬљYTЭ]\О€	Ш\ЬЪYЫ™Y	Л\ЬЪYЫ™Yљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	ЯJNВ€ЫЫњЭЫЫ\]YH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉЬљYTЭ]\О€	ШЫЫ\]Y	Л\ЬЪYЫ™Yљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	ЯJNВ€ЫЫњЭШ[Щ[YH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉЬљYTЭ]\О€	ШШ[Щ[Y	Л\ЬЪYЫ™Yљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	ЯJNВ€ЫЫњЭ[XљYЭ[Э\ИH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉЬљYTЭ]\О€	Ш\ЬЪYЫ™Y	Л\ЬЪYЫ™Yљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	Л\XШ]PЭ\њ™[ќ›ЬЋ€	Ь\ЬЩ[™Щ\‹[ЭЫ™\‰ЯJNВ€ЫЫњЭ™XYH
+\ЩU\›ЪЩ[‹]H	ЛЭЊKЬљY\ЛШЭ\њ™[ќ	КHO€™\]Y\ЭњЫЫЉ\ЩU\›В€Y]Щ€	ССU	Л]ЪЩ[‹Ш\\™RXY\њО€ќYB€K™]Ъ
+NВ€ћHВ€ЫЫњЭ™Y›Ь™HHВ€™]љ\Ъ[ЫЋ€\ЬЪYЫ™YњЭ]KњљYKњ™]љ\Ъ[Ы‹€Y[\Э[ЮN€\ЬЪYЫ™YњЭ]KљY[\Э[ЮKњЪ^™K€]Y]€\ЬЪYЫ™YњЭ]K]Y]]™[ќЛ›[™Э€NВ€ЫЫњЭЬ\ЬЩ[™Щ\‹љ]™\‹Э\”\ЬЩ[™Щ\‹Э\‘љ]™\‹[]][ќXШ]Y[љ™XЭYYЫЫ\]Y\ЬЩ[™Щ\‹ЫЫ\]Yљ]™\‹Ш[Щ[Y\ЬЩ[™Щ\‹Ш[Щ[Yљ]™\‹][\WHH]ШZ]›ЫZ\ЩK[
+В€™XY
+\ЬЪYЫ™Y\ЩU\›’VT‘KќЪЩ[њЛ›ЭЫ™\ЉK€™XY
+\ЬЪYЫ™Y\ЩU\›’VT‘KќЪЩ[њЛ\ЬЪYЫ™Yљ]™\ЉK€™XY
+\ЬЪYЫ™Y\ЩU\›’VT‘KќЪЩ[њЛ›Э\”\ЬЩ[™Щ\ЉK€™XY
+\ЬЪYЫ™Y\ЩU\›’VT‘KќЪЩ[њЛ›Э\‘љ]™\ЉK€™XY
+\ЬЪYЫ™Y\ЩU\›
+K€™XY
+\ЬЪYЫ™Y\ЩU\›’VT‘KќЪЩ[њЛ›ЭЫ™\‹ЭЊKЬљY\ЛШЭ\њ™[ќЬ™\]Y\ЭYIС’VT‘Kњ™\]Y\ЭYX
+K€™XY
+ЫЫ\]Y\ЩU\›’VT‘KќЪЩ[њЛ›ЭЫ™\ЉK€™XY
+ЫЫ\]Y\ЩU\›’VT‘KќЪЩ[њЛ\ЬЪYЫ™Yљ]™\ЉK€™XY
+Ш[Щ[Y\ЩU\›’VT‘KќЪЩ[њЛ›ЭЫ™\ЉK€™XY
+Ш[Щ[Y\ЩU\›’VT‘KќЪЩ[њЛ\ЬЪYЫ™Yљ]™\ЉK€™XY
+[XљYЭ[Э\Л\ЩU\›’VT‘KќЪЩ[њЛ›ЭЫ™\ЉB€JNВ€ЫЫњЭYќ\€HВ€™]љ\Ъ[ЫЋ€\ЬЪYЫ™YњЭ]KњљYKњ™]љ\Ъ[Ы‹€Y[\Э[ЮN€\ЬЪYЫ™YњЭ]KљY[\Э[ЮKњЪ^™K€]Y]€\ЬЪYЫ™YњЭ]K]Y]]™[ќЛ›[™Э€NВ€Y€
+\ЬЩ[™Щ\‹њЭ]\ИOOHЊ\ЬЩ[™Щ\‹›ЩOЛќљY]Щ\”›ЫHOOH	Ь\ЬЩ[™Щ\‰КH›ЭИ™]И\њ›ЬЉ	ЫЭЫљ[™И\ЬЩ[™Щ\€ЫЭ[›Э\ШЫЭ™\€HЭ\њ™[ќљYIКNВ€Y€
+љ]™\‹њЭ]\ИOOHЊљ]™\‹›ЩOЛќљY]Щ\”›ЫHOOH	Щљ]™\‰КH›ЭИ™]И\њ›ЬЉ	Ш\ЬЪYЫ™Yљ]™\€ЫЭ[›Э\ШЫЭ™\€HЭ\њ™[ќљYIКNВ€Y€
+ЫЭ\”\ЬЩ[™Щ\‹Э\‘љ]™\—KњЫЫYJ™\Э[O€™\Э[њЭ]\ИOOHЊ™\Э[›ЩHOOHќ[
+JH›ЭИ™]И\њ›ЬЉ	Э[њ™[]YXЭЬ€X\›™Y][›Э\€Э\њ™[ќљYH^\ЭЙКNВ€Y€
+[]][ќXШ]YњЭ]\ИOOHJH›ЭИ™]И\њ›ЬЉ	Э[]][ќXШ]YЭ\њ™[ќ\љYH\ШЫЭ™\ћHШ\И›Э™Z™XЭY	КNВ€Y€
+[љ™XЭYYњЭ]\ИOOHЊ€[љ™XЭYY›ЩOЛЫЩHOOH	Ъ[ќ[YЬ™\]Y\Э	КH›ЭИ™]И\њ›ЬЉ	ШЭ\њ™[ќ\љYH\ШЫЭ™\ћHXШЩ\YHШ[\‹\Э\YYљYHY[ќYљY\‰КNВ€Y€
+ШЫЫ\]Y\ЬЩ[™Щ\‹ЫЫ\]Yљ]™\‹Ш[Щ[Y\ЬЩ[™Щ\‹Ш[Щ[Yљ]™\—KњЫЫYJ™\Э[O€™\Э[њЭ]\ИOOHЊ™\Э[›ЩHOOHќ[
+JH›ЭИ™]И\њ›ЬЉ	Э\›Z[[љYHШ\И™]\›™Y\ИЭ\њ™[ќ	КNВ€Y€
+][\KњЭ]\ИOOHH][\K›ЩOЛЫЩHOOH	Ш[XљYЭ[Э\ЧШЭ\њ™[ќЬљYIКH›ЭИ™]И\њ›ЬЉ	Ш[XљYЭ[Э\ИЭ\њ™[ќљY\ИЩ\™H›ЭЭЬYШY™[IКNВ€Y€
+”УУ‹њЭљ[™ЪYћJ][\K›ЩJKљ[ЫY\К	ЬљYKY\XШ]KYљ^\™IКJH›ЭИ™]И\њ›ЬЉ	Ш[XљYЭ[Э\ИЭ\њ™[ќ\љYH\њ›Ь€XZЩYHШ[™Y]HY[ќYљY\‰КNВ€Y€
+”УУ‹њЭљ[™ЪYћJ™Y›Ь™JHOOH”УУ‹њЭљ[™ЪYћJYќ\ЉJH›ЭИ™]И\њ›ЬЉ	ШЭ\њ™[ќ\љYH\ШЫЭ™\ћHЪ[™ЩYќ\Ъ[™\ЬИЭ]IКNВ€™]\›€Ь\ЬЩ[™Щ\‹љ]™\‹Э\”\ЬЩ[™Щ\‹Э\‘љ]™\‹[]][ќXШ]Y[љ™XЭYYЫЫ\]Y\ЬЩ[™Щ\‹ЫЫ\]Yљ]™\‹Ш[Щ[Y\ЬЩ[™Щ\‹Ш[Щ[Yљ]™\‹][\K™Y›Ь™KYќ\џNВ€Hљ[[HВ€]ШZ]›ЫZ\ЩK[
+Ш\ЬЪYЫ™YЫЬЩJ
+KЫЫ\]YЫЬЩJ
+KШ[Щ[YЫЬЩJ
+K[XљYЭ[Э\ЛЫЬЩJ
+WJNВ€BџB‚\Ю[Иќ[Э[Ы€Щ[XЭЫ‘њ™\Ъ[ШЪКЬ[ЫњЛЭY™љ^›ЩHHЩ^XЭY™\]Y\Э™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[ЫџJHВ€ЫЫњЭ[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉЬ[ЫњКNВ€ћHВ€ЫЫњЭ™\Э[H]ШZ]™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›В€Y]Щ€	ФФХ	Л€]€ЭЊKЫЩ™™\њЛЙС’VT‘K›Щ™™\’YKЬЩ[XЭ€ЪЩ[Ћ€’VT‘KќЪЩ[њЛ›ЭЫ™\‹€XY\њО€ЙТY[\Э[ЮKRЩ^IО€[Y]KZЩ^KIЬЭY™љ^KLXK€›ЩB€K™]Ъ
+NВ€™]\›€Ь™\Э[љYN€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]KњљYJKЩ™™\Ћ€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]K›Щ™™\ЉK]Y]]™[ќО€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]K]Y]]™[ќК_NВ€Hљ[[HВ€]ШZ][ШЪЛЫЬЩJ
+NВ€BџB‚\Ю[Иќ[Э[Ы€ќ[“Щ™™\•[Y]PЫЫќXЭ
+
+HВ€ЫЫњЭЫШЪУ\ИH]Kњ\њЩJ	МЊЌ‹LKLMХОЊЊ‰КNВ€ЫЫњЭЩ^\™Y›Э[™\ћK[™[YЪX›K[YЫY[ќЫШЪЧHH]ШZ]›ЫZ\ЩK[
+В€Щ[XЭЫ‘њ™\Ъ[ШЪКШЫШЪУ\ЛЩ™™\‘^\™\Р]\О€ЫШЪУ\ИH_K	Щ^\™Y	КK€Щ[XЭЫ‘њ™\Ъ[ШЪКШЫШЪУ\ЛЩ™™\‘^\™\Р]\О€ЫШЪУ\ЯK	Ш›Э[™\ћIКK€Щ[XЭЫ‘њ™\Ъ[ШЪКШЫШЪУ\ЛЩ™™\‘љ]™\‘[YЪX›N€[Щ_K	Ъ[™[YЪX›IКK€Щ[XЭЫ‘њ™\Ъ[ШЪКШЫШЪУ\ЛЩ™™\‘^\™\Р]\О€ЫШЪУ\И
+И_K	Э[Y	КK€Щ[XЭЫ‘њ™\Ъ[ШЪКШЫШЪУ\ЛЩ™™\‘^\™\Р]\О€ЫШЪУ\ИH_K	ШЫY[ќXЫШЪЙЛЩ^XЭY™\]Y\Э™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы‹ЫY[ќ›ЭО€™]И]JЫШЪУ\ИHЊМ
+KќТTУФЭљ[™К
+_JB€JNВ€Y€
+^\™Yњ™\Э[њЭ]\ИOOHH^\™Yњ™\Э[›ЩOЛЫЩHOOH	ЫЩ™™\—Щ^\™Y	КH›ЭИ™]И\њ›ЬЉ	ЬЩ\ќ™\€ЫШЪИY›Э™Z™XЭ[€^\™YЩ™™\‰КNВ€Y€
+›Э[™\ћKњ™\Э[њЭ]\ИOOHH›Э[™\ћKњ™\Э[›ЩOЛЫЩHOOH	ЫЩ™™\—Щ^\™Y	КH›ЭИ™]И\њ›ЬЉ	ЫЩ™™\€™[XZ[™YЩ[XЭX›H]]И^XЭ^\ћH[њЭ[ќ	КNВ€Y€
+[™[YЪX›Kњ™\Э[њЭ]\ИOOHH[™[YЪX›Kњ™\Э[›ЩOЛЫЩHOOH	Щљ]™\—Э[]Z[X›IКH›ЭИ™]И\њ›ЬЉ	ЬЩ[XЭ[Ы€Y›Э™XЪXЪИЭ\њ™[ќљ]™\€[YЪXљ[]IКNВ€Y€
+[Yњ™\Э[њЭ]\ИOOHЊ[YњљYKњЭ]\ИOOH	Ш\ЬЪYЫ™Y	И[YњљYKњ™]љ\Ъ[Ы€OOHКH›ЭИ™]И\њ›ЬЉ	ШHЭ\њ™[ќ[YЪX›HЩ™™\€ЫЭ[›Э™HЩ[XЭY	КNВ€Y€
+ЫY[ќЫШЪЛњ™\Э[њЭ]\ИOOHЊ€ЫY[ќЫШЪЛњ™\Э[›ЩOЛЫЩHOOH	Ъ[ќ[YЬ™\]Y\Э	КH›ЭИ™]И\њ›ЬЉ	ШЫY[ќXЫЫќ›ЫYЫШЪИ[њ]Ш\И›Э™Z™XЭY	КNВ€›Ь€
+ЫЫњЭ™Z™XЭYЩ€Щ^\™Y›Э[™\ћK[™[YЪX›WJHВ€Y€
+™Z™XЭYњљYKњЭ]\ИOOH	ШЫЫXЭ[™ЙИ™Z™XЭYњљYKњ™]љ\Ъ[Ы€OOH’VT‘Kњ™]љ\Ъ[ЫЉH›ЭИ™]И\њ›ЬЉ	Ъ[ќ[YЩ™™\€Щ[XЭ[Ы€Ъ[™ЩYHљYIКNВ€B€™]\›€Щ^\™Y›Э[™\ћK[™[YЪX›K[YЫY[ќЫШЪЯNВџB‚\Ю[Иќ[Э[Ы€ќ[“[ШЪРЫЫќXЭ
+
+HВ€ЫЫњЭ[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉЬљYTЭ]\О€	Ш\ЬЪYЫ™Y	Л\ЬЪYЫ™Yљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	ЯJNВ€ћHВ€™]\›€]ШZ]ќ[’ЫЫќXЭ
+[ШЪЛ\ЩU\›
+NВ€Hљ[[HВ€]ШZ][ШЪЛЫЬЩJ
+NВ€BџB‚\Ю[Иќ[Э[Ы€ќ[ђШ[Щ[][Ы”™X\ЫЫђЫЫќXЭ
+
+HВ€ЫЫњЭШ[Щ[H
+[ШЪЛЩ^K›ЩJHO€™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›В€Y]Щ€	ФФХ	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKШШ[Щ[ЪЩ[Ћ€’VT‘KќЪЩ[њЛ›ЭЫ™\‹€XY\њО€ЙТY[\Э[ЮKRЩ^IО€Щ^_K›ЩB€K™]Ъ
+NВ€ЫЫњЭ[ЭЩYH]ШZ]›ЫZ\ЩK[
+РSђСSUSУ—Ф‘PTУУ”Л›X\
+\Ю[И
+™X\ЫЫ‹[™^
+HO€В€ЫЫњЭ[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\Љ
+NВ€ћHВ€ЫЫњЭЩ^HHШ[Щ[\™X\ЫЫ‹X[ЭЩYIЪ[™^KLXВ€ЫЫњЭЫЫ[X[™HЩ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы‹™X\ЫЫџNВ€ЫЫњЭ™\Э[H]ШZ]Ш[Щ[
+[ШЪЛЩ^KЫЫ[X[™
+NВ€Y€
+™\Э[њЭ]\ИOOHЊ™\Э[›ЩOЛШ[Щ[™X\ЫЫ€OOH™X\ЫЫЉH›ЭИ™]И\њ›ЬЉ[ЭЩYШ[Щ[][Ы€™X\ЫЫ€Ш\И›Э™\Щ\ќ™Y€	Ь™X\ЫЫџX
+NВ€Y€
+[ШЪЛњЭ]K]Y]]™[ќЛ›[™ЭOOHH[ШЪЛњЭ]K]Y]]™[ќЦМKњ™X\ЫЫ€OOH™X\ЫЫЉH›ЭИ™]И\њ›ЬЉ[ЭЩYШ[Щ[][Ы€™X\ЫЫ€Ш\И›Э]Y]Y€	Ь™X\ЫЫџX
+NВ€ЫЫњЭ™\^HH]ШZ]Ш[Щ[
+[ШЪЛЩ^KЫЫ[X[™
+NВ€Y€
+™\^KњЭ]\ИOOHЊ”УУ‹њЭљ[™ЪYћJ™\^K›ЩJHOOH”УУ‹њЭљ[™ЪYћJ™\Э[›ЩJJH›ЭИ™]И\њ›ЬЉ^XЭШ[Щ[][Ы€™\^HШ\И›ЭЭX›N€	Ь™X\ЫЫџX
+NВ€ЫЫњЭЪ[™ЩY™X\ЫЫ€HРSђСSUSУ—Ф‘PTУУ”ЦК[™^
+ИJH	HРSђСSUSУ—Ф‘PTУУ”Л›[™ЭNВ€ЫЫњЭЫЫ™›XЭH]ШZ]Ш[Щ[
+[ШЪЛЩ^KЩ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы‹™X\ЫЫЋ€Ъ[™ЩY™X\ЫЫџJNВ€Y€
+ЫЫ™›XЭњЭ]\ИOOHHЫЫ™›XЭ›ЩOЛЫЩHOOH	ЪY[\Э[ЮWШЫЫ™›XЭ	КH›ЭИ™]И\њ›ЬЉЪ[™ЩYШ[Щ[][Ы€™X\ЫЫ€™]\ЩY[€Y[\Э[ЮHЩ^N€	Ь™X\ЫЫџHO€	ШЪ[™ЩY™X\ЫЫџX
+NВ€Y€
+[ШЪЛњЭ]KњљYKШ[Щ[™X\ЫЫ€OOH™X\ЫЫ€[ШЪЛњЭ]K]Y]]™[ќЛ›[™ЭOOHH[ШЪЛњЭ]KљY[\Э[ЮKњЪ^™HOOHJHВ€›ЭИ™]И\њ›ЬЉШ[Щ[][Ы€™\^HЪ[™ЩYЭ]K]Y]Ь€Y[\Э[ЮH™XЫЬ™О€	Ь™X\ЫЫџX
+NВ€B€™]\›€Ь™X\ЫЫ‹Ъ[™ЩY™X\ЫЫ‹™\Э[™\^KЫЫ™›XЭЭ]N€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]KњљYJK]Y]]™[ќО€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]K]Y]]™[ќКKЭЬ™YЩ^\О€[ШЪЛњЭ]KљY[\Э[ЮKњЪ^™_NВ€Hљ[[HВ€]ШZ][ШЪЛЫЬЩJ
+NВ€B€JJNВ€ЫЫњЭ[[]]X›HH]ШZ]›ЫZ\ЩK[
+РSђСSUSУ—Ф‘PTУУ”Л›X\
+\Ю[И
+™X\ЫЫ‹[™^
+HO€В€ЫЫњЭ[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\Љ
+NВ€ћHВ€ЫЫњЭЪ[™ЩY™X\ЫЫ€HРSђСSUSУ—Ф‘PTУУ”ЦК[™^
+ИJH	HРSђСSUSУ—Ф‘PTУУ”Л›[™ЭNВ€ЫЫњЭЫЫ[Z]YH]ШZ]Ш[Щ[
+[ШЪЛШ[Щ[Z[[]]X›KYљ\њЭIЪ[™^KLXЩ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы‹™X\ЫЫџJNВ€ЫЫњЭ[Y[™Y[ќH]ШZ]Ш[Щ[
+[ШЪЛШ[Щ[Z[[]]X›KX[Y[™IЪ[™^KLXЩ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы€
+ИK™X\ЫЫЋ€Ъ[™ЩY™X\ЫЫџJNВ€Y€
+ЫЫ[Z]YњЭ]\ИOOHЊ[Y[™Y[ќњЭ]\ИOOHH[Y[™Y[ќ›ЩOЛЫЩHOOH	Ъ[ќ[YЭ[њЪ][Ы‰КHВ€›ЭИ™]И\њ›ЬЉH\›Z[[Ш[Щ[][Ы€™X\ЫЫ€ЫЭ[™H[Y[™Y€	Ь™X\ЫЫџHO€	ШЪ[™ЩY™X\ЫЫџX
+NВ€B€Y€
+[ШЪЛњЭ]KњљYKШ[Щ[™X\ЫЫ€OOH™X\ЫЫ€[ШЪЛњЭ]KњљYKњ™]љ\Ъ[Ы€OOH’VT‘Kњ™]љ\Ъ[Ы€
+ИJHВ€›ЭИ™]И\њ›ЬЉH\›Z[[Ш[Щ[][Ы€[Y[™Y[ќЪ[™ЩYHЬљYЪ[[љYN€	Ь™X\ЫЫџX
+NВ€B€Y€
+[ШЪЛњЭ]K]Y]]™[ќЛ›[™ЭOOH€[ШЪЛњЭ]K]Y]]™[ќЦМKњ™X\ЫЫ€OOH™X\ЫЫ€[ШЪЛњЭ]K]Y]]™[ќЦМWKњ™X\ЫЫ€OOH	Ъ[ќ[YЭ[њЪ][Ы‰КHВ€›ЭИ™]И\њ›ЬЉH\›Z[[Ш[Щ[][Ы€[Y[™Y[ќЫЬњќ\Y]И]Y]Z[€	Ь™X\ЫЫџX
+NВ€B€™]\›€Ь™X\ЫЫ‹Ъ[™ЩY™X\ЫЫ‹ЫЫ[Z]Y[Y[™Y[ќЭ]N€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]KњљYJK]Y]]™[ќО€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]K]Y]]™[ќКKЭЬ™YЩ^\О€[ШЪЛњЭ]KљY[\Э[ЮKњЪ^™_NВ€Hљ[[HВ€]ШZ][ШЪЛЫЬЩJ
+NВ€B€JJNВ€ЫЫњЭ[ќ[Y[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\Љ
+NВ€ћHВ€ЫЫњЭ[ќ[Y›ЩY\ИHВ€Щ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[ЫџK€Щ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы‹™X\ЫЫЋ€	ЬЩX\ЪЩY]Y	ЯK€Щ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы‹™X\ЫЫЋ€_K€Щ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы‹™X\ЫЫЋ€	Ь\ЬЩ[™Щ\—Ь™\]Y\ЭY	Л›ЭN€	Э[ќќ\ЭY	ЯB€NВ€ЫЫњЭ[ќ[YHЧNВ€›Ь€
+ЫЫњЭЪ[™^›ЩWHЩ€[ќ[Y›ЩY\Л™[ќљY\К
+JHВ€[ќ[Yњ\Ъ
+]ШZ]Ш[Щ[
+[ќ[Y[ШЪЛШ[Щ[\™X\ЫЫ‹Z[ќ[YIЪ[™^KLX›ЩJJNВ€B€Y€
+[ќ[YњЫЫYJ™\Э[O€™\Э[њЭ]\ИOOHЊ€™\Э[›ЩOЛЫЩHOOH	Ъ[ќ[YЬ™\]Y\Э	КJH›ЭИ™]И\њ›ЬЉ	Ъ[ќ[YШ[Щ[][Ы€™X\ЫЫ€Ь€љY[Ш\ИXШЩ\Y	КNВ€Y€
+[ќ[Y[ШЪЛњЭ]KњљYKњЭ]\ИOOH	ШЫЫXЭ[™ЙИ[ќ[Y[ШЪЛњЭ]KњљYKњ™]љ\Ъ[Ы€OOH’VT‘Kњ™]љ\Ъ[Ы€€[ќ[Y[ШЪЛњЭ]K]Y]]™[ќЛ›[™Э[ќ[Y[ШЪЛњЭ]KљY[\Э[ЮKњЪ^™JHВ€›ЭИ™]И\њ›ЬЉ	Ъ[ќ[YШ[Щ[][Ы€[њ]Ъ[™ЩYЭ]K]Y]Ь€Y[\Э[ЮH™XЫЬ™ЙКNВ€B€™]\›€Ш[ЭЩY[[]]X›K[ќ[Y[ќ[YЭ]N€ЭќXЭ\™YЫЫ™J[ќ[Y[ШЪЛњЭ]KњљYJK[ќ[Y]Y]]™[ќО€ЭќXЭ\™YЫЫ™J[ќ[Y[ШЪЛњЭ]K]Y]]™[ќКK[ќ[YЭЬ™YЩ^\О€[ќ[Y[ШЪЛњЭ]KљY[\Э[ЮKњЪ^™_NВ€Hљ[[HВ€]ШZ][ќ[Y[ШЪЛЫЬЩJ
+NВ€BџB‚\Ю[Иќ[Э[Ы€ќ[ђЫЫЭ\њ™[ЮPЫЫќXЭ
+
+HВ€ЫЫњЭ[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\Љ
+NВ€ЫЫњЭЫЫ[[Ы€HЫY]Щ€	ФФХ	ЛЪЩ[Ћ€’VT‘KќЪЩ[њЛ›ЭЫ™\џNВ€ЫЫњЭЫЫ[X[™ИHВ€Л‹‹ЫЫ[[Ы‹[YN€	ЬЩ[XЭ	Л]€ЭЊKЫЩ™™\њЛЙС’VT‘K›Щ™™\’YKЬЩ[XЭXY\њО€ЙТY[\Э[ЮKRЩ^IО€	ЬXЩKZЩ^K\Щ[XЭLIЯK›ЩN€Щ^XЭY™\]Y\Э™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ыџ_K€Л‹‹ЫЫ[[Ы‹[YN€	ШШ[Щ[	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKШШ[Щ[XY\њО€ЙТY[\Э[ЮKRЩ^IО€	ЬXЩKZЩ^KXШ[Щ[LIЯK›ЩN€Щ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы‹™X\ЫЫЋ€	Ь\ЬЩ[™Щ\—Ь™\]Y\ЭY	Я_B€NВ€ћHВ€ЫЫњЭZ\€H]ШZ]›ЫZ\ЩK[
+ЫЫ[X[™Л›X\
+ЫЫ[X[™O€™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›ЫЫ[X[™™]Ъ
+JJNВ€ЫЫњЭЪ[›™\’[™^HZ\‹™љ[™[™^
+™\Э[O€™\Э[њЭ]\ИOOHЊ
+NВ€ЫЫњЭЬЩ\’[™^HZ\‹™љ[™[™^
+™\Э[O€™\Э[њЭ]\ИOOHH	‰€™\Э[›ЩOЛЫЩHOOH	ЬЭ[WЬ™]љ\Ъ[Ы‰КNВ€Y€
+Ъ[›™\’[™^ЬЩ\’[™^Ъ[›™\’[™^OOHЬЩ\’[™^
+H›ЭИ™]И\њ›ЬЉЫЫЭ\њ™[ќЩ[XЭШШ[Щ[]\Э]™HЫ™HЪ[›™\€[™Ы™HЭ[HЬЩ\Ћ€	Т”УУ‹њЭљ[™ЪYћJZ\Љ_X
+NВ€ЫЫњЭЪ[›™\ђЫЫ[X[™HЫЫ[X[™ЦЭЪ[›™\’[™^KЪ[›™\€HZ\–ЭЪ[›™\’[™^KЬЩ\€HZ\–ЫЬЩ\’[™^NВ€ЫЫњЭ™\^HH]ШZ]™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›Ъ[›™\ђЫЫ[X[™™]Ъ
+NВ€Y€
+™\^KњЭ]\ИOOHЊ”УУ‹њЭљ[™ЪYћJ™\^K›ЩJHOOH”УУ‹њЭљ[™ЪYћJЪ[›™\‹›ЩJJH›ЭИ™]И\њ›ЬЉ	Щ^XЭY[\Э[ЮKRЩ^H™\^HY›Э™]\›€HЬљYЪ[[ЭXШЩ\ЬЙКNВ€ЫЫњЭЪ[™ЩYЫЫ[X[™HЭќXЭ\™YЫЫ™JЪ[›™\ђЫЫ[X[™
+NВ€Ъ[™ЩYЫЫ[X[™›ЩHHЪ[›™\ђЫЫ[X[™›[YHOOH	ЬЩ[XЭ	ИИЩ^XЭY™\]Y\Э™]љ\Ъ[ЫЋ€NN_H€Щ^XЭY™]љ\Ъ[ЫЋ€’VT‘Kњ™]љ\Ъ[Ы‹™X\ЫЫЋ€	Ь›Э]WШЪ[™ЩY	ЯNВ€ЫЫњЭЫЫ™›XЭH]ШZ]™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›Ъ[™ЩYЫЫ[X[™™]Ъ
+NВ€Y€
+ЫЫ™›XЭњЭ]\ИOOHHЫЫ™›XЭ›ЩOЛЫЩHOOH	ЪY[\Э[ЮWШЫЫ™›XЭ	КH›ЭИ™]И\њ›ЬЉ	ТY[\Э[ЮKRЩ^H™]\ЩHЪ]Ъ[™ЩYЫЫќ[ќШ\И›Э™Z™XЭY	КNВ€Y€
+[ШЪЛњЭ]KњљYKњ™]љ\Ъ[Ы€OOH’VT‘Kњ™]љ\Ъ[Ы€
+ИH[ШЪЛњЭ]KњљYKњЭ]\ИOOHЪ[›™\‹›ЩKњЭ]\КH›ЭИ™]И\њ›ЬЉ	ЬXЩHЪ[™ЩYHљYH[Ь™H[€ЫЩIКNВ€™]\›€В€Z\‹€Ъ[›™\Ћ€ШЫЫ[X[™€Ъ[›™\ђЫЫ[X[™›[YK‹‹ќЪ[›™\џK€ЬЩ\Ћ€ШЫЫ[X[™€ЫЫ[X[™ЦЫЬЩ\’[™^K›[YK‹‹›ЬЩ\џK€™\^K€ЫЫ™›XЭ€Э]N€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]KњљYJK€ЭЬ™YЩ^\О€[ШЪЛњЭ]KљY[\Э[ЮKњЪ^™K€]Y]]™[ќО€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]K]Y]]™[ќКB€NВ€Hљ[[HВ€]ШZ][ШЪЛЫЬЩJ
+NВ€BџB‚\Ю[Иќ[Э[Ы€ќ[ђ]Y]ЫЫќXЭ
+
+HВ€ЫЫњЭЬXЩK[Y]KљYTШY™]K›Ш\™[™ФXЩWHH]ШZ]›ЫZ\ЩK[
+Ьќ[ђЫЫЭ\њ™[ЮPЫЫќXЭ
+
+Kќ[“Щ™™\•[Y]PЫЫќXЭ
+
+Kќ[”љYTШY™]PЫЫќXЭ
+
+Kќ[ђ›Ш\™[™ФXЩPЫЫќXЭ
+
+WJNВ€Y€
+XЩK]Y]]™[ќЛ›[™ЭOOHЉH›ЭИ™]И\њ›ЬЉ	ШЫЫЭ\њ™[ќЫЫ[X[™И[™^XЭ™\^HY›Э›ЩXЩH^XЭHЫИ]Y]]™[ќЙКNВ€Y€
+XЩK]Y]]™[ќЛ™љ[\Љ]™[ќO€]™[ќ›Э]ЫЫYHOOH	ШЫЫ[Z]Y	КK›[™ЭOOHJH›ЭИ™]И\њ›ЬЉ	ЬXЩH]Y]Y›Э™XЫЬ™^XЭHЫ™HЫЫ[Z]YЫЫ[X[™	КNВ€Y€
+XЩK]Y]]™[ќЛ™љ[\Љ]™[ќO€]™[ќњ™X\ЫЫ€OOH	ЬЭ[WЬ™]љ\Ъ[Ы‰КK›[™ЭOOHJH›ЭИ™]И\њ›ЬЉ	ЬXЩH]Y]Y›Э™XЫЬ™HЭ[HЬЩ\‰КNВ€Y€
+[Y]K™^\™Y]Y]]™[ќЦМOЛњ™X\ЫЫ€OOH	ЫЩ™™\—Щ^\™Y	КH›ЭИ™]И\њ›ЬЉ	Щ^\™YЩ[XЭ[Ы€™Z™XЭ[Ы€Ш\И›Э]Y]Y	КNВ€Y€
+[Y]Kљ[™[YЪX›K]Y]]™[ќЦМOЛњ™X\ЫЫ€OOH	Щљ]™\—Э[]Z[X›IКH›ЭИ™]И\њ›ЬЉ	Щ[YЪXљ[]H™Z™XЭ[Ы€Ш\И›Э]Y]Y	КNВ€Y€
+[Y]Kќ[Y]Y]]™[ќЦМOЛ›Э]ЫЫYHOOH	ШЫЫ[Z]Y	КH›ЭИ™]И\њ›ЬЉ	ЬЭXШЩ\ЬЩќ[Щ[XЭ[Ы€Ш\И›Э]Y]Y	КNВ€ЫЫњЭ]™[ќИHЛ‹‹њXЩK]Y]]™[ќЛ‹‹ќ[Y]K™^\™Y]Y]]™[ќЛ‹‹ќ[Y]Kљ[™[YЪX›K]Y]]™[ќЛ‹‹ќ[Y]Kќ[Y]Y]]™[ќЛ‹‹њљYTШY™]K]Y]]™[ќЛ‹‹›Ш\™[™ФXЩKШ[Щ[љ\њЭ]Y]]™[ќЛ‹‹›Ш\™[™ФXЩKњЭ\ќљ\њЭ]Y]]™[ќЧNВ€›Ь€
+ЫЫњЭ]™[ќЩ€]™[ќКHВ€Y€
+Шљ™XЭљЩ^\К]™[ќ
+Kљ›Ъ[Љ	Я	КHOOHUQUС’QSЛљ›Ъ[Љ	Я	КJH›ЭИ™]И\њ›ЬЉ]Y]]™[ќЫЫќZ[њИ[™^XЭYљY[О€	УШљ™XЭљЩ^\К]™[ќ
+Kљ›Ъ[Љ	Л	К_X
+NВ€B€ЫЫњЭ[ЫЩYH”УУ‹њЭљ[™ЪYћJ]™[ќКNВ€ЫЫњЭ›ЬљY[€HЛ‹‹“Шљ™XЭќ[Y\К’VT‘KќЪЩ[њКK	ТY[\Э[ЮKRЩ^IЛ	ЬЫ™IЛ	Щ[XZ[	Л	ЫШњЩ\ќ™Y]IЛ	Ь\›Z]	Л	КНЌОIЛ	Р	ЧNВ€Y€
+›ЬљY[‹њЫЫYJ[YHO€[ЫЩYќУЭЩ\ђШ\ЩJ
+Kљ[ЫY\К[YKќУЭЩ\ђШ\ЩJ
+JJJH›ЭИ™]И\њ›ЬЉ	Ш]Y]]™[ќИЫЫќZ[€HЬ™Y[ќX[Ь€љ]]H[њ]	КNВ€™]\›€ЬXЩK[Y]KљYTШY™]K›Ш\™[™ФXЩK]™[ќЯNВџB‚\Ю[Иќ[Э[Ы€ќ[”љYTШY™]PЫЫќXЭ
+
+HВ€ЫЫњЭ[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉЬљYTЭ]\О€	Ш\ЬЪYЫ™Y	ЛљYT™]љ\Ъ[ЫЋ€‹\ЬЪYЫ™Yљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	ЯJNВ€ЫЫњЭ[њЪ][Ы€H
+Щ^K›ЩJHO€™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›В€Y]Щ€	ФФХ	Л]€ЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYKЭ[њЪ][ЫњШЪЩ[Ћ€’VT‘KќЪЩ[њЛ\ЬЪYЫ™Yљ]™\‹€XY\њО€ЙТY[\Э[ЮKRЩ^IО€Щ^_K›ЩB€K™]Ъ
+NВ€ЫЫњЭЫЫ™љ\›HH
+Щ^K›ЩJHO€™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›В€Y]Щ€	ФФХ	Л]€ЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYKЭ™ZXЫKXЫЫ™љ\›X][ЫњШЪЩ[Ћ€’VT‘KќЪЩ[њЛ›ЭЫ™\‹€XY\њО€ЙТY[\Э[ЮKRЩ^IО€Щ^_K›ЩB€K™]Ъ
+NВ€ћHВ€ЫЫњЭ\њљ]љ[™РЫЫ[X[™HЩњ›ЫN€	Ш\ЬЪYЫ™Y	ЛО€	Ш\њљ]љ[™ЙЛ^XЭY™]љ\Ъ[ЫЋ€џNВ€ЫЫњЭ\њљ]љ[™ИH]ШZ][њЪ][ЫЉ	ЬљYKX\њљ]љ[™ЛLIЛ\њљ]љ[™РЫЫ[X[™
+NВ€ЫЫњЭ\њљ]љ[™Ф™\^HH]ШZ][њЪ][ЫЉ	ЬљYKX\њљ]љ[™ЛLIЛ\њљ]љ[™РЫЫ[X[™
+NВ€ЫЫњЭЫЫ™љ\›X][ЫђЫЫ[X[™HЫШњЩ\ќ™Y]N€	ып);п){п+{п+ып#{п$;п$;п$IЛШ[YT\њЫЫЋ€ќYKШ[YU™ZXЫN€ќYK^XЭY™]љ\Ъ[ЫЋ€ЯNВ€ЫЫњЭЫЫ™љ\›X][Ы€H]ШZ]ЫЫ™љ\›J	Э™ZXЫKXЫЫ™љ\›KLIЛЫЫ™љ\›X][ЫђЫЫ[X[™
+NВ€ЫЫњЭЫЫ™љ\›X][Ы”™\^HH]ШZ]ЫЫ™љ\›J	Э™ZXЫKXЫЫ™љ\›KLIЛЫЫ™љ\›X][ЫђЫЫ[X[™
+NВ€ЫЫњЭZ\ЫX]ЪH]ШZ]ЫЫ™љ\›J	Э™ZXЫK[Z\ЫX]ЪLIЛЫШњЩ\ќ™Y]N€	СSSИNNIЛШ[YT\њЫЫЋ€ќYKШ[YU™ZXЫN€ќYK^XЭY™]љ\Ъ[ЫЋ€JNВ€ЫЫњЭЭ\ќЪ]Э]ЫЫ™љ\›X][Ы€H]ШZ][њЪ][ЫЉ	ЬљYK\Э\ќX›ШЪЩYLIЛЩњ›ЫN€	Ш\њљ]љ[™ЙЛО€	ЫЫ—Эљ\	Л^XЭY™]љ\Ъ[ЫЋ€_JNВ€ЫЫњЭ™XЫЫ™љ\›X][Ы€H]ШZ]ЫЫ™љ\›J	Э™ZXЫK\™XЫЫ™љ\›KLIЛЫШњЩ\ќ™Y]N€	СSSИIЛШ[YT\њЫЫЋ€ќYKШ[YU™ZXЫN€ќYK^XЭY™]љ\Ъ[ЫЋ€_JNВ€[ШЪЛњЭ]K™љ]™\‘[YЪXљ[]VЙЩљ]™\‹X\ЬЪYЫ™Y	ЧHH[ЩNВ€ЫЫњЭ™]›ЪЩYљ]™\€H]ШZ][њЪ][ЫЉ	ЬљYK\Э\ќ\™]›ЪЩYLIЛЩњ›ЫN€	Ш\њљ]љ[™ЙЛО€	ЫЫ—Эљ\	Л^XЭY™]љ\Ъ[ЫЋ€џJNВ€[ШЪЛњЭ]K™љ]™\‘[YЪXљ[]VЙЩљ]™\‹X\ЬЪYЫ™Y	ЧHHќYNВ€ЫЫњЭЭ\ќYH]ШZ][њЪ][ЫЉ	ЬљYK\Э\ќLIЛЩњ›ЫN€	Ш\њљ]љ[™ЙЛО€	ЫЫ—Эљ\	Л^XЭY™]љ\Ъ[ЫЋ€џJNВ€ЫЫњЭЫЫ\]YH]ШZ][њЪ][ЫЉ	ЬљYKXЫЫ\]KLIЛЩњ›ЫN€	ЫЫ—Эљ\	ЛО€	ШЫЫ\]Y	Л^XЭY™]љ\Ъ[ЫЋ€ЯJNВ€Y€
+\њљ]љ[™ЛњЭ]\ИOOHЊ\њљ]љ[™Л›ЩKњ™]љ\Ъ[Ы€OOHИ”УУ‹њЭљ[™ЪYћJ\њљ]љ[™Ф™\^K›ЩJHOOH”УУ‹њЭљ[™ЪYћJ\њљ]љ[™Л›ЩJJH›ЭИ™]И\њ›ЬЉ	Ш\ЬЪYЫ™Y]ЛX\њљ]љ[™И[њЪ][Ы€Ь€™\^HZ[Y	КNВ€Y€
+ЫЫ™љ\›X][Ы‹њЭ]\ИOOHЊHЫЫ™љ\›X][Ы‹›ЩK\ЬЪYЫ›Y[ќ™]љ\Ъ[Ы€OOHИ”УУ‹њЭљ[™ЪYћJЫЫ™љ\›X][Ы”™\^K›ЩJHOOH”УУ‹њЭљ[™ЪYћJЫЫ™љ\›X][Ы‹›ЩJJH›ЭИ™]И\њ›ЬЉ	Э™ZXЫHЫЫ™љ\›X][Ы€Ь€™\^HZ[Y	КNВ€Y€
+Z\ЫX]ЪњЭ]\ИOOHHZ\ЫX]Ъ›ЩOЛЫЩHOOH	Э™ZXЫWЫZ\ЫX]Ъ	ИZ\ЫX]Ъ›ЩKњ™]љ\Ъ[Ы€OOHJH›ЭИ™]И\њ›ЬЉ	Э™ZXЫHZ\ЫX]ЪY›Э[ќ[Y]HЭ\њ™[ќЫЫ™љ\›X][Ы‰КNВ€Y€
+Э\ќЪ]Э]ЫЫ™љ\›X][Ы‹њЭ]\ИOOHHЭ\ќЪ]Э]ЫЫ™љ\›X][Ы‹›ЩOЛЫЩHOOH	Э™ZXЫWШЫЫ™љ\›X][Ы—Ь™\]Z\™Y	КH›ЭИ™]И\њ›ЬЉ	ЬљYHЭ\ќШ\И›Э›ШЪЩYЪ]Э]Э\њ™[ќЫЫ™љ\›X][Ы‰КNВ€Y€
+™]›ЪЩYљ]™\‹њЭ]\ИOOHH™]›ЪЩYљ]™\‹›ЩOЛЫЩHOOH	Щљ]™\—Э[]Z[X›IКH›ЭИ™]И\њ›ЬЉ	ЬљYHЭ\ќY›Э™XЪXЪИ\ЬЪYЫ™Yљ]™\€[YЪXљ[]IКNВ€Y€
+Э\ќYњЭ]\ИOOHЊЭ\ќY›ЩKњЭ]\ИOOH	ЫЫ—Эљ\	ИЫЫ\]YњЭ]\ИOOHЊЫЫ\]Y›ЩKњЭ]\ИOOH	ШЫЫ\]Y	КH›ЭИ™]И\њ›ЬЉ	ШЫЫ™љ\›YY[YЪX›HљYHЫЭ[›ЭЫЫ\]HH[ЭЩY[њЪ][Ы€]	КNВ€™]\›€В€\њљ]љ[™Л\њљ]љ[™Ф™\^KЫЫ™љ\›X][Ы‹ЫЫ™љ\›X][Ы”™\^KZ\ЫX]ЪЭ\ќЪ]Э]ЫЫ™љ\›X][Ы‹€™XЫЫ™љ\›X][Ы‹™]›ЪЩYљ]™\‹Э\ќYЫЫ\]Y€Э]N€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]KњљYJK€]Y]]™[ќО€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]K]Y]]™[ќКK€ЭЬ™YЩ^\О€[ШЪЛњЭ]KљY[\Э[ЮKњЪ^™B€NВ€Hљ[[HВ€]ШZ][ШЪЛЫЬЩJ
+NВ€BџB‚\Ю[Иќ[Э[Ы€ќ[ђ›Ш\™[™ФXЩPШ\ЩJЪ[›™\ЉHВ€ЫЫњЭ[^SЬЩ\€HЪ[›™\€OOH	ШШ[Щ[	ИИЭ[њЪ][ЫЋ€M_H€ШШ[Щ[€M_NВ€ЫЫњЭ[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉВ€љYTЭ]\О€	Ш\њљ]љ[™ЙЛ€љYT™]љ\Ъ[ЫЋ€‹€\ЬЪYЫ™Yљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	Л€™ZXЫPЫЫ™љ\›X][ЫЋ€В€™\]Y\ЭY€’VT‘Kњ™\]Y\ЭY€\ЬЪYЫ›Y[ќ™]љ\Ъ[ЫЋ€K€ЫЫ™љ\›YY]€	МЊЌ‹LKLMХОЊЊЊ‰Л€[Y›Ь”™]љ\Ъ[ЫЋ€‚€K€ЫЫ[X[™[^\О€[^SЬЩ\‚€JNВ€ЫЫњЭЫЫ[X[™ИHВ€Ш[Щ[€В€Y]Щ€	ФФХ	Л]€ЭЊKЬљYK\™\]Y\ЭЛЙС’VT‘Kњ™\]Y\ЭYKШШ[Щ[ЪЩ[Ћ€’VT‘KќЪЩ[њЛ›ЭЫ™\‹€XY\њО€ЙТY[\Э[ЮKRЩ^IО€›Ш\™[™Л\XЩKIЭЪ[›™\џKXШ[Щ[LXK€›ЩN€Щ^XЭY™]љ\Ъ[ЫЋ€‹™X\ЫЫЋ€	Ь\ЬЩ[™Щ\—Ь™\]Y\ЭY	ЯB€K€Э\ќ€В€Y]Щ€	ФФХ	Л]€ЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYKЭ[њЪ][ЫњШЪЩ[Ћ€’VT‘KќЪЩ[њЛ\ЬЪYЫ™Yљ]™\‹€XY\њО€ЙТY[\Э[ЮKRЩ^IО€›Ш\™[™Л\XЩKIЭЪ[›™\џK\Э\ќLXK€›ЩN€Щњ›ЫN€	Ш\њљ]љ[™ЙЛО€	ЫЫ—Эљ\	Л^XЭY™]љ\Ъ[ЫЋ€џB€B€NВ€ћHВ€ЫЫњЭШШ[Щ[Э\ќHH]ШZ]›ЫZ\ЩK[
+В€™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›ЫЫ[X[™ЛШ[Щ[™]Ъ
+K€™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›ЫЫ[X[™ЛњЭ\ќ™]Ъ
+B€JNВ€ЫЫњЭ^XЭYHЪ[›™\€OOH	ШШ[Щ[	ИИШШ[Щ[€ЊЭ\ќ€_H€ШШ[Щ[€KЭ\ќ€ЊNВ€Y€
+Ш[Щ[њЭ]\ИOOH^XЭYШ[Щ[Э\ќњЭ]\ИOOH^XЭYњЭ\ќ
+H›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭ›Ш\™[™ИXЩH›ЩXЩY[€[™^XЭYЪ[›™\
+NВ€ЫЫњЭЬЩ\€HЪ[›™\€OOH	ШШ[Щ[	ИИЭ\ќ€Ш[Щ[В€Y€
+ЬЩ\‹›ЩOЛЫЩHOOH	ЬЭ[WЬ™]љ\Ъ[Ы‰ИЬЩ\‹›ЩOЛњ™]љ\Ъ[Ы€OOHКH›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭ›Ш\™[™ИXЩHЬЩ\€Y›Э™XЩZ]™HЭ\њ™[ќ™]љ\Ъ[Ы
+NВ€ЫЫњЭЪ[›љ[™РЫЫ[X[™HЫЫ[X[™ЦЭЪ[›™\—NВ€ЫЫњЭЪ[›љ[™Ф™\Э[HЪ[›™\€OOH	ШШ[Щ[	ИИШ[Щ[€Э\ќВ€ЫЫњЭ™\^HH]ШZ]™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›Ъ[›љ[™РЫЫ[X[™™]Ъ
+NВ€Y€
+™\^KњЭ]\ИOOHЊ”УУ‹њЭљ[™ЪYћJ™\^K›ЩJHOOH”УУ‹њЭљ[™ЪYћJЪ[›љ[™Ф™\Э[›ЩJJH›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭ^XЭ™\^HШ\И›ЭЭX›X
+NВ€Y€
+[ШЪЛњЭ]KњљYKњ™]љ\Ъ[Ы€OOHИ[ШЪЛњЭ]K]Y]]™[ќЛ›[™ЭOOHЉH›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭXЩHЪ[™ЩYЭ]HЬ€]Y][Ь™H[€ЫЩX
+NВ€Y€
+Ъ[›™\€OOH	ШШ[Щ[	И	‰€[ШЪЛњЭ]KњљYKќ™ZXЫPЫЫ™љ\›X][Ы€OOHќ[
+H›ЭИ™]И\њ›ЬЉ	ШШ[Щ[][Ы€Ъ[›™\€™]Z[™Y™ZXЫHЫЫ™љ\›X][Ы‰КNВ€ЫЫњЭ™XYH
+ЪЩ[‹XY\њИHЯJHO€™\]Y\ЭњЫЫЉ[ШЪЛ\ЩU\›В€Y]Щ€	ССU	Л]€ЭЊKЬљY\ЛЙС’VT‘Kњ™\]Y\ЭYXЪЩ[‹XY\њЛШ\\™RXY\њО€ќYB€K™]Ъ
+NВ€ЫЫњЭ]Y]ЫЭ[ќH[ШЪЛњЭ]K]Y]]™[ќЛ›[™ЭВ€ЫЫњЭЭЬ™YЩ^\ИH[ШЪЛњЭ]KљY[\Э[ЮKњЪ^™NВ€ЫЫњЭЬ\ЬЩ[™Щ\‹љ]™\‹Э\”\ЬЩ[™Щ\‹Э\‘љ]™\—HH]ШZ]›ЫZ\ЩK[
+В€™XY
+’VT‘KќЪЩ[њЛ›ЭЫ™\ЉK€™XY
+’VT‘KќЪЩ[њЛ\ЬЪYЫ™Yљ]™\ЉK€™XY
+’VT‘KќЪЩ[њЛ›Э\”\ЬЩ[™Щ\ЉK€™XY
+’VT‘KќЪЩ[њЛ›Э\‘љ]™\ЉB€JNВ€Y€
+\ЬЩ[™Щ\‹њЭ]\ИOOHЊљ]™\‹њЭ]\ИOOHЊ
+H›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭ\ќXЪ\[ќИЫЭ[›Э™XЫЭ™\€Э\њ™[ќљYHЭ]X
+NВ€Y€
+\ЬЩ[™Щ\‹›ЩKњЭ]\ИOOH[ШЪЛњЭ]KњљYKњЭ]\Иљ]™\‹›ЩKњЭ]\ИOOH[ШЪЛњЭ]KњљYKњЭ]\И\ЬЩ[™Щ\‹›ЩKњ™]љ\Ъ[Ы€OOHИљ]™\‹›ЩKњ™]љ\Ъ[Ы€OOHКHВ€›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭ™XЫЭ™\ћH™]\›™YЭ[HЭ]X
+NВ€B€Y€
+Э\”\ЬЩ[™Щ\‹њЭ]\ИOOHЭ\‘љ]™\‹њЭ]\ИOOH
+H›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭ™XЫЭ™\ћH^ЬЩYHљYHИH›Ы‹\\ќXЪ\[ќ
+NВ€ЫЫњЭЬ\ЬЩ[™Щ\“›Э[ЩYљYYљ]™\“›Э[ЩYљYYЭ[T\ЬЩ[™Щ\‹Ь›ЬЬФ›ЫU[Y]Ь‹Ъ[Ш\™\ЬЩ[™Щ\‹Ъ[Ш\™Э\—HH]ШZ]›ЫZ\ЩK[
+В€™XY
+’VT‘KќЪЩ[њЛ›ЭЫ™\‹ЙТY‹S›Ы™KSX]Ъ	О€\ЬЩ[™Щ\‹љXY\њЛ™]YЯJK€™XY
+’VT‘KќЪЩ[њЛ\ЬЪYЫ™Yљ]™\‹ЙТY‹S›Ы™KSX]Ъ	О€ЛЙЩљ]™\‹љXY\њЛ™]YЯXJK€™XY
+’VT‘KќЪЩ[њЛ›ЭЫ™\‹ЙТY‹S›Ы™KSX]Ъ	О€	И›ШњЫЫ]K][Y]Ь€‰ЯJK€™XY
+’VT‘KќЪЩ[њЛ\ЬЪYЫ™Yљ]™\‹ЙТY‹S›Ы™KSX]Ъ	О€\ЬЩ[™Щ\‹љXY\њЛ™]YЯJK€™XY
+’VT‘KќЪЩ[њЛ›ЭЫ™\‹ЙТY‹S›Ы™KSX]Ъ	О€	К‰ЯJK€™XY
+’VT‘KќЪЩ[њЛ›Э\”\ЬЩ[™Щ\‹ЙТY‹S›Ы™KSX]Ъ	О€	К‰ЯJB€JNВ€Y€
+\ЬЩ[™Щ\“›Э[ЩYљYYњЭ]\ИOOHМљ]™\“›Э[ЩYљYYњЭ]\ИOOHМ\ЬЩ[™Щ\“›Э[ЩYљYY›ЩHOOHќ[љ]™\“›Э[ЩYљYY›ЩHOOHќ[
+HВ€›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭX]Ъ[™И[Y]Ь€Y›Э™]\›€[€[\HМ
+NВ€B€Y€
+Э[T\ЬЩ[™Щ\‹њЭ]\ИOOHЊЭ[T\ЬЩ[™Щ\‹›ЩKњ™]љ\Ъ[Ы€OOHИЭ[T\ЬЩ[™Щ\‹љXY\њЛ™]YИOOH\ЬЩ[™Щ\‹љXY\њЛ™]YКHВ€›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭЭ[H[Y]Ь€Y›Э™]\›€Э\њ™[ќЭ]X
+NВ€B€Y€
+Ь›ЬЬФ›ЫU[Y]Ь‹њЭ]\ИOOHЊЬ›ЬЬФ›ЫU[Y]Ь‹›ЩKќљY]Щ\”›ЫHOOH	Щљ]™\‰КH›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭЪ\™YH\ЬЩ[™Щ\€[Y]Ь€Ъ]Hљ]™\€™\™\Щ[ќ][Ы
+NВ€Y€
+Ъ[Ш\™\ЬЩ[™Щ\‹њЭ]\ИOOHМЪ[Ш\™Э\‹њЭ]\ИOOH
+H›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭ][X]YH[Y]Ь€™Y›Ь™H\ќXЪ\[ќ]]Ьљ^][Ы
+NВ€Y€
+[ШЪЛњЭ]K]Y]]™[ќЛ›[™ЭOOH]Y]ЫЭ[ќ[ШЪЛњЭ]KљY[\Э[ЮKњЪ^™HOOHЭЬ™YЩ^\И[ШЪЛњЭ]KњљYKњ™]љ\Ъ[Ы€OOHКHВ€›ЭИ™]И\њ›ЬЉ	ЭЪ[›™\џKYљ\њЭ™XЫЭ™\ћH™XY]]]YЫЫ[X[™Э]X
+NВ€B€™]\›€В€Ъ[›™\‹€Ш[Щ[€Э\ќ€™\^K€™XЫЭ™\ћN€Ь\ЬЩ[™Щ\‹љ]™\‹Э\”\ЬЩ[™Щ\‹Э\‘љ]™\‹\ЬЩ[™Щ\“›Э[ЩYљYYљ]™\“›Э[ЩYљYYЭ[T\ЬЩ[™Щ\‹Ь›ЬЬФ›ЫU[Y]Ь‹Ъ[Ш\™\ЬЩ[™Щ\‹Ъ[Ш\™Э\џK€Э]N€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]KњљYJK€]Y]]™[ќО€ЭќXЭ\™YЫЫ™J[ШЪЛњЭ]K]Y]]™[ќКK€ЭЬ™YЩ^\В€NВ€Hљ[[HВ€]ШZ][ШЪЛЫЬЩJ
+NВ€BџB‚\Ю[Иќ[Э[Ы€ќ[ђ›Ш\™[™ФXЩPЫЫќXЭ
+
+HВ€ЫЫњЭШШ[Щ[љ\њЭЭ\ќљ\њЭHH]ШZ]›ЫZ\ЩK[
+В€ќ[ђ›Ш\™[™ФXЩPШ\ЩJ	ШШ[Щ[	КK€ќ[ђ›Ш\™[™ФXЩPШ\ЩJ	ЬЭ\ќ	КB€JNВ€™]\›€ШШ[Щ[љ\њЭЭ\ќљ\њЭNВџB‚\Ю[Иќ[Э[Ы€ќ[”™XЫЭ™\ћT™]ћPЫЫќXЭ
+
+HВ€ЫЫњЭќ[€H\Ю[И
+Щ\ќ™\“Ь[ЫњЛЫY[ќЬ[ЫњИHЯJHO€В€ЫЫњЭ[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉЬљYTЭ]\О€	Ш\њљ]љ[™ЙЛљYT™]љ\Ъ[ЫЋ€Л\ЬЪYЫ™Yљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	Л‹‹њЩ\ќ™\“Ь[ЫњЯJNВ€ЫЫњЭ[^\ИHЧNВ€ћHВ€ЫЫњЭ™\Э[H]ШZ]™]ЪљYTЭ]UЪ]™]ћJВ€\ЩU\›€[ШЪЛ\ЩU\›€ЪЩ[Ћ€’VT‘KќЪЩ[њЛ›ЭЫ™\‹€ЫY\€\Ю[И[^HO€И[^\Лњ\Ъ
+[^JNИK€[™ЫN€
+
+HO€ЌK€‹‹ЫY[ќЬ[ЫњВ€JNВ€™]\›€Ь™\Э[[^\Л™[XZ[љ[™СZ[\™\О€[ШЪЛњЭ]Kњ™XЫЭ™\ћQZ[\™\Л›[™ЭNВ€Hљ[[HВ€]ШZ][ШЪЛЫЬЩJ
+NВ€B€NВ€ЫЫњЭЬ]S[Z]Y[]Z[X›K^]\ЭYXШЩ\ЬС[љYYHH]ШZ]›ЫZ\ЩK[
+В€ќ[ЉЬ™XЫЭ™\ћQZ[\™\О€ЮЬЭ]\О€ЋK™]ћPYќ\Ћ€	МЙЯW_JK€ќ[ЉЬ™XЫЭ™\ћQZ[\™\О€ЮЬЭ]\О€LЯKЬЭ]\О€LЯW_JK€ќ[ЉЬ™XЫЭ™\ћQZ[\™\О€\њ^K™њ›ЫJЫ[™Э€K
+
+HO€
+ЬЭ]\О€LЛ™]ћPYќ\Ћ€	МLЊ	ЯJJ_JK€ќ[ЉЯKЭЪЩ[Ћ€’VT‘KќЪЩ[њЛ›Э\”\ЬЩ[™Щ\џJB€JNВ€]™]ЫЬљРШ[ИHВ€ЫЫњЭ™]ЫЬљУ[ШЪИH]ШZ]Э\ќ[ШЪФЩ\ќ™\ЉЬљYTЭ]\О€	Ш\њљ]љ[™ЙЛљYT™]љ\Ъ[ЫЋ€Л\ЬЪYЫ™Yљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	ЯJNВ€ЫЫњЭ™]ЫЬљС[^\ИHЧNВ€]™]ЫЬљОВ€ћHВ€™]ЫЬљИH]ШZ]™]ЪљYTЭ]UЪ]™]ћJВ€\ЩU\›€™]ЫЬљУ[ШЪЛ\ЩU\›€ЪЩ[Ћ€’VT‘KќЪЩ[њЛ›ЭЫ™\‹€™]Ъ[\€
+‹‹\™ЬКHO€
+
+КЫ™]ЫЬљРШ[ИOOHHИ›ЫZ\ЩKњ™Z™XЭ
+™]И\њ›ЬЉ	ЬЪ[][]Y™]ЫЬљИZ[\™IКJH€™]Ъ
+‹‹\™ЬКJK€ЫY\€\Ю[И[^HO€И™]ЫЬљС[^\Лњ\Ъ
+[^JNИK€[™ЫN€
+
+HO€ЌB€JNВ€Hљ[[HВ€]ШZ]™]ЫЬљУ[ШЪЛЫЬЩJ
+NВ€B€]Y[ђШ[ИHВ€ЫЫњЭY[€H]ШZ]™]ЪљYTЭ]UЪ]™]ћJВ€\ЩU\›€	Ъ‹ЛМLЌЛЊЊЊNЊIЛЪЩ[Ћ€’VT‘KќЪЩ[њЛ›ЭЫ™\‹€™]Ъ[\€\Ю[И
+
+HO€ИY[ђШ[И
+ПHNИ›ЭИ™]И\њ›ЬЉ	Ы]\Э›Э™]ЪЪ[HY[‰КNИK€\Хљ\ЪX›N€
+
+HO€[ЩK€ЫY\€\Ю[И
+
+HO€ЯB€JNВ€™]\›€Ь]S[Z]Y[]Z[X›K^]\ЭYXШЩ\ЬС[љYY™]ЫЬљО€Ь™\Э[€™]ЫЬљЛ[^\О€™]ЫЬљС[^\ЛШ[О€™]ЫЬљРШ[ЯKY[Ћ€Ь™\Э[€Y[‹Ш[О€Y[ђШ[Я_NВџB‚™ќ[Э[Ы€ќ[”™]љ\Ъ[Ы“Y\™ЩPЫЫќXЭ
+
+HВ€ЫЫњЭXЭ[Ы€HВ€\њљ]љ[™О€	ШЫЫ™љ\›WЭ™ZXЫIЛ€Ш[Щ[Y€	ЬЪЭЧШШ[Щ[YЪ\ЭЬћIЛ€Ы—Эљ\€	ЬЪЭЧЫЫ—Эљ\	Л€ЫЫ\]Y€	ЬЪЭЧШЫЫ\]Y	В€NВ€ЫЫњЭЫ\ЪЭH
+™]љ\Ъ[Ы‹Э]\ЛЭ™\њљY\ИHЯJHO€
+В€Y€’VT‘Kњ™\]Y\ЭY€Э]\Л€™]љ\Ъ[Ы‹€љY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰Л€™^XЭ[ЫЋ€XЭ[Ы–ЬЭ]\ЧK€\]Y]€™]И]J]Kњ\њЩJ	МЊЌ‹LKLMХОЊЊ‰КH
+И™]љ\Ъ[Ы€
+€L
+KќТTУФЭљ[™К
+K€‹‹›Э™\њљY\В€JNВ€ЫЫњЭ\ЩHHЫ\ЪЭ
+Л	Ш\њљ]љ[™ЙКNВ‚€ЫЫњЭ™]Щ\“›ЭYљXШ][Ы€HY\™ЩTљYTЭ]U\]J\ЩKЫ\ЪЭ
+	ШШ[Щ[Y	КK	Ы›ЭYљXШ][Ы‰КNВ€ЫЫњЭ[^YY™XЫЭ™\ћHHY\™ЩTљYTЭ]U\]J™]Щ\“›ЭYљXШ][Ы‹њЭ]K\ЩK	Ь™XЫЭ™\ћIКNВ‚€ЫЫњЭ™]Щ\”™XЫЭ™\ћHHY\™ЩTљYTЭ]U\]J\ЩKЫ\ЪЭ
+K	ЫЫ—Эљ\	КK	Ь™XЫЭ™\ћIКNВ€ЫЫњЭ[^YY›ЭYљXШ][Ы€HY\™ЩTљYTЭ]U\]J™]Щ\”™XЫЭ™\ћKњЭ]KЫ\ЪЭ
+	ШШ[Щ[Y	КK	Ы›ЭYљXШ][Ы‰КNВ‚€ЫЫњЭљ\њЭ[]™\ћHHY\™ЩTљYTЭ]U\]J\ЩKЫ\ЪЭ
+	ШШ[Щ[Y	КK	Ы›ЭYљXШ][Ы‰КNВ€ЫЫњЭ\XШ]HHY\™ЩTљYTЭ]U\]Jљ\њЭ[]™\ћKњЭ]KЫ\ЪЭ
+	ШШ[Щ[Y	КK	Ы›ЭYљXШ][Ы‰КNВ€ЫЫњЭЫЫ™›XЭ[™ИHY\™ЩTљYTЭ]U\]Jљ\њЭ[]™\ћKњЭ]KЫ\ЪЭ
+	Ш\њљ]љ[™ЙКK	Ы›ЭYљXШ][Ы‰КNВ‚€ЫЫњЭШ\HY\™ЩTљYTЭ]U\]J\ЩKЫ\ЪЭ
+L	ШЫЫ\]Y	КK	Ы›ЭYљXШ][Ы‰КNВ€ЫЫњЭШ\™XЫЭ™\ћHHY\™ЩTљYTЭ]U\]JШ\њЭ]KЫ\ЪЭ
+L	ШЫЫ\]Y	КK	Ь™XЫЭ™\ћIКNВ‚€ЫЫњЭЬ›Ы™ФљYHHY\™ЩTљYTЭ]U\]J\ЩKЫ\ЪЭ
+	ШШ[Щ[Y	ЛЪY€	ЬљYKY›Ь™ZYЫ‰ЯJK	Ы›ЭYљXШ][Ы‰КNВ€ЫЫњЭЬ›Ы™Ф›ЫHHY\™ЩTљYTЭ]U\]J\ЩKЫ\ЪЭ
+	ШШ[Щ[Y	ЛЭљY]Щ\”›ЫN€	Щљ]™\‰ЯJK	Ы›ЭYљXШ][Ы‰КNВ€ЫЫњЭZ\ЬЪ[™Р\Щ[[™HHY\™ЩTљYTЭ]U\]Jќ[Ы\ЪЭ
+	ШШ[Щ[Y	КK	Ы›ЭYљXШ][Ы‰КNВ€ЫЫњЭ™XЫЭ™\™Y\Щ[[™HHY\™ЩTљYTЭ]U\]Jќ[Ы\ЪЭ
+	ШШ[Щ[Y	КK	Ь™XЫЭ™\ћIКNВ‚€™]\›€Ш\ЩK™]Щ\“›ЭYљXШ][Ы‹[^YY™XЫЭ™\ћK™]Щ\”™XЫЭ™\ћK[^YY›ЭYљXШ][Ы‹љ\њЭ[]™\ћK\XШ]KЫЫ™›XЭ[™ЛШ\Ш\™XЫЭ™\ћKЬ›Ы™ФљYKЬ›Ы™Ф›ЫKZ\ЬЪ[™Р\Щ[[™K™XЫЭ™\™Y\Щ[[™_NВџB‚\Ю[Иќ[Э[Ы€ќ[“›ЭYљXШ][Ы’[ќЫЫќXЭ
+
+HВ€ЫЫњЭЫ\ЪЭH
+™]љ\Ъ[Ы‹Э]\Л™^XЭ[Ы‹Э™\њљY\ИHЯJHO€
+В€Y€’VT‘Kњ™\]Y\ЭY€Э]\Л€™]љ\Ъ[Ы‹€љY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰Л€™^XЭ[Ы‹€\]Y]€™]И]J]Kњ\њЩJ	МЊЌ‹LKLMХОЊЊ‰КH
+И™]љ\Ъ[Ы€
+€L
+KќТTУФЭљ[™К
+K€‹‹›Э™\њљY\В€JNВ€ЫЫњЭ\ЩHHЫ\ЪЭ
+	ШШ[Щ[Y	Л	ЬЪЭЧШШ[Щ[YЪ\ЭЬћIКNВ€ЫЫњЭЪ[™ЩY[ќHЭ\N€	ЬљYKЪ[™ЩY	ЛљYRY€’VT‘Kњ™\]Y\ЭY™]љ\Ъ[ЫЋ€_NВ€]]]Ьљ^™YШ[ИHВ€]™XЫЭ™\™Yњ›ЫNВ€ЫЫњЭ]]Ьљ^™YH]ШZ][™TљYS›ЭYљXШ][Ы’[ќ
+В€Э\њ™[ќ€\ЩK€[ќ€Ъ[™ЩY[ќ€™XЫЭ™\Ћ€\Ю[И[ќO€В€]]Ьљ^™YШ[И
+ПHNВ€™XЫЭ™\™Yњ›ЫHH[ќВ€™]\›€ЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+K	ЫЫ—Эљ\	Л	ЬЪЭЧЫЫ—Эљ\	К_NВ€B€JNВ‚€]™Z™XЭYШ[ИHВ€ЫЫњЭЩ[њЪ]]™HH]ШZ][™TљYS›ЭYљXШ][Ы’[ќ
+В€Э\њ™[ќ€\ЩK€[ќ€Л‹‹Ъ[™ЩY[ќЭ]\О€	ЫЫ—Эљ\	Л\™PЩ[ќО€ЊМљ]™\’Y€	Щљ]™\‹X\ЬЪYЫ™Y	Л]N€	СSSИIЯK€™XЫЭ™\Ћ€\Ю[И
+
+HO€И™Z™XЭYШ[И
+ПHNИ™]\›€ЬЭ]\О€LNИB€JNВ€ЫЫњЭЭ[HH]ШZ][™TљYS›ЭYљXШ][Ы’[ќ
+ШЭ\њ™[ќ€\ЩK[ќ€Л‹‹Ъ[™ЩY[ќ™]љ\Ъ[ЫЋ€ЯK™XЫЭ™\Ћ€\Ю[И
+
+HO€И™Z™XЭYШ[И
+ПHNИ™]\›€ЬЭ]\О€LNИ_JNВ€ЫЫњЭ\XШ]HH]ШZ][™TљYS›ЭYљXШ][Ы’[ќ
+ШЭ\њ™[ќ€\ЩK[ќ€Л‹‹Ъ[™ЩY[ќ™]љ\Ъ[ЫЋ€K™XЫЭ™\Ћ€\Ю[И
+
+HO€И™Z™XЭYШ[И
+ПHNИ™]\›€ЬЭ]\О€LNИ_JNВ€ЫЫњЭ›Ь™ZYЫ€H]ШZ][™TљYS›ЭYљXШ][Ы’[ќ
+ШЭ\њ™[ќ€\ЩK[ќ€Л‹‹Ъ[™ЩY[ќљYRY€	ЬљYKY›Ь™ZYЫ‰ЯK™XЫЭ™\Ћ€\Ю[И
+
+HO€И™Z™XЭYШ[И
+ПHNИ™]\›€ЬЭ]\О€LNИ_JNВ‚€ЫЫњЭXШЩ\ЬУЬЭH]ШZ][™TљYS›ЭYљXШ][Ы’[ќ
+ШЭ\њ™[ќ€\ЩK[ќ€Ъ[™ЩY[ќ™XЫЭ™\Ћ€\Ю[И
+
+HO€
+ЬЭ]\О€›ЩN€\њ›Ьђ›ЩJ	Ь™\ЫЭ\ЩWЫ›ЭЩ›Э[™	Л	Ф™\ЫЭ\ЩHШ\И›Э›Э[™‰Л	ЪY[‰К_J_JNВ€ЫЫњЭ›ЭY]љ\ЪX›HH]ШZ][™TљYS›ЭYљXШ][Ы’[ќ
+ШЭ\њ™[ќ€\ЩK[ќ€Ъ[™ЩY[ќ™XЫЭ™\Ћ€\Ю[И
+
+HO€
+ЬЭ]\О€М›ЩN€ќ[J_JNВ€ЫЫњЭ[љ]X[H]ШZ][™TљYS›ЭYљXШ][Ы’[ќ
+В€Э\њ™[ќ€ќ[€^XЭYљYRY€’VT‘Kњ™\]Y\ЭY€^XЭYљY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰Л€[ќ€Л‹‹Ъ[™ЩY[ќ™]љ\Ъ[ЫЋ€K€™XЫЭ™\Ћ€\Ю[И
+
+HO€
+ЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+	Ш\ЬЪYЫ™Y	Л	ЭXЪЧЬXЪЭ\	К_JB€JNВ€™]\›€Ш\ЩK]]Ьљ^™Y€Л‹‹]]Ьљ^™YШ[О€]]Ьљ^™YШ[Л™XЫЭ™\™Yњ›Ы_KЩ[њЪ]]™KЭ[K\XШ]K›Ь™ZYЫ‹™Z™XЭYШ[ЛXШЩ\ЬУЬЭ›ЭY]љ\ЪX›K[љ]X[NВџB‚™ќ[Э[Ы€ќ[”Щ\ЬЪ[Ы’\ЫЫ][ЫђЫЫќXЭ
+
+HВ€ЫЫњЭЫ\ЪЭH
+™]љ\Ъ[Ы‹Э]\ЛљY]Щ\”›ЫK™^XЭ[ЫЉHO€
+В€Y€’VT‘Kњ™\]Y\ЭY€Э]\Л€™]љ\Ъ[Ы‹€љY]Щ\”›ЫK€™^XЭ[Ы‹€\]Y]€™]И]J]Kњ\њЩJ	МЊЌ‹LKLMХОЊЊ‰КH
+И™]љ\Ъ[Ы€
+€L
+KќТTУФЭљ[™К
+B€JNВ€ЫЫњЭ\ЬЩ[™Щ\ђљ[™[™ИHЬЩ\ЬЪ[Ы’Y€	ЬЩ\ЬЪ[Ы‹\\ЬЩ[™Щ\‹XIЛљY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰ЛљYRY€’VT‘Kњ™\]Y\ЭYNВ€ЫЫњЭљ]™\ђљ[™[™ИHЬЩ\ЬЪ[Ы’Y€	ЬЩ\ЬЪ[Ы‹Yљ]™\‹XIЛљY]Щ\”›ЫN€	Щљ]™\‰ЛљYRY€’VT‘Kњ™\]Y\ЭYNВ€ЫЫњЭЭ\”\ЬЩ[™Щ\ђљ[™[™ИHЬЩ\ЬЪ[Ы’Y€	ЬЩ\ЬЪ[Ы‹\\ЬЩ[™Щ\‹X‰ЛљY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰ЛљYRY€’VT‘Kњ™\]Y\ЭYNВ‚€]™]ћPШ[Щ[YHВ€ЫЫњЭЩЫЭ]ЫY[ќHЬ™X]TљYTЩ\ЬЪ[ЫђЫY[ќ
+\ЬЩ[™Щ\ђљ[™[™КNВ€ЩЫЭ]ЫY[ќњЩ]ШXЪJЫ\ЪЭ
+	ШШ[Щ[Y	Л	Ь\ЬЩ[™Щ\‰Л	ЬЪЭЧШШ[Щ[YЪ\ЭЬћIКK	Ињ\ЬЩ[™Щ\‹Y]YИ‰КNВ€ЩЫЭ]ЫY[ќњШЪY[T™]ћJ
+
+HO€И™]ћPШ[Щ[Y
+ПHNИJNВ€ЫЫњЭЩЫЭ][™HHЩЫЭ]ЫY[ќњЭ\ќ™XЫЭ™\ћJ
+NВ€ЫЫњЭЩЩЩYЭ]HЩЫЭ]ЫY[ќњ™\Щ]Щ\ЬЪ[ЫЉќ[
+NВ€ЫЫњЭ[^YYYќ\“ЩЫЭ]HЩЫЭ]ЫY[ќ™љ[љ\Ъ™XЫЭ™\ћJЩЫЭ][™KЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+K	ЫЫ—Эљ\	Л	Ь\ЬЩ[™Щ\‰Л	ЬЪЭЧЫЫ—Эљ\	КKXY\њО€Щ]YО€	И›]H‰Я_JNВ‚€ЫЫњЭ›ЫPЫY[ќHЬ™X]TљYTЩ\ЬЪ[ЫђЫY[ќ
+\ЬЩ[™Щ\ђљ[™[™КNВ€›ЫPЫY[ќњЩ]ШXЪJЫ\ЪЭ
+	ШШ[Щ[Y	Л	Ь\ЬЩ[™Щ\‰Л	ЬЪЭЧШШ[Щ[YЪ\ЭЬћIКK	Ињ\ЬЩ[™Щ\‹Y]YИ‰КNВ€ЫЫњЭ\ЬЩ[™Щ\’[™HH›ЫPЫY[ќњЭ\ќ™XЫЭ™\ћJ
+NВ€ЫЫњЭYќ\”›ЫTЭЪ]ЪH›ЫPЫY[ќњ™\Щ]Щ\ЬЪ[ЫЉљ]™\ђљ[™[™КNВ€ЫЫњЭ[^YY\ЬЩ[™Щ\€H›ЫPЫY[ќ™љ[љ\Ъ™XЫЭ™\ћJ\ЬЩ[™Щ\’[™KЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+K	ЫЫ—Эљ\	Л	Ь\ЬЩ[™Щ\‰Л	ЬЪЭЧЫЫ—Эљ\	КKXY\њО€Щ]YО€	Ињ\ЬЩ[™Щ\‹[]H‰Я_JNВ€ЫЫњЭљ]™\’[™HH›ЫPЫY[ќњЭ\ќ™XЫЭ™\ћJ
+NВ€ЫЫњЭљ]™\”™XЫЭ™\ћHH›ЫPЫY[ќ™љ[љ\Ъ™XЫЭ™\ћJљ]™\’[™KЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+K	ЫЫ—Эљ\	Л	Щљ]™\‰Л	ШЫЫќ[ќYWЭљ\	КKXY\њО€Щ]YО€	И™љ]™\‹Y]YИ‰Я_JNВ€ЫЫњЭљ]™\”Э]HH›ЫPЫY[ќњЫ\ЪЭ
+
+NВ‚€ЫЫњЭXШЫЭ[ќЫY[ќHЬ™X]TљYTЩ\ЬЪ[ЫђЫY[ќ
+\ЬЩ[™Щ\ђљ[™[™КNВ€XШЫЭ[ќЫY[ќњЩ]ШXЪJЫ\ЪЭ
+	ШШ[Щ[Y	Л	Ь\ЬЩ[™Щ\‰Л	ЬЪЭЧШШ[Щ[YЪ\ЭЬћIКK	ИXШЫЭ[ќXH‰КNВ€ЫЫњЭXШЫЭ[ќR[™HHXШЫЭ[ќЫY[ќњЭ\ќ™XЫЭ™\ћJ
+NВ€XШЫЭ[ќЫY[ќњ™\Щ]Щ\ЬЪ[ЫЉЭ\”\ЬЩ[™Щ\ђљ[™[™КNВ€ЫЫњЭ[^YYXШЫЭ[ќHHXШЫЭ[ќЫY[ќ™љ[љ\Ъ™XЫЭ™\ћJXШЫЭ[ќR[™KЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+K	ЫЫ—Эљ\	Л	Ь\ЬЩ[™Щ\‰Л	ЬЪЭЧЫЫ—Эљ\	КKXY\њО€Щ]YО€	ИXШЫЭ[ќXK[]H‰Я_JNВ€ЫЫњЭXШЫЭ[ќ”Э]HHXШЫЭ[ќЫY[ќњЫ\ЪЭ
+
+NВ‚€™]\›€ЫЩЩЩYЭ]ЩЫЭ]ЪYЫ[X›ЬќY€ЩЫЭ][™KњЪYЫ[X›ЬќY™]ћPШ[Щ[Y[^YYYќ\“ЩЫЭ]Yќ\”›ЫTЭЪ]Ъ\ЬЩ[™Щ\”ЪYЫ[X›ЬќY€\ЬЩ[™Щ\’[™KњЪYЫ[X›ЬќY[^YY\ЬЩ[™Щ\‹љ]™\”™XЫЭ™\ћKљ]™\”Э]K[^YYXШЫЭ[ќKXШЫЭ[ќ”Э]_NВџB‚™ќ[Э[Ы€ќ[ђЫЫ[X[™Щ\ЬЪ[ЫђЫЫќXЭ
+
+HВ€ЫЫњЭXШЫЭ[ќHHЬЩ\ЬЪ[Ы’Y€	ЬЩ\ЬЪ[Ы‹XIЛXШЫЭ[ќ™YЋ€	ШXШЫЭ[ќ\\ЬЩ[™Щ\‹XIЛљY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰ЯNВ€ЫЫњЭXШЫЭ[ќT™X]]HЬЩ\ЬЪ[Ы’Y€	ЬЩ\ЬЪ[Ы‹XK\™X]]	ЛXШЫЭ[ќ™YЋ€	ШXШЫЭ[ќ\\ЬЩ[™Щ\‹XIЛљY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰ЯNВ€ЫЫњЭXШЫЭ[ќ€HЬЩ\ЬЪ[Ы’Y€	ЬЩ\ЬЪ[Ы‹X‰ЛXШЫЭ[ќ™YЋ€	ШXШЫЭ[ќ\\ЬЩ[™Щ\‹X‰ЛљY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰ЯNВ€ЫЫњЭЫЫ[X[™HШXЭ[ЫЋ€	ШШ[Щ[ЬљYIЛY[\Э[ЮRЩ^N€	ШЫЫ[X[™\Ъ\™YZЩ^IЯNВ‚€ЫЫњЭЩЫЭ]ЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭЩЫЭ][™HHЩЫЭ]ЫY[ќњЭ\ќЫЫ[X[™
+ЫЫ[X[™
+NВ€ЫЫњЭЩЩЩYЭ]HЩЫЭ]ЫY[ќњ™\Щ]Щ\ЬЪ[ЫЉќ[
+NВ€ЫЫњЭ[^YYЭXШЩ\ЬИHЩЫЭ]ЫY[ќ™љ[љ\ЪЫЫ[X[™
+ЩЫЭ][™KЬЭ]\О€Њ›ЩN€ЬЭ]\О€	ШШ[Щ[Y	Я_JNВ‚€ЫЫњЭ^\ћPЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭ^\ћR[™HH^\ћPЫY[ќњЭ\ќЫЫ[X[™
+ЫЫ[X[™
+NВ€ЫЫњЭЩ\ЬЪ[Ы‘^\™YH^\ћPЫY[ќ™љ[љ\ЪЫЫ[X[™
+^\ћR[™KЬЭ]\О€K›ЩN€\њ›Ьђ›ЩJ	Ш]][ќXШ][Ы—Ь™\]Z\™Y	Л	Р]][ќXШ][Ы€\И™\]Z\™Y‰Л	Щ^\™Y\Щ\ЬЪ[Ы‰К_JNВ‚€ЫЫњЭ[љЫ›ЭЫђЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭ[љЫ›ЭЫ’[™HH[љЫ›ЭЫђЫY[ќњЭ\ќЫЫ[X[™
+ЫЫ[X[™
+NВ€ЫЫњЭЭ]ЫЫYU[љЫ›ЭЫ€H[љЫ›ЭЫђЫY[ќ™љ[љ\ЪЫЫ[X[™
+[љЫ›ЭЫ’[™KЬЭ]\О€›ЩN€ќ[JNВ‚€ЫЫњЭЭЪ]ЪЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭXШЫЭ[ќR[™HHЭЪ]ЪЫY[ќњЭ\ќЫЫ[X[™
+ЫЫ[X[™
+NВ€ЭЪ]ЪЫY[ќњ™\Щ]Щ\ЬЪ[ЫЉXШЫЭ[ќЉNВ€ЫЫњЭ[^YYXШЫЭ[ќHHЭЪ]ЪЫY[ќ™љ[љ\ЪЫЫ[X[™
+XШЫЭ[ќR[™KЬЭ]\О€Њ›ЩN€ЬЭ]\О€	ШШ[Щ[Y	Я_JNВ€ЫЫњЭXШЫЭ[ќ’[™HHЭЪ]ЪЫY[ќњЭ\ќЫЫ[X[™
+ЫЫ[X[™
+NВ€ЫЫњЭXШЫЭ[ќђЫЫ[Z]YHЭЪ]ЪЫY[ќ™љ[љ\ЪЫЫ[X[™
+XШЫЭ[ќ’[™KЬЭ]\О€Њ›ЩN€ЬЭ]\О€	ШШ[Щ[Y	Я_JNВ‚€ЫЫњЭXШЫЭ[ќTШЫЬHHY[\Э[ЮTШЫЬRЩ^JXШЫЭ[ќKXШЫЭ[ќ™Y‹ЫЫ[X[™љY[\Э[ЮRЩ^JNВ€ЫЫњЭ™X]]ШЫЬHHY[\Э[ЮTШЫЬRЩ^JXШЫЭ[ќT™X]]XШЫЭ[ќ™Y‹ЫЫ[X[™љY[\Э[ЮRЩ^JNВ€ЫЫњЭXШЫЭ[ќ”ШЫЬHHY[\Э[ЮTШЫЬRЩ^JXШЫЭ[ќ‹XШЫЭ[ќ™Y‹ЫЫ[X[™љY[\Э[ЮRЩ^JNВ€ЫЫњЭ[[Z]\ђHHY[\Э[ЮTШЫЬRЩ^J	ШXШЫЭ[ќIЛ	ЪЩ^IКNВ€ЫЫњЭ[[Z]\ђ€HY[\Э[ЮTШЫЬRЩ^J	ШXШЫЭ[ќ	Л	ШNљЩ^IКNВ€™]\›€ЫЩЩЩYЭ]ЩЫЭ]X›ЬќY€ЩЫЭ][™KњЪYЫ[X›ЬќY[^YYЭXШЩ\ЬЛЩ\ЬЪ[Ы‘^\™YЭ]ЫЫYU[љЫ›ЭЫ‹[^YYXШЫЭ[ќKXШЫЭ[ќђЫЫ[Z]YXШЫЭ[ќTШЫЬK™X]]ШЫЬKXШЫЭ[ќ”ШЫЬKXШЫЭ[ќR[™TШЫЬN€XШЫЭ[ќR[™KњШЫЬYЩ^KXШЫЭ[ќ’[™TШЫЬN€XШЫЭ[ќ’[™KњШЫЬYЩ^K[[Z]\ђK[[Z]\ђџNВџB‚\Ю[Иќ[Э[Ы€ќ[ђЫЫ[X[™™XЫЭ™\ћPЫЫќXЭ
+
+HВ€ЫЫњЭЫ\ЪЭH
+™]љ\Ъ[Ы‹Э]\ЛљY]Щ\”›ЫK™^XЭ[ЫЉHO€
+В€Y€’VT‘Kњ™\]Y\ЭY€Э]\Л€™]љ\Ъ[Ы‹€љY]Щ\”›ЫK€™^XЭ[Ы‹€\]Y]€™]И]J]Kњ\њЩJ	МЊЌ‹LKLMХЊЊ‰КH
+И™]љ\Ъ[Ы€
+€L
+KќТTУФЭљ[™К
+B€JNВ€ЫЫњЭXШЫЭ[ќHHЬЩ\ЬЪ[Ы’Y€	ЬЩ\ЬЪ[Ы‹\™XЫЭ™\ћKXIЛXШЫЭ[ќ™YЋ€	ШXШЫЭ[ќ\\ЬЩ[™Щ\‹XIЛљY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰ЯNВ€ЫЫњЭXШЫЭ[ќ€HЬЩ\ЬЪ[Ы’Y€	ЬЩ\ЬЪ[Ы‹\™XЫЭ™\ћKX‰ЛXШЫЭ[ќ™YЋ€	ШXШЫЭ[ќ\\ЬЩ[™Щ\‹X‰ЛљY]Щ\”›ЫN€	Ь\ЬЩ[™Щ\‰ЯNВ€ЫЫњЭЫЫ[X[™HШXЭ[ЫЋ€	ШШ[Щ[ЬљYIЛY[\Э[ЮRЩ^N€	Ь™XЫЭ™\‹XШ[Щ[ZЩ^IЯNВ€ЫЫњЭ\YYHЭ]HO€Э]OЛљYOOH’VT‘Kњ™\]Y\ЭY	‰€Э]OЛќљY]Щ\”›ЫHOOH	Ь\ЬЩ[™Щ\‰И	‰€Э]OЛњЭ]\ИOOH	ШШ[Щ[Y	ОВ€ЫЫњЭ™YЪ[•[љЫ›ЭЫ€HЫY[ќO€В€ЫЫњЭ[™HHЫY[ќњЭ\ќЫЫ[X[™
+ЫЫ[X[™
+NВ€ЫЫњЭ™\Э[HЫY[ќ™љ[љ\ЪЫЫ[X[™
+[™KЬЭ]\О€›ЩN€ќ[JNВ€Y€
+™\Э[њ™X\ЫЫ€OOH	ЫЭ]ЫЫYWЭ[љЫ›ЭЫ‰КH›ЭИ™]И\њ›ЬЉ	Щ^XЭY[€[љЫ›ЭЫ€ЫЫ[X[™Э]ЫЫYIКNВ€™]\›€[™NВ€NВ‚€]\YY™\^PШ[ИHВ€ЫЫњЭ\YYЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭ\YY[™HH™YЪ[•[љЫ›ЭЫЉ\YYЫY[ќ
+NВ€ЫЫњЭ[™XYP\YYH]ШZ]\YYЫY[ќњ™XЫЭ™\•[љЫ›ЭЫ“Э]ЫЫYJ\YY[™KВ€\Щ[[™T™]љ\Ъ[ЫЋ€€™XЫЭ™\Ћ€\Ю[И
+
+HO€
+ЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+K	ШШ[Щ[Y	Л	Ь\ЬЩ[™Щ\‰Л	ЬЪЭЧШШ[Щ[YЪ\ЭЬћIК_JK€\Р\YY€\YY€™\Щ[™€\Ю[И
+
+HO€И\YY™\^PШ[И
+ПHNИ™]\›€ЬЭ]\О€ЊNИB€JNВ‚€ЫЫњЭ™\^PШ[ИHЧNВ€ЫЫњЭ™\^PЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭ™\^R[™HH™YЪ[•[љЫ›ЭЫЉ™\^PЫY[ќ
+NВ€ЫЫњЭ™\^YYH]ШZ]™\^PЫY[ќњ™XЫЭ™\•[љЫ›ЭЫ“Э]ЫЫYJ™\^R[™KВ€\Щ[[™T™]љ\Ъ[ЫЋ€€™XЫЭ™\Ћ€\Ю[И
+
+HO€
+ЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+	Ш\ЬЪYЫ™Y	Л	Ь\ЬЩ[™Щ\‰Л	ЭXЪЧЩљ]™\‰К_JK€\Р\YY€\YY€™\Щ[™€\Ю[И™\]Y\ЭO€И™\^PШ[Лњ\Ъ
+™\]Y\Э
+NИ™]\›€ЬЭ]\О€Њ›ЩN€ЬЭ]\О€	ШШ[Щ[Y	Я_NИB€JNВ‚€]Ъ[™ЩY™\^PШ[ИHВ€ЫЫњЭЪ[™ЩYЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭЪ[™ЩY[™HH™YЪ[•[љЫ›ЭЫЉЪ[™ЩYЫY[ќ
+NВ€ЫЫњЭЪ[™ЩYH]ШZ]Ъ[™ЩYЫY[ќњ™XЫЭ™\•[љЫ›ЭЫ“Э]ЫЫYJЪ[™ЩY[™KВ€\Щ[[™T™]љ\Ъ[ЫЋ€€™XЫЭ™\Ћ€\Ю[И
+
+HO€
+ЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+K	ЫЫ—Эљ\	Л	Ь\ЬЩ[™Щ\‰Л	ЬЪЭЧЫЫ—Эљ\	К_JK€\Р\YY€\YY€™\Щ[™€\Ю[И
+
+HO€ИЪ[™ЩY™\^PШ[И
+ПHNИ™]\›€ЬЭ]\О€ЊNИB€JNВ‚€][љYY™\^PШ[ИHВ€ЫЫњЭ[љYYЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭ[љYY[™HH™YЪ[•[љЫ›ЭЫЉ[љYYЫY[ќ
+NВ€ЫЫњЭ[љYYH]ШZ][љYYЫY[ќњ™XЫЭ™\•[љЫ›ЭЫ“Э]ЫЫYJ[љYY[™KВ€\Щ[[™T™]љ\Ъ[ЫЋ€€™XЫЭ™\Ћ€\Ю[И
+
+HO€
+ЬЭ]\О€K›ЩN€\њ›Ьђ›ЩJ	Ш]][ќXШ][Ы—Ь™\]Z\™Y	Л	Р]][ќXШ][Ы€\И™\]Z\™Y‰Л	Ь™XЫЭ™\‹Y[љYY	К_JK€\Р\YY€\YY€™\Щ[™€\Ю[И
+
+HO€И[љYY™\^PШ[И
+ПHNИ™]\›€ЬЭ]\О€ЊNИB€JNВ‚€][љЫ›ЭЫ”™\^PШ[ИHВ€ЫЫњЭ[љЫ›ЭЫђЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭ[љЫ›ЭЫ’[™HH™YЪ[•[љЫ›ЭЫЉ[љЫ›ЭЫђЫY[ќ
+NВ€ЫЫњЭ™\^U[љЫ›ЭЫ€H]ШZ][љЫ›ЭЫђЫY[ќњ™XЫЭ™\•[љЫ›ЭЫ“Э]ЫЫYJ[љЫ›ЭЫ’[™KВ€\Щ[[™T™]љ\Ъ[ЫЋ€€™XЫЭ™\Ћ€\Ю[И
+
+HO€
+ЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+	Ш\ЬЪYЫ™Y	Л	Ь\ЬЩ[™Щ\‰Л	ЭXЪЧЩљ]™\‰К_JK€\Р\YY€\YY€™\Щ[™€\Ю[И
+
+HO€И[љЫ›ЭЫ”™\^PШ[И
+ПHNИ™]\›€ЬЭ]\О€LЛ›ЩN€\њ›Ьђ›ЩJ	Э[\Ь\љ[WЭ[]Z[X›IЛ	ХћH]\‹‰Л	Ь™\^K][љЫ›ЭЫ‰К_NИB€JNВ‚€]Э[T™\^PШ[ИHВ€ЫЫњЭЭ[PЫY[ќHЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќ
+XШЫЭ[ќJNВ€ЫЫњЭЭ[R[™HH™YЪ[•[љЫ›ЭЫЉЭ[PЫY[ќ
+NВ€ЫЫњЭЭ[TЩ\ЬЪ[Ы€H]ШZ]Э[PЫY[ќњ™XЫЭ™\•[љЫ›ЭЫ“Э]ЫЫYJЭ[R[™KВ€\Щ[[™T™]љ\Ъ[ЫЋ€€™XЫЭ™\Ћ€\Ю[И
+
+HO€В€Э[PЫY[ќњ™\Щ]Щ\ЬЪ[ЫЉXШЫЭ[ќЉNВ€™]\›€ЬЭ]\О€Њ›ЩN€Ы\ЪЭ
+	Ш\ЬЪYЫ™Y	Л	Ь\ЬЩ[™Щ\‰Л	ЭXЪЧЩљ]™\‰К_NВ€K€\Р\YY€\YY€™\Щ[™€\Ю[И
+
+HO€ИЭ[T™\^PШ[И
+ПHNИ™]\›€ЬЭ]\О€ЊNИB€JNВ€™]\›€Ш[™XYP\YY\YY™\^PШ[Л™\^YY™\^PШ[ЛЪ[™ЩYЪ[™ЩY™\^PШ[Л[љYY[љYY™\^PШ[Л™\^U[љЫ›ЭЫ‹[љЫ›ЭЫ”™\^PШ[ЛЭ[TЩ\ЬЪ[Ы‹Э[T™\^PШ[ЯNВџB‚љY€
+™\]Z\™K›XZ[€OOH[Щ[JHВ€›ЫZ\ЩK[
+Ьќ[“[ШЪРЫЫќXЭ
+
+Kќ[ђ]Y]ЫЫќXЭ
+
+Kќ[”™XЫЭ™\ћT™]ћPЫЫќXЭ
+
+Kќ[“›ЭYљXШ][Ы’[ќЫЫќXЭ
+
+Kќ[ђЫЫ[X[™™XЫЭ™\ћPЫЫќXЭ
+
+Kќ[ђЭ\њ™[ќљYQ\ШЫЭ™\ћPЫЫќXЭ
+
+Kќ[ђШ[Щ[][Ы”™X\ЫЫђЫЫќXЭ
+
+WJKќ[Љ
+Ь™\Э[Л]Y]™]ћK›ЭYљXШ][Ы‹ЫЫ[X[™™XЫЭ™\ћKЭ\њ™[ќљYKШ[Щ[][Ы”™X\ЫЫњЧJHO€В€ЫЫњЭЬXЩK[Y]KљYTШY™]K›Ш\™[™ФXЩ_HH]Y]В€ЫЫњЭY\™ЩHHќ[”™]љ\Ъ[Ы“Y\™ЩPЫЫќXЭ
+
+NВ€ЫЫњЭЩ\ЬЪ[Ы€Hќ[”Щ\ЬЪ[Ы’\ЫЫ][ЫђЫЫќXЭ
+
+NВ€ЫЫњЭЫЫ[X[™Щ\ЬЪ[Ы€Hќ[ђЫЫ[X[™Щ\ЬЪ[ЫђЫЫќXЭ
+
+NВ€ЫЫњЭ[љYYH™\Э[Л™љ[\Љ€O€‹њЭ]\ИЏH
+K›[™ЭВ€ЫЫњЫЫK›ЩКЫЫќXЭТО€	Ь™\Э[Л›[™ЭHШЩ[\љ[ЬИ
+	Щ[љYYHШY™H[љX[Л	Ь™\Э[Л›[™ЭH[љYYHЬЪ]]™HЫЫќ›ЫКX
+NВ€ЫЫњЫЫK›ЩКXЩHТО€	ЬXЩKќЪ[›™\‹ЫЫ[X[™HЫЫ‹	ЬXЩK›ЬЩ\‹ЫЫ[X[™H™XЩZ]™YЭ[WЬ™]љ\Ъ[Ы‹^XЭ™\^HШ\ИЭX›KЪ[™ЩY™\^HШ\И™Z™XЭY
+NВ€ЫЫњЫЫK›ЩК[Y]HТО€	Э[Y]K™^\™Yњ™\Э[›ЩKЫЩ_K^XЭX›Э[™\ћH^\ћK	Э[Y]Kљ[™[YЪX›Kњ™\Э[›ЩKЫЩ_KЫY[ќЫШЪИ™Z™XЭYЭ\њ™[ќЩ™™\€Щ[XЭY
+NВ€ЫЫњЫЫK›ЩКљYHШY™]HТО€™ZXЫHZ\ЫX]Ъ[ќ[Y]YЫЫ™љ\›X][Ы‹[ЫЫ™љ\›YYЬ™]›ЪЩYЭ\ќ›ШЪЩY[ЭЩY]ЫЫ\]Y]™]љ\Ъ[Ы€	ЬљYTШY™]KњЭ]Kњ™]љ\Ъ[ЫџX
+NВ€ЫЫњЫЫK›ЩК›Ш\™[™ИXЩHТО€	Ш›Ш\™[™ФXЩKШ[Щ[љ\њЭќЪ[›™\џH[™	Ш›Ш\™[™ФXЩKњЭ\ќљ\њЭќЪ[›™\џHXXЪЫЫЋИ›ЫK\ШY™H™XЫЭ™\ћH™]\›™YЭ\њ™[ќЭ]HЬ€[€[\HЫЫ™][Ы[М
+NВ€ЫЫњЫЫK›ЩК™XЫЭ™\ћH™]ћHТО€™]ћKPYќ\€	Ь™]ћKњ]S[Z]Y™[^\ЦМ_[\Л^Ы™[ќX[	Ь™]ћKќ[]Z[X›K™[^\Лљ›Ъ[Љ	ЛЙК_[\ЛШ\Y[™XШЩ\ЬЛЭљ\ЪXљ[]HЭЬШ
+NВ€ЫЫњЫЫK›ЩКЫY[ќ™]љ\Ъ[Ы€Y\™ЩHТО€™]љ\Ъ[Ы€	ЫY\™ЩK›™]Щ\“›ЭYљXШ][Ы‹њЭ]Kњ™]љ\Ъ[ЫџH™\Ъ\ЭY[^YY™XЫЭ™\ћKШ\ЛШЫЫ™›XЭИ™\]Y\ЭY™XЫЭ™\ћKШЫЬHZ\ЫX]Ъ\ИЩ\™H™Z™XЭY
+NВ€ЫЫњЫЫK›ЩК›ЭYљXШ][Ы€[ќТО€	Ы›ЭYљXШ][Ы‹]]Ьљ^™YШ[ЯH]]Ьљ^™Y™XЫЭ™\ћH\YY™]љ\Ъ[Ы€	Ы›ЭYљXШ][Ы‹]]Ьљ^™YњЭ]Kњ™]љ\Ъ[ЫџNИљ]]KЭ[H[™›Ь™ZYЫ€[ќИXYH	Ы›ЭYљXШ][Ы‹њ™Z™XЭYШ[ЯH™\]Y\ЭШ
+NВ€ЫЫњЫЫK›ЩКЩ\ЬЪ[Ы€\ЫЫ][Ы€ТО€ЩЫЭ][™›ЫKШXШЫЭ[ќЭЪ]Ъ\ИЫX\™YШXЪKШ[Щ[Y™]ћKX›ЬќYЫ™XYИ[™XШЩ\YЫ›H	ЬЩ\ЬЪ[Ы‹™љ]™\”Э]KќљY]Щ\”›Ы_H™XЫЭ™\ћX
+NВ€ЫЫњЫЫK›ЩКЫЫ[X[™Щ\ЬЪ[Ы€ТО€^\™Y[™Э[K\Щ\ЬЪ[Ы€™\Э[ИЭЬYЪ]Э]]]Л\™]ћNИШ[YH]ИЩ^HЩ\\]Y	ШЫЫ[X[™Щ\ЬЪ[Ы‹XШЫЭ[ќTШЫЬHOOHЫЫ[X[™Щ\ЬЪ[Ы‹XШЫЭ[ќ”ШЫЬHИ	ШћHXШЫЭ[ќ	И€	Ъ[ЫЬњ™XЭIЯX
+NВ€ЫЫњЫЫK›ЩКЫЫ[X[™™XЫЭ™\ћHТО€\YYЭ]HЪЪ\Y™\^NИ[Ъ[™ЩYЭ]H™\^YYЫЩNИЪ[™ЩYШXШЩ\ЬЛ[ЬЭЬЭ[HЩ\ЬЪ[ЫњИЭЬY
+	ШЫЫ[X[™™XЫЭ™\ћKњ™\^PШ[Л›[™ЭH^XЪ]™\^JX
+NВ€ЫЫњЫЫK›ЩКЭ\њ™[ќљYH\ШЫЭ™\ћHТО€	ШЭ\њ™[ќљYKњ\ЬЩ[™Щ\‹›ЩKќљY]Щ\”›Ы_KЙШЭ\њ™[ќљYK™љ]™\‹›ЩKќљY]Щ\”›Ы_H›Э[™Ы™HXЭ]™HљYNИ[њ™[]Y[™\›Z[[љY]Щ\њИ™XЩZ]™Y›Щ[\ЬИЊИ[XљYЭZ]HЭЬYЪ]X
+NВ€ЫЫњЫЫK›ЩКШ[Щ[][Ы€™X\ЫЫ€ТО€	ШШ[Щ[][Ы”™X\ЫЫњЛ[ЭЩY›X\
+][HO€][Kњ™X\ЫЫЉKљ›Ъ[Љ	ЛЙК_NИ^XЭ™\^\ИЭX›KЪ[™ЩY™X\ЫЫњИЫЫ™›XЭY\›Z[[™X\ЫЫњИ[[]]X›K[ќ[Y[Y\ИЪ[™ЩY›ИЭ]X
+NВ€ЫЫњЫЫK›ЩК]Y]ТО€	Ш]Y]™]™[ќЛ›[™ЭH[ЭЫ\ЭY]™[ќЛ›И™\^H\XШ]HЬ€љ]]H[њ]
+NВ€JKШ]Ъ
+\њ›Ь€O€В€ЫЫњЫЫK™\њ›ЬЉЫЫќXЭZ[Y€	Щ\њ›Ь‹›Y\ЬШYЩ_X
+NВ€›ШЩ\ЬЛ™^]ЫЩHHNВ€JNВџB‚›[Щ[K™^ЬќИHС’VT‘KUQUС’QSЛРSђСSUSУ—Ф‘PTУУ”ЛЬ™X]S[ШЪТ[™\‹ШЩ[\љ[ЬЛќ[’ЫЫќXЭќ[“[ШЪРЫЫќXЭќ[ђЫЫЭ\њ™[ЮPЫЫќXЭќ[“Щ™™\•[Y]PЫЫќXЭќ[ђШ[Щ[][Ы”™X\ЫЫђЫЫќXЭќ[”љYTШY™]PЫЫќXЭќ[ђ›Ш\™[™ФXЩPЫЫќXЭќ[ђЭ\њ™[ќљYQ\ШЫЭ™\ћPЫЫќXЭќ[”™XЫЭ™\ћT™]ћPЫЫќXЭќ[”™]љ\Ъ[Ы“Y\™ЩPЫЫќXЭќ[“›ЭYљXШ][Ы’[ќЫЫќXЭќ[”Щ\ЬЪ[Ы’\ЫЫ][ЫђЫЫќXЭќ[ђЫЫ[X[™Щ\ЬЪ[ЫђЫЫќXЭќ[ђЫЫ[X[™™XЫЭ™\ћPЫЫќXЭќ[ђ]Y]ЫЫќXЭ™]ЪљYTЭ]UЪ]™]ћKY\™ЩTљYTЭ]U\]K\њЩTљYS›ЭYљXШ][Ы’[ќ[™TљYS›ЭYљXШ][Ы’[ќЬ™X]TљYTЩ\ЬЪ[ЫђЫY[ќЬ™X]TЩ\ЬЪ[Ыђ›Э[™ЫЫ[X[™ЫY[ќY[\Э[ЮTШЫЬRЩ^K\њЩT™]ћPYќ\“\Л^Ы™[ќX[XЪЫЩ™“\ЛЭ\ќ[ШЪФЩ\ќ™\џNВ
