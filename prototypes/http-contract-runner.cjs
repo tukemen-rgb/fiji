@@ -138,6 +138,38 @@ function createMockState(options = {}) {
   };
 }
 
+function refreshMockOffer(state) {
+  if (state.offer.status !== 'active') return state.offer;
+  if (state.clockMs >= state.offer.expiresAtMs) {
+    state.offer.status = 'expired';
+    state.offer.statusReason = 'time';
+  } else if (!state.driverEligibility[state.offer.driverId]) {
+    state.offer.status = 'unavailable';
+    state.offer.statusReason = 'eligibility';
+  }
+  return state.offer;
+}
+
+function offerListView(state) {
+  const offer = refreshMockOffer(state);
+  const offers = offer.status === 'active' ? [{
+    id: offer.id,
+    requestId: FIXTURE.requestId,
+    fareCents: offer.fareCents,
+    etaMinutes: offer.etaMinutes,
+    status: offer.status,
+    expiresAt: new Date(offer.expiresAtMs).toISOString()
+  }] : [];
+  return {
+    offers,
+    summary: {
+      active: offer.status === 'active' ? 1 : 0,
+      expired: offer.status === 'expired' ? 1 : 0,
+      unavailable: offer.status === 'unavailable' ? 1 : 0
+    }
+  };
+}
+
 function recordAudit(state, actor, event) {
   const entry = Object.freeze({
     id: `audit-${++state.auditSequence}`,
@@ -243,7 +275,7 @@ function createMockHandler(state = createMockState()) {
     if (req.method === 'GET' && url.pathname === offersPath) {
       if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
       if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      return send(res, 200, {offers: [], summary: {active: 0, expired: 0, unavailable: 0}});
+      return send(res, 200, offerListView(state));
     }
     if (req.method === 'POST' && url.pathname === offersPath) {
       if (actor.role !== 'driver' || !actor.eligible) return send(res, 403, errorBody('role_or_eligibility_denied', 'This role or eligibility cannot perform the operation.', 'eligibility'));
@@ -878,6 +910,47 @@ async function runOfferValidityContract() {
   return {expired, boundary, ineligible, valid, clientClock};
 }
 
+async function runOfferListContract() {
+  const clockMs = Date.parse('2026-09-17T03:00:00Z');
+  const read = async options => {
+    const mock = await startMockServer({clockMs, ...options});
+    try {
+      const result = await requestJson(mock.baseUrl, {
+        method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: FIXTURE.tokens.owner
+      }, fetch);
+      return {
+        result,
+        ride: structuredClone(mock.state.ride),
+        offer: structuredClone(mock.state.offer),
+        auditEvents: structuredClone(mock.state.auditEvents),
+        storedKeys: mock.state.idempotency.size
+      };
+    } finally {
+      await mock.close();
+    }
+  };
+  const [active, expired, unavailable] = await Promise.all([
+    read({offerExpiresAtMs: clockMs + 1}),
+    read({offerExpiresAtMs: clockMs}),
+    read({offerExpiresAtMs: clockMs + 1, offerDriverEligible: false})
+  ]);
+  if (active.result.status !== 200 || active.result.body?.offers?.length !== 1 || active.result.body?.summary?.active !== 1) {
+    throw new Error('active offer list did not return its selectable offer');
+  }
+  if (expired.result.status !== 200 || expired.result.body?.offers?.length !== 0 || expired.result.body?.summary?.expired !== 1) {
+    throw new Error('expired offer list did not return expiry guidance state');
+  }
+  if (unavailable.result.status !== 200 || unavailable.result.body?.offers?.length !== 0 || unavailable.result.body?.summary?.unavailable !== 1) {
+    throw new Error('unavailable offer list did not distinguish eligibility loss');
+  }
+  for (const item of [active, expired, unavailable]) {
+    if (item.ride.status !== 'collecting' || item.ride.revision !== FIXTURE.revision || item.auditEvents.length || item.storedKeys) {
+      throw new Error('reading offer guidance changed ride, audit, or idempotency state');
+    }
+  }
+  return {active, expired, unavailable};
+}
+
 async function runMockContract() {
   const mock = await startMockServer({rideStatus: 'assigned', assignedDriverId: 'driver-assigned'});
   try {
@@ -1444,7 +1517,7 @@ async function runCommandRecoveryContract() {
 }
 
 if (require.main === module) {
-  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract(), runCommandRecoveryContract(), runCurrentRideDiscoveryContract(), runCancellationReasonContract()]).then(([results, audit, retry, notification, commandRecovery, currentRide, cancellationReasons]) => {
+  Promise.all([runMockContract(), runAuditContract(), runRecoveryRetryContract(), runNotificationHintContract(), runCommandRecoveryContract(), runCurrentRideDiscoveryContract(), runCancellationReasonContract(), runOfferListContract()]).then(([results, audit, retry, notification, commandRecovery, currentRide, cancellationReasons, offerList]) => {
     const {race, validity, rideSafety, boardingRace} = audit;
     const merge = runRevisionMergeContract();
     const session = runSessionIsolationContract();
@@ -1463,6 +1536,7 @@ if (require.main === module) {
     console.log(`Command recovery OK: applied state skipped replay; unchanged state replayed once; changed/access-lost/stale sessions stopped (${commandRecovery.replayCalls.length} explicit replay)`);
     console.log(`Current ride discovery OK: ${currentRide.passenger.body.viewerRole}/${currentRide.driver.body.viewerRole} found one active ride; unrelated and terminal viewers received bodyless 204; ambiguity stopped with 409`);
     console.log(`HTTP cancellation reason OK: ${cancellationReasons.allowed.map(item => item.reason).join('/')}; exact replays stable, changed reasons conflicted, terminal reasons immutable, invalid values changed no state`);
+    console.log(`HTTP offer list OK: ${offerList.active.result.body.summary.active} active, ${offerList.expired.result.body.summary.expired} expired, ${offerList.unavailable.result.body.summary.unavailable} unavailable; stale offers omitted without ride mutation`);
     console.log(`HTTP audit OK: ${audit.events.length} allowlisted events, no replay duplicate or private input`);
   }).catch(error => {
     console.error(`HTTP contract failed: ${error.message}`);
@@ -1470,4 +1544,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {FIXTURE, AUDIT_FIELDS, CANCELLATION_REASONS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runCancellationReasonContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};
+module.exports = {FIXTURE, AUDIT_FIELDS, CANCELLATION_REASONS, createMockHandler, scenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runOfferListContract, runCancellationReasonContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, fetchRideStateWithRetry, mergeRideStateUpdate, parseRideNotificationHint, handleRideNotificationHint, createRideSessionClient, createSessionBoundCommandClient, idempotencyScopeKey, parseRetryAfterMs, exponentialBackoffMs, startMockServer};

@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {OPERATIONS, CANCELLATION_REASONS, loadContract, validateContract} = require('../api-contract-check.cjs');
-const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runCancellationReasonContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
+const {FIXTURE, AUDIT_FIELDS, scenarios: httpScenarios, runHttpContract, runMockContract, runConcurrencyContract, runOfferValidityContract, runOfferListContract, runCancellationReasonContract, runRideSafetyContract, runBoardingRaceContract, runCurrentRideDiscoveryContract, runRecoveryRetryContract, runRevisionMergeContract, runNotificationHintContract, runSessionIsolationContract, runCommandSessionContract, runCommandRecoveryContract, runAuditContract, parseRetryAfterMs} = require('../http-contract-runner.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../role-split/index.html'), 'utf8');
 const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(x => x[1]);
 let auditContract;
@@ -31,6 +31,8 @@ let commandRecoveryContract;
 function commandRecoveryResults() { return commandRecoveryContract ||= runCommandRecoveryContract(); }
 let cancellationReasonContract;
 function cancellationReasonResults() { return cancellationReasonContract ||= runCancellationReasonContract(); }
+let offerListContract;
+function offerListResults() { return offerListContract ||= runOfferListContract(); }
 function setup() {
   const sandbox = vm.createContext({});
   scripts.slice(0, 2).forEach(script => vm.runInContext(script, sandbox));
@@ -3262,6 +3264,29 @@ test('client cannot override the trusted offer-selection clock', async () => {
   assert.equal(validity.clientClock.result.body.code,'invalid_request');
   assert.equal(validity.clientClock.ride.status,'collecting');
   assert.equal(validity.clientClock.offer.status,'active');
+});
+test('offer list returns only an active server-timed offer with its expiry', async () => {
+  const {active}=await offerListResults();
+  assert.equal(active.result.status,200);
+  assert.deepEqual(active.result.body.summary,{active:1,expired:0,unavailable:0});
+  assert.deepEqual(active.result.body.offers,[{
+    id:FIXTURE.offerId,requestId:FIXTURE.requestId,fareCents:2300,etaMinutes:7,
+    status:'active',expiresAt:'2026-09-17T03:00:00.001Z'
+  }]);
+});
+test('offer list distinguishes expiry from eligibility loss without changing the ride', async () => {
+  const {expired,unavailable}=await offerListResults();
+  assert.deepEqual(expired.result.body,{offers:[],summary:{active:0,expired:1,unavailable:0}});
+  assert.equal(expired.offer.status,'expired');
+  assert.equal(expired.offer.statusReason,'time');
+  assert.deepEqual(unavailable.result.body,{offers:[],summary:{active:0,expired:0,unavailable:1}});
+  assert.equal(unavailable.offer.status,'unavailable');
+  assert.equal(unavailable.offer.statusReason,'eligibility');
+  for(const item of [expired,unavailable]){
+    assert.deepEqual(item.ride,{id:FIXTURE.requestId,status:'collecting',revision:FIXTURE.revision,assignedDriverId:null,vehicleConfirmation:null});
+    assert.deepEqual(item.auditEvents,[]);
+    assert.equal(item.storedKeys,0);
+  }
 });
 test('successful offer selection records a minimal server-timestamped audit event', async () => {
   const {validity}=await auditedHttpResults(),event=validity.valid.auditEvents[0];
