@@ -426,6 +426,86 @@
     };
     return Object.freeze({snapshot,recoverOnStartup,resume,beginSession,setVisible,dispose});
   }
+  function createOfferExpiryRefreshFlow({readOffers,eventTarget,documentState,setTimer=setTimeout,clearTimer=clearTimeout}){
+    if(typeof readOffers!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string'||typeof setTimer!=='function'||typeof clearTimer!=='function')throw Error('提示期限更新の設定が不正です。');
+    let attached=false,detached=false,visible=documentState.visibilityState!=='hidden',timer=null,timerVersion=0,operation=null,refreshOnVisible=false,refreshes=0,lastReason='idle',serverNow=null,nextExpiryAt=null;
+    const operations=new Set();
+    const snapshot=()=>Object.freeze({attached,detached,visible,busy:Boolean(operation),timerScheduled:timer!==null,refreshOnVisible,refreshes,lastReason,serverNow,nextExpiryAt});
+    const reject=reason=>Promise.resolve({refreshed:false,reason,state:snapshot()});
+    const cancelTimer=()=>{
+      timerVersion+=1;
+      if(timer!==null){try{clearTimer(timer);}catch{}timer=null;}
+    };
+    const parseList=value=>{
+      const now=Date.parse(value?.serverNow),expiry=value?.nextExpiryAt===null?null:Date.parse(value?.nextExpiryAt);
+      if(!value||!Array.isArray(value.offers)||!Number.isFinite(now)||value.nextExpiryAt!==null&&!Number.isFinite(expiry)||expiry!==null&&expiry<now)return null;
+      return Object.freeze({serverNow:new Date(now).toISOString(),nextExpiryAt:expiry===null?null:new Date(expiry).toISOString(),delayMs:expiry===null?null:Math.max(0,expiry-now)});
+    };
+    const schedule=parsed=>{
+      cancelTimer();serverNow=parsed.serverNow;nextExpiryAt=parsed.nextExpiryAt;
+      if(nextExpiryAt===null){refreshOnVisible=false;lastReason='no_active_expiry';return;}
+      if(!visible){refreshOnVisible=true;lastReason='expiry_waiting_for_visible';return;}
+      const token=timerVersion;
+      timer=setTimer(()=>{
+        if(detached||!attached||token!==timerVersion)return;
+        timer=null;
+        if(!visible){refreshOnVisible=true;lastReason='expiry_waiting_for_visible';return;}
+        void refresh('expiry');
+      },parsed.delayMs);
+      lastReason='expiry_scheduled';
+    };
+    const apply=value=>{
+      if(detached)return {applied:false,reason:'flow_detached',state:snapshot()};
+      const parsed=parseList(value);
+      if(!parsed){lastReason='invalid_offer_list';return {applied:false,reason:lastReason,state:snapshot()};}
+      schedule(parsed);return {applied:true,reason:lastReason,state:snapshot()};
+    };
+    const refresh=reason=>{
+      if(!attached||detached)return reject('flow_inactive');
+      if(!visible){refreshOnVisible=true;lastReason='screen_hidden';return reject(lastReason);}
+      if(operation)return reject('refresh_in_progress');
+      cancelTimer();refreshOnVisible=false;lastReason=reason==='resume'?'resume_refresh_pending':'expiry_refresh_pending';
+      const version=timerVersion;
+      let task;
+      task=Promise.resolve().then(()=>readOffers(Object.freeze({reason,serverNow,nextExpiryAt}))).then(value=>{
+        if(detached||!attached||version!==timerVersion){lastReason='stale_refresh';return {refreshed:false,reason:lastReason,state:snapshot()};}
+        const applied=apply(value);
+        if(!applied.applied){lastReason='invalid_offer_list';return {refreshed:false,reason:lastReason,state:snapshot()};}
+        refreshes+=1;lastReason=reason==='resume'?'resumed':'refreshed';
+        return {refreshed:true,reason:lastReason,state:snapshot()};
+      },()=>{
+        if(!detached&&attached&&version===timerVersion){refreshOnVisible=true;lastReason='refresh_failed';}
+        return {refreshed:false,reason:detached||!attached||version!==timerVersion?'stale_refresh':'refresh_failed',state:snapshot()};
+      }).finally(()=>{operations.delete(task);if(operation===task)operation=null;});
+      operation=task;operations.add(task);return task;
+    };
+    const syncVisibility=name=>{
+      if(!attached||detached)return;
+      const nextVisible=documentState.visibilityState!=='hidden';
+      if(!nextVisible){
+        if(visible){visible=false;refreshOnVisible=nextExpiryAt!==null;cancelTimer();lastReason='hidden';}
+        return;
+      }
+      const resumed=!visible;visible=true;
+      if((resumed||name==='pageshow')&&refreshOnVisible){refreshOnVisible=false;void refresh('resume');}
+    };
+    const onVisibilityChange=()=>syncVisibility('visibilitychange');
+    const onPageShow=()=>syncVisibility('pageshow');
+    const attach=()=>{
+      if(detached)return {started:false,reason:'flow_detached',state:snapshot()};
+      if(attached)return {started:false,reason:'already_attached',state:snapshot()};
+      attached=true;visible=documentState.visibilityState!=='hidden';eventTarget.addEventListener('visibilitychange',onVisibilityChange);eventTarget.addEventListener('pageshow',onPageShow);lastReason='attached';
+      return {started:true,reason:'attached',state:snapshot()};
+    };
+    const detach=()=>{
+      if(detached)return {detached:false,reason:'already_detached',state:snapshot()};
+      if(attached){eventTarget.removeEventListener('visibilitychange',onVisibilityChange);eventTarget.removeEventListener('pageshow',onPageShow);}
+      attached=false;detached=true;refreshOnVisible=false;cancelTimer();lastReason='detached';
+      return {detached:true,reason:'detached',state:snapshot()};
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
+    return Object.freeze({snapshot,attach,apply,refresh,detach,idle});
+  }
   function createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery}){
     if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||requestRecovery!==undefined&&typeof requestRecovery!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');
     let attached=false,detached=false,lastEvent='idle',handledEvents=0,onlinePending=null;
@@ -1624,7 +1704,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
