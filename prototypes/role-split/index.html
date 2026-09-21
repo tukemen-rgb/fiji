@@ -60,7 +60,7 @@
 <div class="quick-grid"><button class="quick" data-nav="verify"><svg class="icon"><use href="#i-shield"/></svg><span><b>車両を照合</b><small>ナンバー・許可情報</small></span></button><button class="quick" data-nav="passenger-history"><svg class="icon"><use href="#i-clock"/></svg><span><b>乗車履歴</b><small>依頼・提示額の記録</small></span></button></div>
 <div class="section-title">よく使う行き先 · サンプル</div><button class="place-row" data-destination="Nadi Town, Fiji"><svg class="icon"><use href="#i-clock"/></svg><span>Nadi Town<small>街の中心へ</small></span><svg class="icon"><use href="#i-arrow"/></svg></button><button class="place-row" data-destination="Nadi International Airport, Fiji"><svg class="icon"><use href="#i-clock"/></svg><span>Nadi Airport<small>空港へ</small></span><svg class="icon"><use href="#i-arrow"/></svg></button>
 <div class="notice-line"><svg class="icon"><use href="#i-shield"/></svg><span>アプリへの登録と、営業許可の確認は別です。確認元・日時・有効期限を表示します。</span></div></div></section>
-<section id="offers-page" class="page panel" hidden><div class="backline"><button class="icon-btn" data-nav="home" aria-label="戻る"><svg class="icon"><use href="#i-back"/></svg></button>ルートに戻る</div><p class="eyebrow">COMPARE OFFERS</p><h1>料金と車両で選ぶ</h1><p id="offer-destination" class="muted"></p><p class="banner">車両・金額・到着時間は架空のサンプルです。実際の配車・固定運賃の確約は行いません。</p><div id="offers"></div></section>
+<section id="offers-page" class="page panel" hidden><div class="backline"><button class="icon-btn" data-nav="home" aria-label="戻る"><svg class="icon"><use href="#i-back"/></svg></button>ルートに戻る</div><p class="eyebrow">COMPARE OFFERS</p><h1>料金と車両で選ぶ</h1><p id="offer-destination" class="muted"></p><p class="banner">車両・金額・到着時間は架空のサンプルです。実際の配車・固定運賃の確約は行いません。</p><div id="offer-access-feedback" class="empty" role="status" aria-live="polite" hidden><strong id="offer-access-title"></strong><p id="offer-access-message"></p><button id="offer-access-action" class="secondary" type="button" hidden></button></div><div id="offers"></div></section>
 <section id="verify-page" class="page panel" hidden><p class="eyebrow">BEFORE YOU BOARD</p><h1>この車で、合っていますか？</h1><p class="muted">許可情報に加えて、目の前の車両も照合。</p><form id="lookup-form"><label class="field">ナンバープレート<input id="plate-input" placeholder="例：DEMO 001" maxlength="20" autocomplete="off" autocapitalize="characters" required></label><label class="checkbox"><input id="airport-check" type="checkbox">空港から乗車（空港側の確認も必要）</label><button class="primary" type="submit">登録情報を照合する</button></form><p class="samples-label">テスト用ナンバー</p><div class="sample-buttons"><button data-plate="DEMO 001">確認済みの見本</button><button data-plate="DEMO 003">期限切れ</button><button data-plate="DEMO 004">申請中</button><button data-plate="DEMO 999">未登録</button></div><div id="lookup-result" aria-live="polite"></div><p class="muted">照合先はこのプレビュー内の架空台帳です。LTAの公的登録簿とは接続していません。</p></section>
 <section id="register-page" class="page panel" hidden><div class="backline"><button class="icon-btn" data-nav="role" aria-label="役割選択に戻る"><svg class="icon"><use href="#i-back"/></svg></button>運転手として登録</div><p class="eyebrow">DRIVER ONBOARDING</p><h1>タクシー登録申請</h1><p class="muted">申請後、発行元の情報と照合してから掲載。</p><div class="banner">テスト専用です。実名・実際の免許番号や書類は入れないでください。入力内容は送信・永続保存されません。</div><button class="small-action" id="fill-sample">サンプル情報を入力する</button><div class="form-progress" id="progress"><span class="on"></span><span></span><span></span></div>
 <form id="registration-form"><div id="reg-step-0"><label class="field">運転手氏名<input name="name" maxlength="160" required></label><label class="field">連絡先（国番号を含む）<input name="phone" type="tel" maxlength="22" required></label><label class="field">運転免許番号<input name="driverLicence" maxlength="160" required></label><label class="field">PSV運転手許可番号<input name="psvPermit" maxlength="160" required></label></div>
@@ -528,6 +528,62 @@
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,attach,apply,refresh,detach,idle});
+  }
+  function createOfferAccessDomBridge({flow,elements,onReauthenticate=()=>({requested:true}),onPassengerHome=()=>({navigated:true})}){
+    if(!flow||typeof flow.snapshot!=='function'||typeof flow.refresh!=='function'||!elements||!elements.panel||!elements.title||!elements.message||!elements.action||typeof elements.action.addEventListener!=='function'||typeof elements.action.removeEventListener!=='function'||typeof onReauthenticate!=='function'||typeof onPassengerHome!=='function')throw Error('提示案内パネルの設定が不正です。');
+    const offerButtons=[...(elements.offerButtons||[])],driverControls=[...(elements.driverControls||[])];
+    let attached=false,detached=false,pending=null,consumedAction=null,lastAction='idle';
+    const copy=guidance=>{
+      if(guidance==='session_expired')return {title:'ログインが必要です',message:'最新の提示を確認するため、利用者として再ログインしてください。',action:'reauthenticate',label:'利用者として再ログイン'};
+      if(guidance==='passenger_role_required')return {title:'利用者画面に戻ってください',message:'提示は利用者アカウントから確認できます。',action:'passenger_role',label:'利用者ホームへ'};
+      if(guidance==='request_unavailable')return {title:'この依頼は利用できません',message:'依頼が終了したか、表示できなくなりました。利用者ホームから確認してください。',action:null,label:''};
+      if(guidance==='latest_offer_required')return {title:'提示を更新してください',message:'古い提示は選べません。最新の提示を確認してください。',action:'refresh',label:'最新の提示を確認'};
+      return null;
+    };
+    const view=()=>{
+      const state=flow.snapshot(),content=copy(state.guidance);
+      return Object.freeze({hidden:!content,title:content?.title||'',message:content?.message||'',action:content?.action||null,label:content?.label||'',offersSelectable:state.offersSelectable===true,busy:Boolean(pending),consumed:content?.action!==null&&content?.action===consumedAction});
+    };
+    const snapshot=()=>Object.freeze({attached,detached,busy:Boolean(pending),consumedAction,lastAction,view:view()});
+    const render=()=>{
+      const current=view();
+      offerButtons.forEach(button=>{button.disabled=!current.offersSelectable;});
+      driverControls.forEach(control=>{control.hidden=true;control.setAttribute?.('aria-hidden','true');});
+      if(detached)return current;
+      elements.panel.hidden=current.hidden;elements.title.textContent=current.title;elements.message.textContent=current.message;
+      const showAction=Boolean(current.action)&&!current.consumed;
+      elements.action.hidden=!showAction;elements.action.disabled=!showAction||current.busy;elements.action.textContent=current.label;
+      elements.action.setAttribute?.('data-offer-action',current.action||'');
+      return current;
+    };
+    const activate=()=>{
+      if(!attached||detached)return Promise.resolve({processed:false,reason:'bridge_inactive',state:snapshot()});
+      const current=view();
+      if(pending)return Promise.resolve({processed:false,reason:'action_in_progress',state:snapshot()});
+      if(!current.action||current.consumed)return Promise.resolve({processed:false,reason:'action_not_available',state:snapshot()});
+      const selected=current.action;lastAction=selected;render();
+      let task;
+      const work=selected==='reauthenticate'?onReauthenticate():selected==='passenger_role'?onPassengerHome():flow.refresh('manual');
+      task=Promise.resolve(work).then(result=>{
+        if(detached)return {processed:false,reason:'stale_action',state:snapshot()};
+        consumedAction=selected;lastAction='completed';return {processed:true,reason:'completed',action:selected,result,state:snapshot()};
+      },()=>{lastAction='action_failed';return {processed:false,reason:lastAction,state:snapshot()};}).finally(()=>{if(pending===task)pending=null;render();});
+      pending=task;render();return task;
+    };
+    const onClick=event=>{event?.preventDefault?.();void activate();};
+    const attach=()=>{
+      if(detached)return {attached:false,reason:'bridge_detached',state:snapshot()};
+      if(attached)return {attached:false,reason:'already_attached',state:snapshot()};
+      attached=true;elements.action.addEventListener('click',onClick);lastAction='attached';render();return {attached:true,reason:'attached',state:snapshot()};
+    };
+    const detach=()=>{
+      if(detached)return {detached:false,reason:'already_detached',state:snapshot()};
+      if(attached)elements.action.removeEventListener('click',onClick);
+      attached=false;detached=true;elements.panel.hidden=true;elements.action.hidden=true;elements.action.disabled=true;lastAction='detached';
+      return {detached:true,reason:'detached',state:snapshot()};
+    };
+    const idle=async()=>{if(pending)await pending;return snapshot();};
+    return Object.freeze({snapshot,attach,render,activate,detach,idle});
   }
   function createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery}){
     if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||requestRecovery!==undefined&&typeof requestRecovery!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');
@@ -1727,7 +1783,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createOfferAccessDomBridge,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>

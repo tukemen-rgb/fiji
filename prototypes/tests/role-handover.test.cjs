@@ -1165,6 +1165,39 @@ function feedbackDomElements() {
   const target=recoveryEventTarget(),element=()=>({hidden:false,disabled:false,textContent:'',className:'',attributes:{},setAttribute(name,value){this.attributes[name]=String(value);}}),action=Object.assign(element(),target);
   return {box:element(),title:element(),message:element(),action,commandButtons:[element(),element()]};
 }
+function offerAccessDomElements() {
+  const element=()=>({hidden:false,disabled:false,textContent:'',attributes:{},setAttribute(name,value){this.attributes[name]=String(value);}});
+  return {panel:element(),title:element(),message:element(),action:Object.assign(element(),recoveryEventTarget()),offerButtons:[element(),element()],driverControls:[element(),element()]};
+}
+test('offer access panel runs passenger reauthentication once and never exposes driver controls', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements();let reads=0,reauthentications=0,release;
+  const flow=R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>{reads+=1;return {status:401};}});
+  flow.attach();flow.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:10.000Z',offers:[{id:'stale-offer'}]});
+  const bridge=R.createOfferAccessDomBridge({flow,elements,onReauthenticate:()=>{reauthentications+=1;return new Promise(resolve=>{release=resolve;});}});
+  bridge.attach();await flow.refresh('expiry');bridge.render();
+  assert.equal(reads,1);assert.equal(elements.panel.hidden,false);assert.equal(elements.action.hidden,false);assert.equal(elements.action.textContent,'利用者として再ログイン');
+  assert.match(elements.title.textContent,/ログイン/);assert.doesNotMatch(elements.title.textContent+elements.message.textContent+elements.action.textContent,/運転手/);
+  assert.ok(elements.offerButtons.every(button=>button.disabled));assert.ok(elements.driverControls.every(control=>control.hidden&&control.attributes['aria-hidden']==='true'));
+  const first=bridge.activate(),duplicate=await bridge.activate();assert.equal(reauthentications,1);assert.equal(duplicate.reason,'action_in_progress');
+  release({requested:true});const completed=await first;await bridge.idle();assert.equal(completed.processed,true);assert.equal(elements.action.hidden,true);
+  const repeated=await bridge.activate();assert.equal(repeated.reason,'action_not_available');assert.equal(reauthentications,1);
+});
+test('offer access panel separates passenger-role guidance from a no-action missing request', async () => {
+  for(const expected of [
+    {status:403,label:'利用者ホームへ',title:/利用者画面/,passengerHomes:1,hidden:false},
+    {status:404,label:'',title:/利用できません/,passengerHomes:0,hidden:true}
+  ]){
+    const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'},elements=offerAccessDomElements(),timers=expiryTimers();let passengerHomes=0;
+    const flow=R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>({status:expected.status})});
+    flow.attach();flow.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:10.000Z',offers:[{id:'stale-offer'}]});
+    const bridge=R.createOfferAccessDomBridge({flow,elements,onPassengerHome:()=>{passengerHomes+=1;return {navigated:true};}});
+    bridge.attach();await flow.refresh('expiry');bridge.render();
+    assert.equal(elements.panel.hidden,false);assert.match(elements.title.textContent,expected.title);assert.equal(elements.action.hidden,expected.hidden);assert.equal(elements.action.textContent,expected.label);
+    assert.ok(elements.offerButtons.every(button=>button.disabled));assert.ok(elements.driverControls.every(control=>control.hidden));assert.doesNotMatch(elements.title.textContent+elements.message.textContent+elements.action.textContent,/運転手/);
+    const result=await bridge.activate();await bridge.idle();
+    assert.equal(passengerHomes,expected.passengerHomes);assert.equal(result.processed,expected.status===403);
+  }
+});
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));
