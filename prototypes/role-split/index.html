@@ -1440,7 +1440,8 @@
     const cancel=()=>{generation+=1;pending=null;return snapshot();};
     const canApply=token=>pending===token;
     const apply=token=>{if(!canApply(token))return Object.freeze({accepted:false,reason:'stale_place',state:snapshot()});pending=null;return Object.freeze({accepted:true,reason:'selected',state:snapshot()});};
-    return Object.freeze({snapshot,begin,cancel,canApply,apply});
+    const fail=token=>{if(!canApply(token))return Object.freeze({accepted:false,reason:'stale_place',state:snapshot()});pending=null;return Object.freeze({accepted:true,reason:'place_failed',state:snapshot()});};
+    return Object.freeze({snapshot,begin,cancel,canApply,apply,fail});
   }
   function create(){
     let seq=10;
@@ -1957,7 +1958,7 @@ $('connect-maps').onclick = async () => {
           if(!placeSelection.canApply(selection.token))return;const selected=R.googlePlaceDestination(p);if(!selected){placeSelection.apply(selection.token);return;}if(!invalidateCurrentSearch({destination:selected.label})){placeSelection.apply(selection.token);return;}if(!placeSelection.apply(selection.token).accepted)return;
           state.destination=selected.route;$('destination').value=selected.label;
           await drawRoute();
-        }catch{toast('目的地を取得できません。再選択してください。');}
+        }catch{if(placeSelection.fail(selection.token).accepted)toast('目的地を取得できません。再選択してください。');}
       });
       $('google-search').replaceChildren(ac);$('google-search').hidden=false;
       $('offline-search').hidden=true;

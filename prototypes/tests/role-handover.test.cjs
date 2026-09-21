@@ -149,6 +149,21 @@ test('manual destination and ride submission cancel a pending Google place resul
   const {R}=setup(),selection=R.createGooglePlaceSelectionController(),pending=selection.begin();
   selection.cancel();assert.equal(selection.canApply(pending.token),false);assert.equal(selection.apply(pending.token).accepted,false);
 });
+test('a delayed Google place failure stays silent after a newer selection', () => {
+  const {R}=setup(),selection=R.createGooglePlaceSelectionController();
+  const old=selection.begin(),current=selection.begin();
+  assert.equal(selection.fail(old.token).accepted,false);
+  assert.equal(selection.canApply(current.token),true);
+  assert.equal(selection.apply(current.token).accepted,true);
+});
+test('only the current Google place failure closes the pending selection and shows guidance', () => {
+  assert.match(source,/catch\{if\(placeSelection\.fail\(selection\.token\)\.accepted\)toast\('目的地を取得できません。再選択してください。'\);\}/);
+  const {R}=setup(),selection=R.createGooglePlaceSelectionController(),current=selection.begin();
+  const failed=selection.fail(current.token);
+  assert.equal(failed.accepted,true);assert.equal(failed.reason,'place_failed');
+  assert.deepEqual({...selection.snapshot()},{generation:current.token,pending:false});
+  assert.equal(selection.fail(current.token).accepted,false);
+});
 test('manual pickup survives map and geolocation failure and can still create a request', () => {
   const {R,m}=setup(),pickup=R.createPickupInputController('Ramada Wailoaloa');
   const locating=pickup.beginLocation();
