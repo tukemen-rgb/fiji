@@ -150,7 +150,13 @@ function validateContract(spec) {
     if (!response) add(`getCurrentRide must document ${code}`);
     else if (!response.headers?.['Retry-After']) add(`getCurrentRide ${code} requires Retry-After header`);
   }
+  const offerRead = spec.paths?.['/v1/ride-requests/{requestId}/offers']?.get;
+  const offerHeaders = offerRead?.responses?.['200']?.headers || {};
+  for (const name of ['Cache-Control', 'Vary']) {
+    if (!offerHeaders[name]) add(`listRideOffers 200 requires ${name} header`);
+  }
   if (spec.components?.headers?.PrivateNoCache?.schema?.const !== 'private, no-cache') add('ride state cache control must be private, no-cache');
+  if (spec.components?.headers?.PrivateNoStore?.schema?.const !== 'private, no-store') add('offer list cache control must be private, no-store');
   if (spec.components?.headers?.VaryAuthorization?.schema?.const !== 'Authorization') add('ride state response must vary by Authorization');
   return errors;
 }

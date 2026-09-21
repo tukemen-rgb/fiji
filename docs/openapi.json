@@ -36,7 +36,14 @@
         "summary": "List currently selectable offers for the owning passenger",
         "tags": ["Passenger"],
         "responses": {
-          "200": { "description": "Current offers and unavailable-count summary", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OfferList" } } } },
+          "200": {
+            "description": "Current offers and unavailable-count summary",
+            "headers": {
+              "Cache-Control": { "$ref": "#/components/headers/PrivateNoStore" },
+              "Vary": { "$ref": "#/components/headers/VaryAuthorization" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OfferList" } } }
+          },
           "401": { "$ref": "#/components/responses/AuthenticationRequired" },
           "403": { "$ref": "#/components/responses/RoleDenied" },
           "404": { "$ref": "#/components/responses/NotFound" }
@@ -233,6 +240,7 @@
     "headers": {
       "RideStateETag": { "description": "Opaque validator scoped to the ride revision and authenticated viewer role", "schema": { "type": "string" } },
       "PrivateNoCache": { "description": "Prevents shared reuse and requires revalidation", "schema": { "type": "string", "const": "private, no-cache" } },
+      "PrivateNoStore": { "description": "Prevents storage or shared reuse of private offer data", "schema": { "type": "string", "const": "private, no-store" } },
       "VaryAuthorization": { "description": "Separates authenticated representations", "schema": { "type": "string", "const": "Authorization" } },
       "RetryAfter": { "description": "Minimum delay before retrying, as delta-seconds or an HTTP date", "schema": { "type": "string", "minLength": 1 } }
     },

@@ -222,8 +222,12 @@ async function atomicCommand(state, actor, req, url, body, action) {
 function createMockHandler(state = createMockState()) {
   const handler = async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
+    const offerReadPath = `/v1/ride-requests/${FIXTURE.requestId}/offers`;
+    const offerReadHeaders = req.method === 'GET' && url.pathname === offerReadPath
+      ? {'cache-control': 'private, no-store', 'vary': 'Authorization'}
+      : {};
     const actor = actorFrom(req);
-    if (!actor) return send(res, 401, errorBody('authentication_required', 'Authentication is required.', 'auth'));
+    if (!actor) return send(res, 401, errorBody('authentication_required', 'Authentication is required.', 'auth'), offerReadHeaders);
     if (req.method === 'POST' && !req.headers['idempotency-key']) {
       return send(res, 422, errorBody('invalid_request', 'Idempotency-Key is required.', 'idempotency'));
     }
@@ -273,9 +277,9 @@ function createMockHandler(state = createMockState()) {
     }
 
     if (req.method === 'GET' && url.pathname === offersPath) {
-      if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'));
-      if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'));
-      return send(res, 200, offerListView(state));
+      if (actor.role !== 'passenger') return send(res, 403, errorBody('role_or_eligibility_denied', 'This role cannot perform the operation.', 'role'), offerReadHeaders);
+      if (actor.id !== 'passenger-owner') return send(res, 404, errorBody('resource_not_found', 'Resource was not found.', 'hidden'), offerReadHeaders);
+      return send(res, 200, offerListView(state), offerReadHeaders);
     }
     if (req.method === 'POST' && url.pathname === offersPath) {
       if (actor.role !== 'driver' || !actor.eligible) return send(res, 403, errorBody('role_or_eligibility_denied', 'This role or eligibility cannot perform the operation.', 'eligibility'));
@@ -916,7 +920,7 @@ async function runOfferListContract() {
     const mock = await startMockServer({clockMs, ...options});
     try {
       const result = await requestJson(mock.baseUrl, {
-        method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: FIXTURE.tokens.owner
+        method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: FIXTURE.tokens.owner, captureHeaders: true
       }, fetch);
       return {
         result,
@@ -934,6 +938,17 @@ async function runOfferListContract() {
     read({offerExpiresAtMs: clockMs}),
     read({offerExpiresAtMs: clockMs + 1, offerDriverEligible: false})
   ]);
+  const deniedMock = await startMockServer({clockMs, offerExpiresAtMs: clockMs + 1});
+  let denied;
+  try {
+    denied = await Promise.all([
+      requestJson(deniedMock.baseUrl, {method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, captureHeaders: true}, fetch),
+      requestJson(deniedMock.baseUrl, {method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: FIXTURE.tokens.reviewedDriver, captureHeaders: true}, fetch),
+      requestJson(deniedMock.baseUrl, {method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: FIXTURE.tokens.otherPassenger, captureHeaders: true}, fetch)
+    ]);
+  } finally {
+    await deniedMock.close();
+  }
   if (active.result.status !== 200 || active.result.body?.offers?.length !== 1 || active.result.body?.summary?.active !== 1) {
     throw new Error('active offer list did not return its selectable offer');
   }
@@ -948,7 +963,13 @@ async function runOfferListContract() {
       throw new Error('reading offer guidance changed ride, audit, or idempotency state');
     }
   }
-  return {active, expired, unavailable};
+  for (const item of [active.result, expired.result, unavailable.result, ...denied]) {
+    if (item.headers?.cacheControl !== 'private, no-store' || item.headers?.vary !== 'Authorization') {
+      throw new Error('offer list response was cacheable or did not vary by authorization');
+    }
+  }
+  if (denied.map(item => item.status).join('/') !== '401/403/404') throw new Error('offer list denial controls changed');
+  return {active, expired, unavailable, denied};
 }
 
 async function runMockContract() {

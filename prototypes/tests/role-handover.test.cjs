@@ -3081,6 +3081,12 @@ test('API checker fails closed when safety requirements are removed', () => {
   const sharedCache=structuredClone(loadContract());
   sharedCache.components.headers.PrivateNoCache.schema.const='public, max-age=60';
   assert.ok(validateContract(sharedCache).some(message=>message.includes('ride state cache control must be private, no-cache')));
+  const storedOffers=structuredClone(loadContract());
+  storedOffers.components.headers.PrivateNoStore.schema.const='public, max-age=60';
+  assert.ok(validateContract(storedOffers).some(message=>message.includes('offer list cache control must be private, no-store')));
+  const missingOfferVary=structuredClone(loadContract());
+  delete missingOfferVary.paths['/v1/ride-requests/{requestId}/offers'].get.responses['200'].headers.Vary;
+  assert.ok(validateContract(missingOfferVary).some(message=>message.includes('listRideOffers 200 requires Vary header')));
   const noRateLimit=structuredClone(loadContract());
   delete noRateLimit.paths['/v1/rides/{requestId}'].get.responses['429'];
   assert.ok(validateContract(noRateLimit).some(message=>message.includes('getRideState must document 429')));
@@ -3268,11 +3274,21 @@ test('client cannot override the trusted offer-selection clock', async () => {
 test('offer list returns only an active server-timed offer with its expiry', async () => {
   const {active}=await offerListResults();
   assert.equal(active.result.status,200);
+  assert.deepEqual(active.result.headers,{etag:null,cacheControl:'private, no-store',vary:'Authorization'});
   assert.deepEqual(active.result.body.summary,{active:1,expired:0,unavailable:0});
   assert.deepEqual(active.result.body.offers,[{
     id:FIXTURE.offerId,requestId:FIXTURE.requestId,fareCents:2300,etaMinutes:7,
     status:'active',expiresAt:'2026-09-17T03:00:00.001Z'
   }]);
+});
+test('offer list denials are also non-storable and authorization-separated', async () => {
+  const {denied}=await offerListResults();
+  assert.deepEqual(denied.map(item=>item.status),[401,403,404]);
+  for(const item of denied){
+    assert.equal(item.headers.cacheControl,'private, no-store');
+    assert.equal(item.headers.vary,'Authorization');
+    assert.equal(item.headers.etag,null);
+  }
 });
 test('offer list distinguishes expiry from eligibility loss without changing the ride', async () => {
   const {expired,unavailable}=await offerListResults();
