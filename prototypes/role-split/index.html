@@ -428,9 +428,9 @@
   }
   function createOfferExpiryRefreshFlow({readOffers,eventTarget,documentState,setTimer=setTimeout,clearTimer=clearTimeout}){
     if(typeof readOffers!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string'||typeof setTimer!=='function'||typeof clearTimer!=='function')throw Error('提示期限更新の設定が不正です。');
-    let attached=false,detached=false,visible=documentState.visibilityState!=='hidden',timer=null,timerVersion=0,operation=null,refreshOnVisible=false,refreshes=0,lastReason='idle',serverNow=null,nextExpiryAt=null;
+    let attached=false,detached=false,visible=documentState.visibilityState!=='hidden',timer=null,timerVersion=0,operation=null,refreshOnVisible=false,refreshes=0,lastReason='idle',serverNow=null,nextExpiryAt=null,offersSelectable=false,action=null,guidance='idle';
     const operations=new Set();
-    const snapshot=()=>Object.freeze({attached,detached,visible,busy:Boolean(operation),timerScheduled:timer!==null,refreshOnVisible,refreshes,lastReason,serverNow,nextExpiryAt});
+    const snapshot=()=>Object.freeze({attached,detached,visible,busy:Boolean(operation),timerScheduled:timer!==null,refreshOnVisible,refreshes,lastReason,serverNow,nextExpiryAt,offersSelectable,action,guidance});
     const reject=reason=>Promise.resolve({refreshed:false,reason,state:snapshot()});
     const cancelTimer=()=>{
       timerVersion+=1;
@@ -438,11 +438,11 @@
     };
     const parseList=value=>{
       const now=Date.parse(value?.serverNow),expiry=value?.nextExpiryAt===null?null:Date.parse(value?.nextExpiryAt);
-      if(!value||!Array.isArray(value.offers)||!Number.isFinite(now)||value.nextExpiryAt!==null&&!Number.isFinite(expiry)||expiry!==null&&expiry<now)return null;
-      return Object.freeze({serverNow:new Date(now).toISOString(),nextExpiryAt:expiry===null?null:new Date(expiry).toISOString(),delayMs:expiry===null?null:Math.max(0,expiry-now)});
+      if(!value||!Array.isArray(value.offers)||!Number.isFinite(now)||value.nextExpiryAt!==null&&!Number.isFinite(expiry)||expiry!==null&&expiry<now||Boolean(value.offers.length)!==Boolean(expiry!==null))return null;
+      return Object.freeze({serverNow:new Date(now).toISOString(),nextExpiryAt:expiry===null?null:new Date(expiry).toISOString(),delayMs:expiry===null?null:Math.max(0,expiry-now),offerCount:value.offers.length});
     };
     const schedule=parsed=>{
-      cancelTimer();serverNow=parsed.serverNow;nextExpiryAt=parsed.nextExpiryAt;
+      cancelTimer();serverNow=parsed.serverNow;nextExpiryAt=parsed.nextExpiryAt;offersSelectable=parsed.offerCount>0;action=null;guidance=offersSelectable?'current':'empty';
       if(nextExpiryAt===null){refreshOnVisible=false;lastReason='no_active_expiry';return;}
       if(!visible){refreshOnVisible=true;lastReason='expiry_waiting_for_visible';return;}
       const token=timerVersion;
@@ -460,22 +460,28 @@
       if(!parsed){lastReason='invalid_offer_list';return {applied:false,reason:lastReason,state:snapshot()};}
       schedule(parsed);return {applied:true,reason:lastReason,state:snapshot()};
     };
+    const requireManualRefresh=reason=>{
+      cancelTimer();refreshOnVisible=false;offersSelectable=false;action='refresh';guidance='latest_offer_required';lastReason=reason;
+      return {refreshed:false,reason,state:snapshot()};
+    };
     const refresh=reason=>{
       if(!attached||detached)return reject('flow_inactive');
-      if(!visible){refreshOnVisible=true;lastReason='screen_hidden';return reject(lastReason);}
+      if(!['expiry','resume','manual'].includes(reason))return reject('invalid_refresh_reason');
       if(operation)return reject('refresh_in_progress');
-      cancelTimer();refreshOnVisible=false;lastReason=reason==='resume'?'resume_refresh_pending':'expiry_refresh_pending';
+      if(reason==='manual'&&action!=='refresh')return reject('action_not_available');
+      if(!visible){if(reason!=='manual')refreshOnVisible=true;lastReason='screen_hidden';return reject(lastReason);}
+      cancelTimer();refreshOnVisible=false;offersSelectable=false;action=null;guidance='refreshing';lastReason=reason==='resume'?'resume_refresh_pending':reason==='manual'?'manual_refresh_pending':'expiry_refresh_pending';
       const version=timerVersion;
       let task;
       task=Promise.resolve().then(()=>readOffers(Object.freeze({reason,serverNow,nextExpiryAt}))).then(value=>{
         if(detached||!attached||version!==timerVersion){lastReason='stale_refresh';return {refreshed:false,reason:lastReason,state:snapshot()};}
         const applied=apply(value);
-        if(!applied.applied){lastReason='invalid_offer_list';return {refreshed:false,reason:lastReason,state:snapshot()};}
-        refreshes+=1;lastReason=reason==='resume'?'resumed':'refreshed';
+        if(!applied.applied)return requireManualRefresh('invalid_offer_list');
+        refreshes+=1;lastReason=reason==='resume'?'resumed':reason==='manual'?'manual_refreshed':'refreshed';
         return {refreshed:true,reason:lastReason,state:snapshot()};
       },()=>{
-        if(!detached&&attached&&version===timerVersion){refreshOnVisible=true;lastReason='refresh_failed';}
-        return {refreshed:false,reason:detached||!attached||version!==timerVersion?'stale_refresh':'refresh_failed',state:snapshot()};
+        if(!detached&&attached&&version===timerVersion)return requireManualRefresh('refresh_failed');
+        return {refreshed:false,reason:'stale_refresh',state:snapshot()};
       }).finally(()=>{operations.delete(task);if(operation===task)operation=null;});
       operation=task;operations.add(task);return task;
     };
@@ -483,7 +489,7 @@
       if(!attached||detached)return;
       const nextVisible=documentState.visibilityState!=='hidden';
       if(!nextVisible){
-        if(visible){visible=false;refreshOnVisible=nextExpiryAt!==null;cancelTimer();lastReason='hidden';}
+        if(visible){visible=false;refreshOnVisible=action===null&&nextExpiryAt!==null;cancelTimer();lastReason='hidden';}
         return;
       }
       const resumed=!visible;visible=true;
@@ -500,7 +506,7 @@
     const detach=()=>{
       if(detached)return {detached:false,reason:'already_detached',state:snapshot()};
       if(attached){eventTarget.removeEventListener('visibilitychange',onVisibilityChange);eventTarget.removeEventListener('pageshow',onPageShow);}
-      attached=false;detached=true;refreshOnVisible=false;cancelTimer();lastReason='detached';
+      attached=false;detached=true;refreshOnVisible=false;offersSelectable=false;action=null;guidance='detached';cancelTimer();lastReason='detached';
       return {detached:true,reason:'detached',state:snapshot()};
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};

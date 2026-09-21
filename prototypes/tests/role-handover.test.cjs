@@ -1123,6 +1123,21 @@ test('detaching an offer expiry refresh discards its late response and stale tim
   assert.equal(flow.snapshot().detached,true);assert.equal(flow.snapshot().refreshes,0);assert.equal(flow.snapshot().timerScheduled,false);assert.equal(flow.snapshot().lastReason,'stale_refresh');
   target.dispatch('pageshow');assert.equal(reads,1);assert.equal(target.listenerCount('visibilitychange'),0);assert.equal(target.listenerCount('pageshow'),0);
 });
+test('offer expiry failure locks stale offers and waits for one explicit refresh', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers();let reads=0,fail=true,release;
+  const flow=R.createOfferExpiryRefreshFlow({
+    eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),
+    readOffers:()=>{reads+=1;if(fail)return Promise.reject(Error('offline'));return new Promise(resolve=>{release=resolve;});}
+  });
+  flow.attach();flow.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:10.000Z',offers:[{id:'offer-first'}]});
+  timers.fire(timers.pending()[0].id);await flow.idle();
+  assert.equal(reads,1);assert.equal(flow.snapshot().offersSelectable,false);assert.equal(flow.snapshot().action,'refresh');assert.equal(flow.snapshot().guidance,'latest_offer_required');assert.equal(flow.snapshot().timerScheduled,false);assert.equal(flow.snapshot().refreshOnVisible,false);
+  target.dispatch('pageshow');target.dispatch('visibilitychange');await flow.idle();assert.equal(reads,1);
+  fail=false;const retry=flow.refresh('manual'),duplicate=await flow.refresh('manual');await Promise.resolve();await Promise.resolve();
+  assert.equal(reads,2);assert.equal(duplicate.reason,'refresh_in_progress');assert.equal(flow.snapshot().offersSelectable,false);assert.equal(flow.snapshot().action,null);
+  release({serverNow:'2026-09-22T00:00:12.000Z',nextExpiryAt:'2026-09-22T00:00:40.000Z',offers:[{id:'offer-later'}]});
+  const result=await retry;await flow.idle();assert.equal(result.refreshed,true);assert.equal(result.reason,'manual_refreshed');assert.equal(flow.snapshot().offersSelectable,true);assert.equal(flow.snapshot().action,null);assert.equal(flow.snapshot().guidance,'current');assert.deepEqual(timers.pending().map(item=>item.delay),[28000]);
+});
 function feedbackDomElements() {
   const target=recoveryEventTarget(),element=()=>({hidden:false,disabled:false,textContent:'',className:'',attributes:{},setAttribute(name,value){this.attributes[name]=String(value);}}),action=Object.assign(element(),target);
   return {box:element(),title:element(),message:element(),action,commandButtons:[element(),element()]};
