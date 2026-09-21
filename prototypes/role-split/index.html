@@ -1418,6 +1418,12 @@
   function pickupAirportScope(input={}){
     return input.source==='manual'&&input.confirmedAirport===true;
   }
+  function cancellationReasonView(reason){
+    if(reason==='route_changed')return Object.freeze({kind:'search_change',message:'乗車地点または行き先の変更により、この依頼を取り消しました。'});
+    if(reason==='schedule_changed')return Object.freeze({kind:'schedule_change',message:'予約日時の変更により、この依頼を取り消しました。'});
+    if(reason==='passenger_requested')return Object.freeze({kind:'passenger',message:'利用者が依頼を取り消しました。'});
+    return Object.freeze({kind:'unknown',message:'この依頼は取り消されました。'});
+  }
   function pickupEditorView(input={}){
     const source=['manual','geolocation'].includes(input.source)?input.source:'empty';
     return Object.freeze({
@@ -1547,12 +1553,13 @@
       const r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);
       if(!r)throw Error('この依頼の検索条件を変更できません。');
       const has=key=>Object.prototype.hasOwnProperty.call(changes,key);
-      const changed=(has('pickup')&&text(changes.pickup)!==r.pickup)||(has('destination')&&text(changes.destination)!==r.destination)||(has('airport')&&!!changes.airport!==r.airport)||(has('pickupAt')&&normalizePickupAt(changes.pickupAt)!==r.pickupAt);
-      if(!changed)return Object.freeze({invalidated:false,reason:'unchanged'});
+      const routeChanged=(has('pickup')&&text(changes.pickup)!==r.pickup)||(has('destination')&&text(changes.destination)!==r.destination)||(has('airport')&&!!changes.airport!==r.airport);
+      const scheduleChanged=has('pickupAt')&&normalizePickupAt(changes.pickupAt)!==r.pickupAt;
+      if(!routeChanged&&!scheduleChanged)return Object.freeze({invalidated:false,reason:'unchanged'});
       if(['assigned','arriving','on_trip'].includes(r.status))throw Error('選択済み・乗車中の依頼は検索条件を変更できません。履歴から依頼を確認してください。');
       if(r.status!=='collecting')return Object.freeze({invalidated:false,reason:'terminal'});
-      markCancelled(r,'search_edited');
-      return Object.freeze({invalidated:true,reason:'search_edited'});
+      const reason=routeChanged?'route_changed':'schedule_changed';markCancelled(r,reason);
+      return Object.freeze({invalidated:true,reason});
     }
     function driverRequests(){need('driver');if(!gate().eligible||!state.online[state.profile.recordId])return [];const requests=state.requests.filter(r=>r.status==='collecting'&&eligibleRecord(state.profile.recordId,r));requests.forEach(refreshOffers);return requests;}
     function submitOffer(id,input){
@@ -1617,7 +1624,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -2065,7 +2072,8 @@ function renderPassengerHistory(){
   $('passenger-history').querySelectorAll('[data-cancel-ride]').forEach(b=>b.onclick=()=>openCancellation(b.dataset.cancelRide));
 }
 function cancellationMarkup(r){
-  return `<p class="banner">${r.cancelReason==='route_changed'?'行き先の変更により、この依頼を取り消しました。':r.cancelReason==='schedule_changed'?'予約日時の変更により、この依頼を取り消しました。':'利用者が依頼を取り消しました。'}迎車・乗車開始はできません。</p><p class="muted">取消日時：${esc(r.cancelledAt||'記録なし')}<br>記録した提示額は請求・キャンセル料ではありません。</p>`;
+  const reason=R.cancellationReasonView(r.cancelReason);
+  return `<p class="banner">${esc(reason.message)}迎車・乗車開始はできません。</p><p class="muted">取消日時：${esc(r.cancelledAt||'記録なし')}<br>記録した提示額は請求・キャンセル料ではありません。</p>`;
 }
 let cancelRequest=null;
 function openCancellation(id){

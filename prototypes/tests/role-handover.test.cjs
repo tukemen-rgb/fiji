@@ -2735,14 +2735,22 @@ test('changing a collecting route invalidates earlier quotes', () => {
   assert.equal(first.status,'cancelled'); assert.throws(()=>m.selectOffer(old.id));
 });
 test('editing pickup, destination or schedule immediately invalidates the active search and quotes', () => {
-  for(const changes of [{pickup:'New Hotel'},{destination:'Demo Town'},{pickupAt:new Date(Date.now()+3600000).toISOString()}]){
+  for(const [changes,reason] of [[{pickup:'New Hotel'},'route_changed'],[{destination:'Demo Town'},'route_changed'],[{pickupAt:new Date(Date.now()+3600000).toISOString()},'schedule_changed']]){
     const {m}=setup();passenger(m);
     const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),offer=m.getOffers(ride.id)[0];
     const result=m.invalidateRideSearch(ride.id,changes);
-    assert.equal(result.invalidated,true);assert.equal(result.reason,'search_edited');assert.equal(ride.status,'cancelled');assert.equal(ride.cancelReason,'search_edited');
+    assert.equal(result.invalidated,true);assert.equal(result.reason,reason);assert.equal(ride.status,'cancelled');assert.equal(ride.cancelReason,reason);
     assert.ok(m.state.offers.filter(o=>o.requestId===ride.id).every(o=>o.status==='expired'));assert.throws(()=>m.selectOffer(offer.id));
   }
   assert.match(source,/state\.currentRequest=null;state\.expectedId=null;state\.selected=null;\$\('live-summary'\)\.hidden=true;\$\('offers'\)\.replaceChildren\(\);clearLines\(\);/);
+});
+test('cancelled history distinguishes route edits, schedule edits and explicit cancellation', () => {
+  const {R}=setup();
+  assert.deepEqual({...R.cancellationReasonView('route_changed')},{kind:'search_change',message:'乗車地点または行き先の変更により、この依頼を取り消しました。'});
+  assert.deepEqual({...R.cancellationReasonView('schedule_changed')},{kind:'schedule_change',message:'予約日時の変更により、この依頼を取り消しました。'});
+  assert.deepEqual({...R.cancellationReasonView('passenger_requested')},{kind:'passenger',message:'利用者が依頼を取り消しました。'});
+  assert.deepEqual({...R.cancellationReasonView('tampered')},{kind:'unknown',message:'この依頼は取り消されました。'});
+  assert.match(source,/const reason=R\.cancellationReasonView\(r\.cancelReason\);[\s\S]*?esc\(reason\.message\)/);
 });
 test('unchanged search input is retained and assigned rides cannot be silently edited', () => {
   const {m}=setup();passenger(m);
