@@ -1433,6 +1433,15 @@
     const label=text(place.formattedAddress||place.displayName,160)||'選択した地点';
     return Object.freeze({label,route:Object.freeze({lat,lng})});
   }
+  function createGooglePlaceSelectionController(){
+    let generation=0,pending=null;
+    const snapshot=()=>Object.freeze({generation,pending:pending!==null});
+    const begin=()=>{pending=++generation;return Object.freeze({token:pending,state:snapshot()});};
+    const cancel=()=>{generation+=1;pending=null;return snapshot();};
+    const canApply=token=>pending===token;
+    const apply=token=>{if(!canApply(token))return Object.freeze({accepted:false,reason:'stale_place',state:snapshot()});pending=null;return Object.freeze({accepted:true,reason:'selected',state:snapshot()});};
+    return Object.freeze({snapshot,begin,cancel,canApply,apply});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -1602,7 +1611,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,passengerRegistrationInput,googlePlaceDestination,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -1613,6 +1622,7 @@ const V = window.TaxiVerification;
 const $ = id => document.getElementById(id);
 const R = window.TaxiRoles;
 const model = R.create();
+const placeSelection = R.createGooglePlaceSelectionController();
 let records = model.state.records;
 const names = {taxi_permit:'Taxi Permit（営業許可）',vehicle_licence:'車両登録・PSV車両資格',driver_licence:'運転免許',psv_driver_permit:'PSV運転手許可',fitness:'車両検査・適合証明',insurance:'営業利用を含む保険',operator_assignment:'名義人の同意・運転権限',airport_authorization:'空港側の営業承認'};
 const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
@@ -1747,14 +1757,15 @@ $('save-pickup').onclick = () => {
   $('airport-check').checked = state.airport;
   $('pickup-dialog').close(); if (state.mapReady && state.destination) drawRoute();
 };
-$('destination').addEventListener('input', () => { const destination=$('destination').value.trim();if(!invalidateCurrentSearch({destination})){$('destination').value=state.destination;return;}state.destination=destination;state.routeSeq++;$('live-summary').hidden=true;clearLines(); });
+$('destination').addEventListener('input', () => { placeSelection.cancel();const destination=$('destination').value.trim();if(!invalidateCurrentSearch({destination})){$('destination').value=state.destination;return;}state.destination=destination;state.routeSeq++;$('live-summary').hidden=true;clearLines(); });
 document.querySelectorAll('[data-destination]').forEach(b => b.onclick = () => {
-  if(!invalidateCurrentSearch({destination:b.dataset.destination}))return;state.destination = b.dataset.destination; $('destination').value = state.destination;
+  placeSelection.cancel();if(!invalidateCurrentSearch({destination:b.dataset.destination}))return;state.destination = b.dataset.destination; $('destination').value = state.destination;
   if (state.mapReady) drawRoute(); else { $('demo-route').hidden = false; $('demo-end').hidden = false; }
   toast('行き先を選びました。料金比較はサンプルです。');
 });
 $('find-offers').onclick = () => {
   try {
+    placeSelection.cancel();
     const pickupView=R.pickupRequestView(pickupInput.snapshot());
     if(!pickupView.ready){if(pickupView.action==='edit_pickup')showPickupFallback(pickupView.message);else toast(pickupView.message);return;}
     if (!state.destination) { $('destination').focus();return toast('先に目的地を入力してください。'); }
@@ -1941,8 +1952,9 @@ $('connect-maps').onclick = async () => {
       $('demo-map').hidden=true;$('maps-open').hidden=true;$('map-caption').textContent='Google Maps · 現在地は未取得';
       const ac = new PlaceAutocompleteElement({includedRegionCodes:['fj']});
       ac.addEventListener('gmp-select',async e=>{
+        const selection=placeSelection.begin();
         try { const p=e.placePrediction.toPlace(); await p.fetchFields({fields:['displayName','formattedAddress','location']});
-          const selected=R.googlePlaceDestination(p);if(!selected)return;if(!invalidateCurrentSearch({destination:selected.label}))return;
+          if(!placeSelection.canApply(selection.token))return;const selected=R.googlePlaceDestination(p);if(!selected){placeSelection.apply(selection.token);return;}if(!invalidateCurrentSearch({destination:selected.label})){placeSelection.apply(selection.token);return;}if(!placeSelection.apply(selection.token).accepted)return;
           state.destination=selected.route;$('destination').value=selected.label;
           await drawRoute();
         }catch{toast('目的地を取得できません。再選択してください。');}

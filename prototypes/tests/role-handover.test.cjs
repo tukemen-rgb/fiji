@@ -128,12 +128,26 @@ test('Google place selection uses a stable address and rejects missing coordinat
   assert.equal(R.googlePlaceDestination({location:{lat:NaN,lng:177.443}}),null);
 });
 test('Google place selection invalidates old quotes before replacing the route destination', () => {
-  assert.match(source,/const selected=R\.googlePlaceDestination\(p\);if\(!selected\)return;if\(!invalidateCurrentSearch\(\{destination:selected\.label\}\)\)return;\s*state\.destination=selected\.route;\$\('destination'\)\.value=selected\.label;/);
+  assert.match(source,/if\(!placeSelection\.canApply\(selection\.token\)\)return;const selected=R\.googlePlaceDestination\(p\);if\(!selected\)\{placeSelection\.apply\(selection\.token\);return;\}if\(!invalidateCurrentSearch\(\{destination:selected\.label\}\)\)\{placeSelection\.apply\(selection\.token\);return;\}if\(!placeSelection\.apply\(selection\.token\)\.accepted\)return;\s*state\.destination=selected\.route;\$\('destination'\)\.value=selected\.label;/);
   const {R,m}=setup();passenger(m);
   const ride=m.requestRide({pickup:'Demo Hotel',destination:'Nadi Town'}),offer=m.getOffers(ride.id)[0];
   const selected=R.googlePlaceDestination({displayName:'Airport',formattedAddress:'Nadi International Airport, Fiji',location:{lat:-17.755,lng:177.443}});
   assert.equal(m.invalidateRideSearch(ride.id,{destination:selected.label}).invalidated,true);
   assert.equal(ride.status,'cancelled');assert.equal(offer.status,'expired');assert.throws(()=>m.selectOffer(offer.id));
+});
+test('a newer Google place selection rejects the delayed older result', () => {
+  const {R}=setup(),selection=R.createGooglePlaceSelectionController();
+  const old=selection.begin(),current=selection.begin();
+  assert.equal(selection.canApply(old.token),false);assert.equal(selection.apply(old.token).reason,'stale_place');
+  assert.equal(selection.canApply(current.token),true);assert.equal(selection.apply(current.token).accepted,true);
+  assert.deepEqual({...selection.snapshot()},{generation:current.token,pending:false});
+});
+test('manual destination and ride submission cancel a pending Google place result', () => {
+  assert.match(source,/\$\('destination'\)\.addEventListener\('input', \(\) => \{ placeSelection\.cancel\(\);/);
+  assert.match(source,/\$\('find-offers'\)\.onclick = \(\) => \{\s*try \{\s*placeSelection\.cancel\(\);/);
+  assert.match(source,/if\(!placeSelection\.canApply\(selection\.token\)\)return;const selected=R\.googlePlaceDestination\(p\);/);
+  const {R}=setup(),selection=R.createGooglePlaceSelectionController(),pending=selection.begin();
+  selection.cancel();assert.equal(selection.canApply(pending.token),false);assert.equal(selection.apply(pending.token).accepted,false);
 });
 test('manual pickup survives map and geolocation failure and can still create a request', () => {
   const {R,m}=setup(),pickup=R.createPickupInputController('Ramada Wailoaloa');
