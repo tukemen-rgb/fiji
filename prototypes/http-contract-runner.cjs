@@ -106,6 +106,30 @@ function matchesIfNoneMatch(value, etag) {
 function createMockState(options = {}) {
   const clockMs = options.clockMs ?? Date.parse('2026-09-17T03:00:00Z');
   const rideStatus = options.rideStatus ?? 'collecting';
+  const offer = {
+    id: FIXTURE.offerId,
+    driverId: 'driver-reviewed',
+    status: 'active',
+    fareCents: 2300,
+    etaMinutes: 7,
+    expiresAtMs: options.offerExpiresAtMs ?? clockMs + 15 * 60 * 1000
+  };
+  const additionalOffers = (options.additionalOffers || []).map((item, index) => ({
+    id: `offer-additional-${index + 1}`,
+    driverId: `driver-additional-${index + 1}`,
+    status: 'active',
+    fareCents: 2400 + index * 100,
+    etaMinutes: 8 + index,
+    expiresAtMs: clockMs + 15 * 60 * 1000,
+    ...item
+  }));
+  const offers = [offer, ...additionalOffers];
+  const driverEligibility = {
+    'driver-reviewed': options.offerDriverEligible ?? true,
+    'driver-assigned': options.assignedDriverEligible ?? true,
+    ...(options.driverEligibility || {})
+  };
+  for (const item of offers) if (!Object.hasOwn(driverEligibility, item.driverId)) driverEligibility[item.driverId] = true;
   return {
     ride: {
       id: FIXTURE.requestId,
@@ -114,18 +138,9 @@ function createMockState(options = {}) {
       assignedDriverId: options.assignedDriverId ?? (rideStatus === 'collecting' ? null : 'driver-assigned'),
       vehicleConfirmation: options.vehicleConfirmation ? structuredClone(options.vehicleConfirmation) : null
     },
-    offer: {
-      id: FIXTURE.offerId,
-      driverId: 'driver-reviewed',
-      status: 'active',
-      fareCents: 2300,
-      etaMinutes: 7,
-      expiresAtMs: options.offerExpiresAtMs ?? clockMs + 15 * 60 * 1000
-    },
-    driverEligibility: {
-      'driver-reviewed': options.offerDriverEligible ?? true,
-      'driver-assigned': options.assignedDriverEligible ?? true
-    },
+    offer,
+    offers,
+    driverEligibility,
     bookedPlate: normalizePlate(options.bookedPlate ?? 'DEMO 001'),
     commandDelays: {...(options.commandDelays || {})},
     recoveryFailures: (options.recoveryFailures || []).map(failure => ({...failure})),
@@ -138,36 +153,36 @@ function createMockState(options = {}) {
   };
 }
 
-function refreshMockOffer(state) {
-  if (state.offer.status !== 'active') return state.offer;
-  if (state.clockMs >= state.offer.expiresAtMs) {
-    state.offer.status = 'expired';
-    state.offer.statusReason = 'time';
-  } else if (!state.driverEligibility[state.offer.driverId]) {
-    state.offer.status = 'unavailable';
-    state.offer.statusReason = 'eligibility';
+function refreshMockOffer(state, offer = state.offer) {
+  if (offer.status !== 'active') return offer;
+  if (state.clockMs >= offer.expiresAtMs) {
+    offer.status = 'expired';
+    offer.statusReason = 'time';
+  } else if (!state.driverEligibility[offer.driverId]) {
+    offer.status = 'unavailable';
+    offer.statusReason = 'eligibility';
   }
-  return state.offer;
+  return offer;
 }
 
 function offerListView(state) {
-  const offer = refreshMockOffer(state);
-  const offers = offer.status === 'active' ? [{
+  const current = (state.offers || [state.offer]).map(offer => refreshMockOffer(state, offer));
+  const offers = current.filter(offer => offer.status === 'active').map(offer => ({
     id: offer.id,
     requestId: FIXTURE.requestId,
     fareCents: offer.fareCents,
     etaMinutes: offer.etaMinutes,
     status: offer.status,
     expiresAt: new Date(offer.expiresAtMs).toISOString()
-  }] : [];
+  }));
   return {
     serverNow: new Date(state.clockMs).toISOString(),
     nextExpiryAt: offers.length ? offers.reduce((earliest, item) => earliest === null || item.expiresAt < earliest ? item.expiresAt : earliest, null) : null,
     offers,
     summary: {
-      active: offer.status === 'active' ? 1 : 0,
-      expired: offer.status === 'expired' ? 1 : 0,
-      unavailable: offer.status === 'unavailable' ? 1 : 0
+      active: current.filter(offer => offer.status === 'active').length,
+      expired: current.filter(offer => offer.status === 'expired').length,
+      unavailable: current.filter(offer => offer.status === 'unavailable').length
     }
   };
 }
@@ -957,6 +972,34 @@ async function runOfferListContract() {
   } finally {
     await deniedMock.close();
   }
+  const sequenceMock = await startMockServer({
+    clockMs,
+    offerExpiresAtMs: clockMs + 10_000,
+    additionalOffers: [{
+      id: 'offer-later', driverId: 'driver-later', fareCents: 2600, etaMinutes: 9,
+      expiresAtMs: clockMs + 40_000
+    }]
+  });
+  let sequence;
+  try {
+    const request = () => requestJson(sequenceMock.baseUrl, {
+      method: 'GET', path: `/v1/ride-requests/${FIXTURE.requestId}/offers`, token: FIXTURE.tokens.owner,
+      captureHeaders: true
+    }, fetch);
+    const before = await request();
+    sequenceMock.state.clockMs = clockMs + 10_000;
+    const after = await request();
+    sequence = {
+      before,
+      after,
+      ride: structuredClone(sequenceMock.state.ride),
+      offers: structuredClone(sequenceMock.state.offers),
+      auditEvents: structuredClone(sequenceMock.state.auditEvents),
+      storedKeys: sequenceMock.state.idempotency.size
+    };
+  } finally {
+    await sequenceMock.close();
+  }
   if (active.result.status !== 200 || active.result.body?.offers?.length !== 1 || active.result.body?.summary?.active !== 1) {
     throw new Error('active offer list did not return its selectable offer');
   }
@@ -991,7 +1034,18 @@ async function runOfferListContract() {
     }
   }
   if (denied.map(item => item.status).join('/') !== '401/403/404') throw new Error('offer list denial controls changed');
-  return {active, expired, unavailable, conditional, denied};
+  if (sequence.before.body?.offers?.length !== 2 || sequence.before.body?.nextExpiryAt !== new Date(clockMs + 10_000).toISOString()) {
+    throw new Error('multiple offers did not schedule refresh at the earliest expiry');
+  }
+  if (sequence.after.body?.offers?.length !== 1 || sequence.after.body.offers[0]?.id !== 'offer-later' ||
+      sequence.after.body?.nextExpiryAt !== new Date(clockMs + 40_000).toISOString() ||
+      sequence.after.body?.summary?.expired !== 1) {
+    throw new Error('earliest-expiry refresh did not retain only the later active offer');
+  }
+  if (sequence.ride.status !== 'collecting' || sequence.ride.revision !== FIXTURE.revision || sequence.auditEvents.length || sequence.storedKeys) {
+    throw new Error('multiple-offer refresh changed ride, audit, or idempotency state');
+  }
+  return {active, expired, unavailable, conditional, denied, sequence};
 }
 
 async function runMockContract() {
