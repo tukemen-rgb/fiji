@@ -1135,8 +1135,31 @@ test('offer expiry failure locks stale offers and waits for one explicit refresh
   target.dispatch('pageshow');target.dispatch('visibilitychange');await flow.idle();assert.equal(reads,1);
   fail=false;const retry=flow.refresh('manual'),duplicate=await flow.refresh('manual');await Promise.resolve();await Promise.resolve();
   assert.equal(reads,2);assert.equal(duplicate.reason,'refresh_in_progress');assert.equal(flow.snapshot().offersSelectable,false);assert.equal(flow.snapshot().action,null);
-  release({serverNow:'2026-09-22T00:00:12.000Z',nextExpiryAt:'2026-09-22T00:00:40.000Z',offers:[{id:'offer-later'}]});
+  release({status:200,body:{serverNow:'2026-09-22T00:00:12.000Z',nextExpiryAt:'2026-09-22T00:00:40.000Z',offers:[{id:'offer-later'}]}});
   const result=await retry;await flow.idle();assert.equal(result.refreshed,true);assert.equal(result.reason,'manual_refreshed');assert.equal(flow.snapshot().offersSelectable,true);assert.equal(flow.snapshot().action,null);assert.equal(flow.snapshot().guidance,'current');assert.deepEqual(timers.pending().map(item=>item.delay),[28000]);
+});
+test('offer refresh access responses never restore stale offers or retry automatically', async () => {
+  const cases=[
+    {status:401,reason:'session_expired',action:'reauthenticate',guidance:'session_expired',refreshed:false},
+    {status:403,reason:'passenger_role_required',action:'passenger_role',guidance:'passenger_role_required',refreshed:false},
+    {status:404,reason:'request_not_found',action:null,guidance:'request_unavailable',refreshed:true}
+  ];
+  for(const expected of cases){
+    const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers();let reads=0;
+    const flow=R.createOfferExpiryRefreshFlow({
+      eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),
+      readOffers:async()=>{reads+=1;return {status:expected.status};}
+    });
+    flow.attach();flow.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:10.000Z',offers:[{id:'stale-offer'}]});
+    const result=await flow.refresh('expiry');await flow.idle();
+    assert.equal(result.refreshed,expected.refreshed);assert.equal(result.reason,expected.reason);assert.equal(reads,1);
+    assert.equal(flow.snapshot().offersSelectable,false);assert.equal(flow.snapshot().action,expected.action);assert.equal(flow.snapshot().guidance,expected.guidance);
+    assert.equal(flow.snapshot().accessOutcome,expected.status);assert.equal(flow.snapshot().serverNow,null);assert.equal(flow.snapshot().nextExpiryAt,null);assert.equal(flow.snapshot().timerScheduled,false);assert.equal(flow.snapshot().refreshOnVisible,false);
+    const stale=flow.apply({serverNow:'2026-09-22T00:00:01.000Z',nextExpiryAt:'2026-09-22T00:00:10.000Z',offers:[{id:'stale-offer'}]});
+    assert.equal(stale.applied,false);assert.equal(stale.reason,'access_locked');assert.equal(flow.snapshot().offersSelectable,false);
+    target.dispatch('pageshow');target.dispatch('visibilitychange');await flow.idle();assert.equal(reads,1);
+    const manual=await flow.refresh('manual');assert.equal(manual.reason,'action_not_available');assert.equal(reads,1);
+  }
 });
 function feedbackDomElements() {
   const target=recoveryEventTarget(),element=()=>({hidden:false,disabled:false,textContent:'',className:'',attributes:{},setAttribute(name,value){this.attributes[name]=String(value);}}),action=Object.assign(element(),target);

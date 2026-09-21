@@ -428,9 +428,9 @@
   }
   function createOfferExpiryRefreshFlow({readOffers,eventTarget,documentState,setTimer=setTimeout,clearTimer=clearTimeout}){
     if(typeof readOffers!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string'||typeof setTimer!=='function'||typeof clearTimer!=='function')throw Error('提示期限更新の設定が不正です。');
-    let attached=false,detached=false,visible=documentState.visibilityState!=='hidden',timer=null,timerVersion=0,operation=null,refreshOnVisible=false,refreshes=0,lastReason='idle',serverNow=null,nextExpiryAt=null,offersSelectable=false,action=null,guidance='idle';
+    let attached=false,detached=false,visible=documentState.visibilityState!=='hidden',timer=null,timerVersion=0,operation=null,refreshOnVisible=false,refreshes=0,lastReason='idle',serverNow=null,nextExpiryAt=null,offersSelectable=false,action=null,guidance='idle',accessOutcome=null;
     const operations=new Set();
-    const snapshot=()=>Object.freeze({attached,detached,visible,busy:Boolean(operation),timerScheduled:timer!==null,refreshOnVisible,refreshes,lastReason,serverNow,nextExpiryAt,offersSelectable,action,guidance});
+    const snapshot=()=>Object.freeze({attached,detached,visible,busy:Boolean(operation),timerScheduled:timer!==null,refreshOnVisible,refreshes,lastReason,serverNow,nextExpiryAt,offersSelectable,action,guidance,accessOutcome});
     const reject=reason=>Promise.resolve({refreshed:false,reason,state:snapshot()});
     const cancelTimer=()=>{
       timerVersion+=1;
@@ -456,6 +456,7 @@
     };
     const apply=value=>{
       if(detached)return {applied:false,reason:'flow_detached',state:snapshot()};
+      if(accessOutcome!==null)return {applied:false,reason:'access_locked',state:snapshot()};
       const parsed=parseList(value);
       if(!parsed){lastReason='invalid_offer_list';return {applied:false,reason:lastReason,state:snapshot()};}
       schedule(parsed);return {applied:true,reason:lastReason,state:snapshot()};
@@ -463,6 +464,19 @@
     const requireManualRefresh=reason=>{
       cancelTimer();refreshOnVisible=false;offersSelectable=false;action='refresh';guidance='latest_offer_required';lastReason=reason;
       return {refreshed:false,reason,state:snapshot()};
+    };
+    const applyAccessOutcome=status=>{
+      cancelTimer();refreshOnVisible=false;offersSelectable=false;serverNow=null;nextExpiryAt=null;accessOutcome=status;
+      if(status===401){action='reauthenticate';guidance='session_expired';lastReason='session_expired';return {refreshed:false,reason:lastReason,state:snapshot()};}
+      if(status===403){action='passenger_role';guidance='passenger_role_required';lastReason='passenger_role_required';return {refreshed:false,reason:lastReason,state:snapshot()};}
+      action=null;guidance='request_unavailable';lastReason='request_not_found';refreshes+=1;
+      return {refreshed:true,reason:lastReason,state:snapshot()};
+    };
+    const readOutcome=value=>{
+      if(!Number.isInteger(value?.status))return {kind:'list',value};
+      if(value.status===200)return {kind:'list',value:value.body};
+      if([401,403,404].includes(value.status))return {kind:'access',status:value.status};
+      return {kind:'failed'};
     };
     const refresh=reason=>{
       if(!attached||detached)return reject('flow_inactive');
@@ -475,7 +489,10 @@
       let task;
       task=Promise.resolve().then(()=>readOffers(Object.freeze({reason,serverNow,nextExpiryAt}))).then(value=>{
         if(detached||!attached||version!==timerVersion){lastReason='stale_refresh';return {refreshed:false,reason:lastReason,state:snapshot()};}
-        const applied=apply(value);
+        const outcome=readOutcome(value);
+        if(outcome.kind==='access')return applyAccessOutcome(outcome.status);
+        if(outcome.kind==='failed')return requireManualRefresh('refresh_failed');
+        const applied=apply(outcome.value);
         if(!applied.applied)return requireManualRefresh('invalid_offer_list');
         refreshes+=1;lastReason=reason==='resume'?'resumed':reason==='manual'?'manual_refreshed':'refreshed';
         return {refreshed:true,reason:lastReason,state:snapshot()};
@@ -506,7 +523,7 @@
     const detach=()=>{
       if(detached)return {detached:false,reason:'already_detached',state:snapshot()};
       if(attached){eventTarget.removeEventListener('visibilitychange',onVisibilityChange);eventTarget.removeEventListener('pageshow',onPageShow);}
-      attached=false;detached=true;refreshOnVisible=false;offersSelectable=false;action=null;guidance='detached';cancelTimer();lastReason='detached';
+      attached=false;detached=true;refreshOnVisible=false;offersSelectable=false;action=null;guidance='detached';accessOutcome=null;cancelTimer();lastReason='detached';
       return {detached:true,reason:'detached',state:snapshot()};
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
