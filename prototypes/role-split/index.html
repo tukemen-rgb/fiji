@@ -529,8 +529,8 @@
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
     return Object.freeze({snapshot,attach,apply,refresh,detach,idle});
   }
-  function createOfferAccessDomBridge({flow,elements,onReauthenticate=()=>({requested:true}),onPassengerHome=()=>({navigated:true})}){
-    if(!flow||typeof flow.snapshot!=='function'||typeof flow.refresh!=='function'||!elements||!elements.panel||!elements.title||!elements.message||!elements.action||typeof elements.action.addEventListener!=='function'||typeof elements.action.removeEventListener!=='function'||typeof onReauthenticate!=='function'||typeof onPassengerHome!=='function')throw Error('提示案内パネルの設定が不正です。');
+  function createOfferAccessDomBridge({flow,elements,onReauthenticate=()=>({requested:true}),onPassengerHome=()=>({navigated:true}),onActionComplete=()=>({completed:true})}){
+    if(!flow||typeof flow.snapshot!=='function'||typeof flow.refresh!=='function'||!elements||!elements.panel||!elements.title||!elements.message||!elements.action||typeof elements.action.addEventListener!=='function'||typeof elements.action.removeEventListener!=='function'||typeof onReauthenticate!=='function'||typeof onPassengerHome!=='function'||typeof onActionComplete!=='function')throw Error('提示案内パネルの設定が不正です。');
     const offerButtons=[...(elements.offerButtons||[])],driverControls=[...(elements.driverControls||[])];
     let attached=false,detached=false,pending=null,consumedAction=null,lastAction='idle';
     const copy=guidance=>{
@@ -564,7 +564,9 @@
       const selected=current.action;lastAction=selected;render();
       let task;
       const work=selected==='reauthenticate'?onReauthenticate():selected==='passenger_role'?onPassengerHome():flow.refresh('manual');
-      task=Promise.resolve(work).then(result=>{
+      task=Promise.resolve(work).then(async result=>{
+        if(detached)return {processed:false,reason:'stale_action',state:snapshot()};
+        await onActionComplete(Object.freeze({action:selected,result}));
         if(detached)return {processed:false,reason:'stale_action',state:snapshot()};
         consumedAction=selected;lastAction='completed';return {processed:true,reason:'completed',action:selected,result,state:snapshot()};
       },()=>{lastAction='action_failed';return {processed:false,reason:lastAction,state:snapshot()};}).finally(()=>{if(pending===task)pending=null;render();});
@@ -584,6 +586,51 @@
     };
     const idle=async()=>{if(pending)await pending;return snapshot();};
     return Object.freeze({snapshot,attach,render,activate,detach,idle});
+  }
+  function createOfferPageLifecycle({createFlow,createDomBridge}){
+    if(typeof createFlow!=='function'||typeof createDomBridge!=='function')throw Error('提示ページライフサイクルの設定が不正です。');
+    let active=null,generation=0,lastAction='idle';
+    const operations=new Set();
+    const snapshot=()=>Object.freeze({entered:Boolean(active),generation,activeGeneration:active?.generation||null,busy:operations.size>0,lastAction,flow:active?.flow.snapshot()||null,dom:active?.dom.snapshot()||null});
+    const track=work=>{
+      let task;
+      task=Promise.resolve(work).finally(()=>operations.delete(task));operations.add(task);return task;
+    };
+    const leave=()=>{
+      if(!active)return {left:false,reason:'not_entered',state:snapshot()};
+      const previous=active;active=null;lastAction='left';previous.dom.detach();previous.flow.detach();
+      return {left:true,reason:'left',generation:previous.generation,state:snapshot()};
+    };
+    const enter=()=>{
+      if(active)leave();
+      const currentGeneration=++generation,flow=createFlow(Object.freeze({generation:currentGeneration})),dom=createDomBridge(Object.freeze({generation:currentGeneration,flow}));
+      if(!flow||typeof flow.attach!=='function'||typeof flow.apply!=='function'||typeof flow.refresh!=='function'||typeof flow.detach!=='function'||typeof flow.idle!=='function'||!dom||typeof dom.attach!=='function'||typeof dom.render!=='function'||typeof dom.activate!=='function'||typeof dom.detach!=='function'||typeof dom.idle!=='function')throw Error('提示ページライフサイクルの構成が不正です。');
+      const entry={generation:currentGeneration,flow,dom};active=entry;flow.attach();dom.attach();lastAction='entered';
+      return {entered:true,reason:'entered',generation:currentGeneration,state:snapshot()};
+    };
+    const apply=value=>{
+      if(!active)return {applied:false,reason:'page_inactive',state:snapshot()};
+      const result=active.flow.apply(value);active.dom.render();lastAction=result.applied?'applied':result.reason;
+      return {...result,pageState:snapshot()};
+    };
+    const refresh=reason=>{
+      if(!active)return Promise.resolve({refreshed:false,reason:'page_inactive',state:snapshot()});
+      const entry=active;lastAction='refresh_pending';
+      return track(entry.flow.refresh(reason).then(result=>{
+        if(active!==entry)return {refreshed:false,reason:'stale_page',state:snapshot()};
+        entry.dom.render();lastAction=result.reason;return {...result,pageState:snapshot()};
+      }));
+    };
+    const activate=()=>{
+      if(!active)return Promise.resolve({processed:false,reason:'page_inactive',state:snapshot()});
+      const entry=active;lastAction='action_pending';
+      return track(entry.dom.activate().then(result=>{
+        if(active!==entry)return {processed:false,reason:'stale_page',state:snapshot()};
+        entry.dom.render();lastAction=result.reason;return {...result,pageState:snapshot()};
+      }));
+    };
+    const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(active){await active.flow.idle();await active.dom.idle();}return snapshot();};
+    return Object.freeze({snapshot,enter,apply,refresh,activate,leave,idle});
   }
   function createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery}){
     if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||requestRecovery!==undefined&&typeof requestRecovery!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');
@@ -1783,7 +1830,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createOfferAccessDomBridge,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createOfferAccessDomBridge,createOfferPageLifecycle,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>

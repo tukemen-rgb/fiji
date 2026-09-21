@@ -1198,6 +1198,27 @@ test('offer access panel separates passenger-role guidance from a no-action miss
     assert.equal(passengerHomes,expected.passengerHomes);assert.equal(result.processed,expected.status===403);
   }
 });
+test('leaving the offer page disposes every bridge and rejects delayed reauthentication navigation', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements(),navigations=[];let release,reauthentications=0;
+  const lifecycle=R.createOfferPageLifecycle({
+    createFlow:()=>R.createOfferExpiryRefreshFlow({
+      eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),
+      readOffers:async()=>({status:401})
+    }),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({
+      flow,elements,
+      onReauthenticate:()=>{reauthentications+=1;return new Promise(resolve=>{release=resolve;});},
+      onActionComplete:({action})=>{navigations.push(action);return {navigated:true};}
+    })
+  });
+  const entered=lifecycle.enter();assert.equal(entered.entered,true);assert.equal(target.listenerCount('visibilitychange'),1);assert.equal(elements.action.listenerCount('click'),1);
+  lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:10.000Z',offers:[{id:'stale-offer'}]});
+  await lifecycle.refresh('expiry');assert.equal(elements.panel.hidden,false);assert.equal(elements.action.textContent,'利用者として再ログイン');
+  const pending=lifecycle.activate();await Promise.resolve();assert.equal(reauthentications,1);
+  const left=lifecycle.leave();assert.equal(left.left,true);assert.equal(target.listenerCount('visibilitychange'),0);assert.equal(target.listenerCount('pageshow'),0);assert.equal(elements.action.listenerCount('click'),0);assert.equal(elements.panel.hidden,true);
+  release({authenticated:true});const result=await pending;await lifecycle.idle();
+  assert.equal(result.processed,false);assert.equal(result.reason,'stale_page');assert.deepEqual(navigations,[]);assert.equal(lifecycle.snapshot().entered,false);assert.equal(timers.pending().length,0);
+});
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));
