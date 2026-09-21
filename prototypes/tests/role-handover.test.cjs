@@ -3087,6 +3087,9 @@ test('API checker fails closed when safety requirements are removed', () => {
   const missingOfferVary=structuredClone(loadContract());
   delete missingOfferVary.paths['/v1/ride-requests/{requestId}/offers'].get.responses['200'].headers.Vary;
   assert.ok(validateContract(missingOfferVary).some(message=>message.includes('listRideOffers 200 requires Vary header')));
+  const cacheableOfferDenial=structuredClone(loadContract());
+  delete cacheableOfferDenial.components.responses.PrivateRoleDenied.headers['Cache-Control'];
+  assert.ok(validateContract(cacheableOfferDenial).some(message=>message.includes('listRideOffers 403 requires Cache-Control header')));
   const noRateLimit=structuredClone(loadContract());
   delete noRateLimit.paths['/v1/rides/{requestId}'].get.responses['429'];
   assert.ok(validateContract(noRateLimit).some(message=>message.includes('getRideState must document 429')));

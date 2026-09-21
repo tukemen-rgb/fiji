@@ -44,9 +44,9 @@
             },
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OfferList" } } }
           },
-          "401": { "$ref": "#/components/responses/AuthenticationRequired" },
-          "403": { "$ref": "#/components/responses/RoleDenied" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "401": { "$ref": "#/components/responses/PrivateAuthenticationRequired" },
+          "403": { "$ref": "#/components/responses/PrivateRoleDenied" },
+          "404": { "$ref": "#/components/responses/PrivateNotFound" }
         }
       },
       "post": {
@@ -416,6 +416,9 @@
       "AuthenticationRequired": { "description": "No valid session", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "RoleDenied": { "description": "Role or current eligibility denied", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "NotFound": { "description": "Missing or concealed foreign resource", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "PrivateAuthenticationRequired": { "description": "No valid session; response must not be stored", "headers": { "Cache-Control": { "$ref": "#/components/headers/PrivateNoStore" }, "Vary": { "$ref": "#/components/headers/VaryAuthorization" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "PrivateRoleDenied": { "description": "Role denied; response must not be stored", "headers": { "Cache-Control": { "$ref": "#/components/headers/PrivateNoStore" }, "Vary": { "$ref": "#/components/headers/VaryAuthorization" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "PrivateNotFound": { "description": "Missing or concealed foreign resource; response must not be stored", "headers": { "Cache-Control": { "$ref": "#/components/headers/PrivateNoStore" }, "Vary": { "$ref": "#/components/headers/VaryAuthorization" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "TooManyRequests": { "description": "Recovery read rate limit", "headers": { "Retry-After": { "$ref": "#/components/headers/RetryAfter" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "ServiceUnavailable": { "description": "Temporary recovery read outage", "headers": { "Retry-After": { "$ref": "#/components/headers/RetryAfter" } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "Conflict": { "description": "Stale revision, invalid transition, expired offer, unavailable driver, vehicle mismatch, missing current vehicle confirmation, ambiguous current ride or idempotency conflict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
