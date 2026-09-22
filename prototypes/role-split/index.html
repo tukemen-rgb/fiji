@@ -1934,17 +1934,24 @@
       disableCommands:true,action:'refresh'
     });
   }
-  function createScheduleConflictRecoveryController({conflict,sessionForPassenger,readCurrentRide,createAbortController=()=>typeof AbortController==='function'?new AbortController():null}={}){
-    if(conflict?.outcome!=='conflict'||!Number.isInteger(conflict.revision)||conflict.revision<1||typeof sessionForPassenger!=='function'||typeof readCurrentRide!=='function'||typeof createAbortController!=='function')throw Error('予約競合の最新状態確認設定が不正です。');
-    let phase='locked',action='refresh',target=null,reads=0,lastReason='conflict',operation=null,controller=null,version=1;
+  function createScheduleConflictRecoveryController({conflict,sessionForPassenger,readCurrentRide,eventTarget=null,createAbortController=()=>typeof AbortController==='function'?new AbortController():null}={}){
+    if(conflict?.outcome!=='conflict'||!Number.isInteger(conflict.revision)||conflict.revision<1||typeof sessionForPassenger!=='function'||typeof readCurrentRide!=='function'||typeof createAbortController!=='function'||(eventTarget!==null&&(typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function')))throw Error('予約競合の最新状態確認設定が不正です。');
+    let phase='locked',action='refresh',target=null,reads=0,lastReason='conflict',operation=null,controller=null,version=1,eventAttached=false;
     const snapshot=()=>Object.freeze({phase,busy:Boolean(operation),reads,lastReason,commandsLocked:phase!=='confirmed',action,target,autoCommandReplay:false});
     const session=()=>{try{const value=sessionForPassenger();return value&&typeof value==='object'&&!Array.isArray(value)?value:null;}catch{return null;}};
+    const initialBinding=session();
     const stop=(reason,nextPhase='unresolved')=>{phase=nextPhase;action=nextPhase==='reauth'?'reauth':'refresh';target=null;lastReason=reason;return {processed:false,reason,state:snapshot()};};
+    const detachSessionListener=()=>{if(eventAttached){eventTarget.removeEventListener('fiji:auth-session-changed',onAuthSessionChanged);eventAttached=false;}};
+    const stopForSessionChange=reason=>{version+=1;try{controller?.abort();}catch{}controller=null;operation=null;detachSessionListener();return stop(reason,'reauth');};
+    const onAuthSessionChanged=()=>{const current=session();if(current===initialBinding)return;stopForSessionChange(current?'stale_session':'session_unavailable');};
+    if(!initialBinding){phase='reauth';action='reauth';lastReason='session_unavailable';}
+    else if(eventTarget){eventTarget.addEventListener('fiji:auth-session-changed',onAuthSessionChanged);eventAttached=true;}
     const refresh=()=>{
       if(phase==='confirmed')return Promise.resolve({processed:false,reason:'already_confirmed',state:snapshot()});
       if(operation)return Promise.resolve({processed:false,reason:'read_in_progress',state:snapshot()});
       const binding=session();
       if(!binding)return Promise.resolve(stop('session_unavailable','reauth'));
+      if(binding!==initialBinding)return Promise.resolve(stop('stale_session','reauth'));
       const token=version;controller=createAbortController();
       if(controller!==null&&(!controller.signal||typeof controller.abort!=='function'))throw Error('予約競合の通信中止設定が不正です。');
       reads+=1;lastReason='latest_state_pending';
@@ -1966,7 +1973,7 @@
       },()=>token===version?stop('latest_state_unavailable'):{processed:false,reason:'stale_recovery',state:snapshot()}).finally(()=>{if(operation===task)operation=null;if(controller?.signal===request.signal)controller=null;});
       operation=task;return task;
     };
-    const invalidate=()=>{version+=1;try{controller?.abort();}catch{}controller=null;operation=null;phase='stale';action=null;target=null;lastReason='invalidated';return snapshot();};
+    const invalidate=()=>{version+=1;try{controller?.abort();}catch{}controller=null;operation=null;detachSessionListener();phase='stale';action=null;target=null;lastReason='invalidated';return snapshot();};
     return Object.freeze({snapshot,refresh,invalidate});
   }
   function create(){
@@ -2279,7 +2286,7 @@ function recoverSearchRevisionConflict(error){
   state.pickupAt=view.pickupAt;state.currentRequestRevision=view.revision;$('schedule-time').value=view.inputValue;updateScheduleControl();
   if($('schedule-dialog').open)$('schedule-dialog').close();
   scheduleConflictRecoveryController?.invalidate();scheduleConflictRecoveryController=null;scheduleConflictRecovery=view;
-  if(R.isAllowedRoleServiceProvider(injectedRoleServices))scheduleConflictRecoveryController=R.createScheduleConflictRecoveryController({conflict:view,sessionForPassenger:()=>injectedRoleServices.sessionForRole('passenger'),readCurrentRide:context=>injectedRoleServices.readCurrentRide(context)});
+  if(R.isAllowedRoleServiceProvider(injectedRoleServices))scheduleConflictRecoveryController=R.createScheduleConflictRecoveryController({conflict:view,sessionForPassenger:()=>injectedRoleServices.sessionForRole('passenger'),readCurrentRide:context=>injectedRoleServices.readCurrentRide(context),eventTarget:window});
   commandUi.setRole('passenger');const generation=commandUi.snapshot().generation;
   commandUi.applyFeedback('passenger',generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});
   restartGuard.mark('passenger','conflict');renderCommandFeedback();toast(view.message);return true;
