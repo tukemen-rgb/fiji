@@ -1553,7 +1553,7 @@ test('auth session events invalidate cancellation recovery once from the current
       createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerElements})
     });
     const panelBridge=R.createCancellationRecoveryDomBridge({lifecycle,elements});panelBridge.attach();lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
-    const authBridge=R.createCancellationSessionEventBridge({bridge:panelBridge,eventTarget:target,sessionForPassenger:()=>{sessionReads+=1;return session;}});
+    const authBridge=R.createCancellationSessionEventBridge({bridge:panelBridge,eventTarget:target,sessionGenerationForPassenger:()=>{sessionReads+=1;return session?.accountRef||null;}});
     assert.equal(authBridge.attach().started,true);assert.equal(authBridge.attach().reason,'already_attached');assert.equal(target.listenerCount('fiji:auth-session-changed'),1);assert.equal(target.addCount('fiji:auth-session-changed'),1);
     target.dispatch('fiji:auth-session-changed',{detail:{role:'driver',sessionBinding:accountB}});
     assert.equal(authBridge.snapshot().lastAction,'session_unchanged');assert.equal(target.listenerCount('fiji:auth-session-changed'),1);assert.equal(panelBridge.snapshot().detached,false);
@@ -1566,6 +1566,36 @@ test('auth session events invalidate cancellation recovery once from the current
     assert.equal(delayed.processed,false);assert.equal(delayed.reason,'stale_action');assert.equal(historyNavigations,0);assert.equal(retries,0);assert.equal(lifecycle.snapshot().terminalReason,'session_invalidated');assert.equal(lifecycle.snapshot().lastAction,sessionChange);
     assert.equal(sessionReads,3);assert.equal(authBridge.detach().reason,'already_detached');assert.doesNotMatch(JSON.stringify([authBridge.snapshot(),panelBridge.snapshot()]),/private-passenger|cancel-auth-event-key|ride-/);
   }
+});
+test('token refresh keeps cancellation recovery when the provider-owned passenger generation is stable', async () => {
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),accountA1={tokenRef:'private-token-old',generation:'passenger-generation-a'},accountA2={tokenRef:'private-token-new',generation:'passenger-generation-a'},accountB={tokenRef:'private-token-b',generation:'passenger-generation-b'};
+  const target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),offerElements=offerAccessDomElements(),elements=cancellationRecoveryDomElements();let session=accountA1,releaseState,rejectState,sessionReads=0,retries=0;
+  const lifecycle=R.createOfferPageLifecycle({
+    rideId:ride.id,baselineRevision:ride.revision,baselineStatus:ride.status,cancellationIdempotencyKey:'cancel-stable-generation-key',
+    readCancellationState:()=>new Promise((resolve,reject)=>{releaseState=resolve;rejectState=reject;}),
+    retryCancellationCommand:async()=>{retries+=1;return {status:503};},onCancellationRecovered:()=>({navigated:true,page:'passenger-history'}),
+    createFlow:()=>R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>({status:500})}),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerElements})
+  });
+  const panelBridge=R.createCancellationRecoveryDomBridge({lifecycle,elements});panelBridge.attach();lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
+  const authBridge=R.createCancellationSessionEventBridge({bridge:panelBridge,eventTarget:target,sessionGenerationForPassenger:()=>{sessionReads+=1;return session?.generation||null;}});authBridge.attach();
+  const pending=panelBridge.reconcile();while(!releaseState)await new Promise(resolve=>setImmediate(resolve));
+  session=accountA2;target.dispatch('fiji:auth-session-changed',{detail:{sessionGeneration:accountB.generation,tokenRef:accountB.tokenRef}});
+  assert.equal(authBridge.snapshot().lastAction,'session_unchanged');assert.equal(target.listenerCount('fiji:auth-session-changed'),1);assert.equal(panelBridge.snapshot().detached,false);
+  rejectState(Error('network failure after token refresh'));const unresolved=await pending;assert.equal(unresolved.reason,'explicit_retry_required');assert.equal(elements.panel.hidden,false);assert.equal(elements.action.listenerCount('click'),1);assert.equal(retries,0);
+  session=accountB;target.dispatch('fiji:auth-session-changed',{detail:{sessionGeneration:accountA1.generation,tokenRef:accountA1.tokenRef}});
+  assert.equal(authBridge.snapshot().lastAction,'account_switch');assert.equal(target.listenerCount('fiji:auth-session-changed'),0);assert.equal(panelBridge.snapshot().detached,true);assert.equal(elements.panel.hidden,true);assert.equal(elements.action.listenerCount('click'),0);assert.equal(sessionReads,3);
+  assert.doesNotMatch(JSON.stringify([authBridge.snapshot(),panelBridge.snapshot()]),/private-token|passenger-generation|cancel-stable-generation-key|ride-/);
+});
+test('cancellation session bridge rejects a raw session object instead of using object identity', () => {
+  const {R}=setup(),target=recoveryEventTarget(),invalidations=[];
+  const bridge=R.createCancellationSessionEventBridge({
+    bridge:{invalidateSession:reason=>{invalidations.push(reason);return {invalidated:true,reason};}},eventTarget:target,
+    sessionGenerationForPassenger:()=>({accountRef:'private-passenger',tokenRef:'private-token'})
+  });
+  const started=bridge.attach();assert.equal(started.started,false);assert.equal(started.reason,'session_unavailable');assert.deepEqual(invalidations,['logout']);assert.equal(target.listenerCount('fiji:auth-session-changed'),0);
+  assert.deepEqual(Object.keys(bridge.snapshot()).sort(),['attached','detached','handledEvents','lastAction']);assert.doesNotMatch(JSON.stringify(bridge.snapshot()),/private-passenger|private-token/);
 });
 test('cancellation recovery page leave tears down panel, auth and offer listeners before delayed completion', async () => {
   const {R,m}=setup();passenger(m);
@@ -1580,7 +1610,7 @@ test('cancellation recovery page leave tears down panel, auth and offer listener
     createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerElements})
   });
   lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
-  const page=R.createCancellationRecoveryPageController({lifecycle,elements,eventTarget:target,sessionForPassenger:()=>{sessionReads+=1;return session;}});
+  const page=R.createCancellationRecoveryPageController({lifecycle,elements,eventTarget:target,sessionGenerationForPassenger:()=>{sessionReads+=1;return session.accountRef;}});
   assert.equal(page.start().started,true);assert.equal(page.start().reason,'already_started');assert.equal(sessionReads,1);
   assert.equal(target.listenerCount('fiji:auth-session-changed'),1);assert.equal(elements.action.listenerCount('click'),1);assert.equal(target.listenerCount('visibilitychange'),1);assert.equal(target.listenerCount('pageshow'),1);
   const pending=page.reconcile();while(!releaseState)await new Promise(resolve=>setImmediate(resolve));
@@ -1605,7 +1635,7 @@ test('re-entering cancellation recovery isolates the fresh passenger page from d
         createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerElements})
       });
       lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
-      const page=R.createCancellationRecoveryPageController({lifecycle,elements,eventTarget:target,sessionForPassenger:()=>session});page.start();
+      const page=R.createCancellationRecoveryPageController({lifecycle,elements,eventTarget:target,sessionGenerationForPassenger:()=>session?.accountRef||null});page.start();
       return {lifecycle,page};
     };
     const oldElements=cancellationRecoveryDomElements(),oldOfferElements=offerAccessDomElements(),oldTimers=expiryTimers();
