@@ -1652,6 +1652,50 @@ test('cancellation retry fails closed when its passenger generation provider bec
     assert.doesNotMatch(JSON.stringify(page.snapshot()),/passenger-generation|spoofed-event-token|cancel-generation-provider-loss-key|ride-/);page.leave();
   }
 });
+test('recovered passenger generation requires a fresh cancellation page before reconciliation resumes', async () => {
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
+  let providerAvailable=true,releaseOldRetry,oldRetries=0,oldHistory=0,freshHistory=0,sessionReads=0;
+  const sessionGenerationForPassenger=()=>{sessionReads+=1;return providerAvailable?'passenger-generation-a':null;};
+  const makePage=({key,elements,offerElements,timers,readCancellationState,retryCancellationCommand,onCancellationRecovered})=>{
+    const lifecycle=R.createOfferPageLifecycle({
+      rideId:ride.id,baselineRevision:ride.revision,baselineStatus:ride.status,cancellationIdempotencyKey:key,
+      readCancellationState,retryCancellationCommand,onCancellationRecovered,
+      createFlow:()=>R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>({status:500})}),
+      createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerElements})
+    });
+    lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
+    const page=R.createCancellationRecoveryPageController({lifecycle,elements,eventTarget:target,sessionGenerationForPassenger});
+    assert.equal(page.start().started,true);return {lifecycle,page};
+  };
+  const oldElements=cancellationRecoveryDomElements(),old=makePage({
+    key:'cancel-provider-recovery-old-key',elements:oldElements,offerElements:offerAccessDomElements(),timers:expiryTimers(),
+    readCancellationState:async()=>{throw Error('simulated network failure');},
+    retryCancellationCommand:()=>{oldRetries+=1;return new Promise(resolve=>{releaseOldRetry=resolve;});},
+    onCancellationRecovered:()=>{oldHistory+=1;return {navigated:true,page:'passenger-history'};}
+  });
+  assert.equal((await old.page.reconcile()).reason,'explicit_retry_required');const oldPending=old.page.activate();while(!releaseOldRetry)await new Promise(resolve=>setImmediate(resolve));
+  providerAvailable=false;target.dispatch('fiji:auth-session-changed',{detail:{sessionGeneration:'passenger-generation-a'}});
+  assert.equal(old.page.snapshot().session.lastAction,'logout');assert.equal(target.listenerCount('fiji:auth-session-changed'),0);assert.equal(oldElements.panel.hidden,true);
+  providerAvailable=true;const readsAfterLoss=sessionReads;target.dispatch('fiji:auth-session-changed',{detail:{sessionGeneration:'passenger-generation-a'}});
+  assert.equal(sessionReads,readsAfterLoss);assert.equal((await old.page.reconcile()).reason,'bridge_inactive');assert.equal((await old.page.activate()).reason,'bridge_inactive');
+  assert.equal(oldElements.panel.hidden,true);assert.equal(oldElements.action.listenerCount('click'),0);assert.equal(oldHistory,0);assert.equal(oldRetries,1);
+
+  const freshElements=cancellationRecoveryDomElements(),fresh=makePage({
+    key:'cancel-provider-recovery-fresh-key',elements:freshElements,offerElements:offerAccessDomElements(),timers:expiryTimers(),
+    readCancellationState:async()=>({status:200,body:{id:ride.id,status:'cancelled',revision:ride.revision+1,viewerRole:'passenger',nextAction:'show_cancelled_history',updatedAt:'2026-09-22T00:00:06.000Z'}}),
+    retryCancellationCommand:async()=>{throw Error('fresh page must not retry');},
+    onCancellationRecovered:()=>{freshHistory+=1;return {navigated:true,page:'passenger-history'};}
+  });
+  assert.equal(target.listenerCount('fiji:auth-session-changed'),1);const current=await fresh.page.reconcile();
+  assert.equal(current.processed,true);assert.equal(current.reason,'request_cancelled');assert.equal(freshHistory,1);assert.equal(fresh.lifecycle.snapshot().terminalReason,'request_cancelled');
+  const freshBeforeOldCompletion=JSON.stringify(fresh.page.snapshot());
+  releaseOldRetry({status:200,body:{id:ride.id,status:'cancelled',revision:ride.revision+1,viewerRole:'passenger',nextAction:'show_cancelled_history',updatedAt:'2026-09-22T00:00:05.000Z'}});
+  const oldCompleted=await oldPending;await old.page.idle();assert.equal(oldCompleted.processed,false);assert.equal(oldCompleted.reason,'stale_action');assert.equal(oldHistory,0);assert.equal(freshHistory,1);
+  assert.equal(JSON.stringify(fresh.page.snapshot()),freshBeforeOldCompletion);assert.equal(sessionReads,readsAfterLoss+1);assert.equal(target.listenerCount('fiji:auth-session-changed'),1);
+  old.page.leave();fresh.page.leave();assert.equal(target.listenerCount('fiji:auth-session-changed'),0);
+  assert.doesNotMatch(JSON.stringify([old.page.snapshot(),fresh.page.snapshot()]),/passenger-generation|cancel-provider-recovery-(old|fresh)-key|ride-/);
+});
 test('cancellation session bridge rejects a raw session object instead of using object identity', () => {
   const {R}=setup(),target=recoveryEventTarget(),invalidations=[];
   const bridge=R.createCancellationSessionEventBridge({
