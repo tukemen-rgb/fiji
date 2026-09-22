@@ -1619,6 +1619,39 @@ test('stable passenger generations govern an in-flight explicit cancellation ret
     assert.equal(retries,1);assert.equal(sessionReads,2);assert.doesNotMatch(JSON.stringify(page.snapshot()),/private-token|passenger-generation|spoofed-event-token|cancel-generation-retry-key|ride-/);page.leave();
   }
 });
+test('cancellation retry fails closed when its passenger generation provider becomes unavailable', async () => {
+  for(const providerLoss of ['exception','blank']){
+    const {R,m}=setup();passenger(m);
+    const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+    const target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),offerElements=offerAccessDomElements(),elements=cancellationRecoveryDomElements();
+    let generation='passenger-generation-a',releaseRetry,retries=0,historyNavigations=0,sessionReads=0,providerFailed=false;
+    const lifecycle=R.createOfferPageLifecycle({
+      rideId:ride.id,baselineRevision:ride.revision,baselineStatus:ride.status,cancellationIdempotencyKey:'cancel-generation-provider-loss-key',
+      readCancellationState:async()=>{throw Error('simulated network failure');},
+      retryCancellationCommand:()=>{retries+=1;return new Promise(resolve=>{releaseRetry=resolve;});},
+      onCancellationRecovered:()=>{historyNavigations+=1;return {navigated:true,page:'passenger-history'};},
+      createFlow:()=>R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>({status:500})}),
+      createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerElements})
+    });
+    lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
+    const page=R.createCancellationRecoveryPageController({
+      lifecycle,elements,eventTarget:target,
+      sessionGenerationForPassenger:()=>{sessionReads+=1;if(providerFailed&&providerLoss==='exception')throw Error('auth provider unavailable');return providerFailed?'   ':generation;}
+    });
+    assert.equal(page.start().started,true);assert.equal((await page.reconcile()).reason,'explicit_retry_required');
+    const pending=page.activate();while(!releaseRetry)await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(retries,1);providerFailed=true;
+    target.dispatch('fiji:auth-session-changed',{detail:{sessionGeneration:generation,tokenRef:'spoofed-event-token'}});
+    assert.equal(page.snapshot().session.lastAction,'logout');assert.equal(target.listenerCount('fiji:auth-session-changed'),0);
+    assert.equal(elements.panel.hidden,true);assert.equal(elements.action.listenerCount('click'),0);
+    releaseRetry({status:200,body:{id:ride.id,status:'cancelled',revision:ride.revision+1,viewerRole:'passenger',nextAction:'show_cancelled_history',updatedAt:'2026-09-22T00:00:05.000Z'}});
+    const completed=await pending;await page.idle();
+    assert.equal(completed.processed,false);assert.equal(completed.reason,'stale_action');assert.equal(historyNavigations,0);assert.equal(retries,1);assert.equal(sessionReads,2);
+    assert.equal(lifecycle.snapshot().terminalReason,'session_invalidated');assert.equal(lifecycle.snapshot().lastAction,'logout');
+    assert.equal((await page.activate()).reason,'bridge_inactive');
+    assert.doesNotMatch(JSON.stringify(page.snapshot()),/passenger-generation|spoofed-event-token|cancel-generation-provider-loss-key|ride-/);page.leave();
+  }
+});
 test('cancellation session bridge rejects a raw session object instead of using object identity', () => {
   const {R}=setup(),target=recoveryEventTarget(),invalidations=[];
   const bridge=R.createCancellationSessionEventBridge({
