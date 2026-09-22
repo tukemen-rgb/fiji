@@ -1320,6 +1320,36 @@ test('an offer response completed while hidden stays disabled until one visible 
   assert.equal(reads,2);assert.equal(state.flow.offersSelectable,true);assert.equal(state.flow.refreshes,1);assert.equal(state.flow.lastReason,'resumed');assert.equal(state.flow.nextExpiryAt,'2026-09-22T00:00:40.000Z');assert.ok(elements.offerButtons.every(button=>button.disabled===false));assert.deepEqual(timers.pending().map(item=>item.delay),[15000]);
   assert.equal(target.listenerCount('visibilitychange'),1);assert.equal(target.listenerCount('pageshow'),1);assert.equal(elements.action.listenerCount('click'),1);lifecycle.leave();assert.equal(timers.pending().length,0);
 });
+test('hidden offer access responses lock stale offers once without a resume read', async () => {
+  for(const expected of [
+    {status:401,guidance:'session_expired',action:'reauthenticate',title:'ログインが必要です'},
+    {status:403,guidance:'passenger_role_required',action:'passenger_role',title:'利用者画面に戻ってください'},
+    {status:404,guidance:'request_unavailable',action:null,title:'この依頼は利用できません'}
+  ]){
+    const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements(),requests=[];let reads=0,accessRenders=0;
+    const lifecycle=R.createOfferPageLifecycle({
+      createFlow:()=>R.createOfferExpiryRefreshFlow({
+        eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),
+        readOffers:value=>{reads+=1;return new Promise(resolve=>requests.push({value,resolve}));}
+      }),
+      createDomBridge:({flow})=>{
+        const bridge=R.createOfferAccessDomBridge({flow,elements});
+        return {...bridge,render:()=>{if(['session_expired','passenger_role_required','request_unavailable'].includes(flow.snapshot().guidance))accessRenders+=1;return bridge.render();}};
+      }
+    });
+    lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:10.000Z',offers:[{id:'offer-stale'}]});
+    assert.ok(elements.offerButtons.every(button=>button.disabled===false));
+    const pending=lifecycle.refresh('expiry');while(requests.length<1)await new Promise(resolve=>setImmediate(resolve));
+    assert.ok(elements.offerButtons.every(button=>button.disabled));assert.equal(elements.panel.hidden,true);assert.equal(timers.pending().length,0);
+    documentState.visibilityState='hidden';target.dispatch('visibilitychange');requests[0].resolve({status:expected.status});
+    const result=await pending;await lifecycle.idle();let state=lifecycle.snapshot();
+    assert.equal(reads,1);assert.equal(result.refreshed,expected.status===404);assert.equal(state.flow.accessOutcome,expected.status);assert.equal(state.flow.guidance,expected.guidance);assert.equal(state.flow.action,expected.action);assert.equal(state.flow.refreshOnVisible,false);assert.equal(state.flow.offersSelectable,false);assert.equal(state.flow.serverNow,null);assert.equal(state.flow.nextExpiryAt,null);assert.equal(accessRenders,1);
+    assert.ok(elements.offerButtons.every(button=>button.disabled));assert.equal(elements.panel.hidden,false);assert.equal(elements.title.textContent,expected.title);assert.equal(elements.action.hidden,expected.action===null);assert.equal(timers.pending().length,0);
+    documentState.visibilityState='visible';target.dispatch('visibilitychange');target.dispatch('pageshow');target.dispatch('pageshow');await Promise.resolve();await lifecycle.idle();state=lifecycle.snapshot();
+    assert.equal(reads,1);assert.equal(accessRenders,1);assert.equal(state.flow.accessOutcome,expected.status);assert.equal(state.flow.guidance,expected.guidance);assert.equal(state.flow.offersSelectable,false);assert.equal(timers.pending().length,0);
+    lifecycle.leave();assert.equal(target.listenerCount('visibilitychange'),0);assert.equal(target.listenerCount('pageshow'),0);
+  }
+});
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));

@@ -456,7 +456,7 @@
         if(detached||!attached||token!==timerVersion)return;
         timer=null;
         if(!visible){refreshOnVisible=true;lastReason='expiry_waiting_for_visible';return;}
-        void refresh('expiry');
+        void refresh('expiry',true);
       },parsed.delayMs);
       lastReason='expiry_scheduled';
     };
@@ -484,13 +484,14 @@
       if([401,403,404].includes(value.status))return {kind:'access',status:value.status};
       return {kind:'failed'};
     };
-    const refresh=reason=>{
+    const refresh=(reason,notifyState=false)=>{
       if(!attached||detached)return reject('flow_inactive');
       if(!['expiry','resume','manual'].includes(reason))return reject('invalid_refresh_reason');
       if(operation)return reject('refresh_in_progress');
       if(reason==='manual'&&action!=='refresh')return reject('action_not_available');
       if(!visible){if(reason!=='manual')refreshOnVisible=true;lastReason='screen_hidden';return reject(lastReason);}
       cancelTimer();refreshOnVisible=false;offersSelectable=false;action=null;guidance='refreshing';lastReason=reason==='resume'?'resume_refresh_pending':reason==='manual'?'manual_refresh_pending':'expiry_refresh_pending';
+      if(notifyState)notify();
       const version=timerVersion;
       const controller=createAbortController();
       if(controller!==null&&(!controller.signal||typeof controller.abort!=='function'))throw Error('提示取得の中止設定が不正です。');
@@ -515,7 +516,7 @@
       },()=>{
         if(!detached&&attached&&version===timerVersion)return requireManualRefresh('refresh_failed');
         return {refreshed:false,reason:'stale_refresh',state:snapshot()};
-      }).then(result=>{notify();return result;}).finally(()=>{operations.delete(task);if(operation===task)operation=null;if(requestController===controller)requestController=null;});
+      }).then(result=>{if(notifyState)notify();return result;}).finally(()=>{operations.delete(task);if(operation===task)operation=null;if(requestController===controller)requestController=null;});
       operation=task;operations.add(task);return task;
     };
     const syncVisibility=name=>{
@@ -530,7 +531,7 @@
         return;
       }
       const resumed=!visible;visible=true;
-      if((resumed||name==='pageshow')&&refreshOnVisible){refreshOnVisible=false;void refresh('resume');}
+      if((resumed||name==='pageshow')&&refreshOnVisible){refreshOnVisible=false;void refresh('resume',true);}
     };
     const onVisibilityChange=()=>syncVisibility('visibilitychange');
     const onPageShow=()=>syncVisibility('pageshow');
@@ -638,7 +639,8 @@
     const refresh=reason=>{
       if(!active)return Promise.resolve({refreshed:false,reason:'page_inactive',state:snapshot()});
       const entry=active;lastAction='refresh_pending';
-      return track(entry.flow.refresh(reason).then(result=>{
+      const work=entry.flow.refresh(reason);entry.dom.render();
+      return track(work.then(result=>{
         if(active!==entry)return {refreshed:false,reason:'stale_page',state:snapshot()};
         entry.dom.render();lastAction=result.reason;return {...result,pageState:snapshot()};
       }));
