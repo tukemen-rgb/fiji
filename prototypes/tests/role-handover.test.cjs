@@ -1169,6 +1169,9 @@ function offerAccessDomElements() {
   const element=()=>({hidden:false,disabled:false,textContent:'',attributes:{},setAttribute(name,value){this.attributes[name]=String(value);}});
   return {panel:element(),title:element(),message:element(),action:Object.assign(element(),recoveryEventTarget()),offerButtons:[element(),element()],driverControls:[element(),element()]};
 }
+function cancellationRecoveryDomElements() {
+  return offerAccessDomElements();
+}
 test('offer access panel runs passenger reauthentication once and never exposes driver controls', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements();let reads=0,reauthentications=0,release;
   const flow=R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>{reads+=1;return {status:401};}});
@@ -1444,6 +1447,48 @@ test('a cancellation retry with another unknown result stops without a loop', as
   assert.equal(retries,1);assert.equal(retryRequest.idempotencyKey,originalKey);releaseRetry({status:503});const stopped=await first;assert.equal(await duplicate,stopped);await lifecycle.idle();const state=lifecycle.snapshot();
   assert.equal(stopped.retried,false);assert.equal(stopped.reason,'retry_outcome_unknown');assert.equal(state.lastAction,'cancellation_retry_stopped');assert.equal(state.terminalReason,'cancellation_outcome_unknown');assert.equal(state.cancellationRetryAllowed,false);assert.equal(state.cancellationRetryUsed,true);assert.equal(historyNavigations,0);
   assert.equal((await lifecycle.retryCancellation()).reason,'retry_already_used');assert.equal(retries,1);assert.equal(lifecycle.enter().reason,'cancellation_outcome_unknown');assert.ok(elements.offerButtons.every(button=>button.disabled));assert.equal(timers.pending().length,0);
+});
+test('cancellation recovery panel requires one passenger action before retrying', async () => {
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),originalKey='cancel-panel-key';
+  const target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),offerElements=offerAccessDomElements(),elements=cancellationRecoveryDomElements();let retries=0,releaseRetry,historyNavigations=0;
+  const lifecycle=R.createOfferPageLifecycle({
+    rideId:ride.id,baselineRevision:ride.revision,baselineStatus:ride.status,cancellationIdempotencyKey:originalKey,
+    readCancellationState:async()=>{throw Error('simulated network failure');},
+    retryCancellationCommand:request=>{retries+=1;assert.deepEqual({...request},{action:'cancel_ride',rideId:ride.id,expectedRevision:1,cancelReason:'passenger_requested',idempotencyKey:originalKey});m.cancelRide(ride.id,ride.revision);return new Promise(resolve=>{releaseRetry=()=>resolve({status:200,body:{id:ride.id,status:'cancelled',revision:ride.revision,viewerRole:'passenger',nextAction:'show_cancelled_history',updatedAt:ride.cancelledAt}});});},
+    onCancellationRecovered:()=>{historyNavigations+=1;return {navigated:true,page:'passenger-history'};},
+    createFlow:()=>R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>({status:500})}),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerElements})
+  });
+  const bridge=R.createCancellationRecoveryDomBridge({lifecycle,elements});bridge.attach();
+  lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});bridge.render();
+  assert.equal(elements.panel.hidden,true);assert.equal(retries,0);assert.equal(elements.action.listenerCount('click'),1);
+  const recovery=await bridge.reconcile();assert.equal(recovery.reason,'explicit_retry_required');assert.equal(retries,0);
+  assert.equal(elements.panel.hidden,false);assert.equal(elements.action.hidden,false);assert.equal(elements.action.textContent,'同じ依頼を一度だけ再送');assert.match(elements.message.textContent,/自動では再送しません/);
+  assert.doesNotMatch(elements.title.textContent+elements.message.textContent+elements.action.textContent,/運転手/);assert.ok(elements.offerButtons.every(button=>button.disabled));assert.ok(elements.driverControls.every(control=>control.hidden&&control.attributes['aria-hidden']==='true'));
+  const first=bridge.activate(),duplicate=await bridge.activate();assert.equal(duplicate.reason,'action_in_progress');assert.equal(retries,1);assert.equal(elements.action.hidden,true);assert.match(elements.title.textContent,/再確認/);
+  while(!releaseRetry)await new Promise(resolve=>setImmediate(resolve));releaseRetry();const completed=await first;await bridge.idle();
+  assert.equal(completed.processed,true);assert.equal(completed.reason,'request_cancelled');assert.equal(historyNavigations,1);assert.equal(elements.panel.hidden,true);
+  assert.equal((await bridge.activate()).reason,'action_not_available');assert.equal(retries,1);assert.equal(lifecycle.snapshot().cancellationRetryUsed,true);
+});
+test('cancellation recovery panel stops after the single retry stays unknown', async () => {
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+  const target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),offerElements=offerAccessDomElements(),elements=cancellationRecoveryDomElements();let retries=0,releaseRetry;
+  const lifecycle=R.createOfferPageLifecycle({
+    rideId:ride.id,baselineRevision:ride.revision,baselineStatus:ride.status,cancellationIdempotencyKey:'cancel-panel-stop-key',
+    readCancellationState:async()=>({status:200,body:{id:ride.id,status:'collecting',revision:ride.revision,viewerRole:'passenger',nextAction:'compare_offers',updatedAt:'2026-09-22T00:00:00.000Z'}}),
+    retryCancellationCommand:()=>{retries+=1;return new Promise(resolve=>{releaseRetry=resolve;});},
+    createFlow:()=>R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>({status:500})}),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerElements})
+  });
+  const bridge=R.createCancellationRecoveryDomBridge({lifecycle,elements});bridge.attach();lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
+  await bridge.reconcile();assert.equal(elements.action.textContent,'同じ依頼を一度だけ再送');assert.equal(retries,0);
+  const retry=bridge.activate();while(!releaseRetry)await new Promise(resolve=>setImmediate(resolve));releaseRetry({status:503});const stopped=await retry;await bridge.idle();
+  assert.equal(stopped.processed,false);assert.equal(stopped.reason,'retry_outcome_unknown');assert.equal(retries,1);assert.equal(elements.panel.hidden,false);assert.equal(elements.action.hidden,true);
+  assert.match(elements.title.textContent,/確認できません/);assert.match(elements.message.textContent,/追加の再送を停止/);assert.doesNotMatch(elements.title.textContent+elements.message.textContent,/運転手/);
+  assert.equal((await bridge.activate()).reason,'action_not_available');assert.equal(retries,1);assert.equal(lifecycle.snapshot().lastAction,'cancellation_retry_stopped');
+  bridge.detach();assert.equal(elements.panel.hidden,true);assert.equal(elements.action.listenerCount('click'),0);
 });
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};

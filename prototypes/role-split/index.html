@@ -60,7 +60,7 @@
 <div class="quick-grid"><button class="quick" data-nav="verify"><svg class="icon"><use href="#i-shield"/></svg><span><b>車両を照合</b><small>ナンバー・許可情報</small></span></button><button class="quick" data-nav="passenger-history"><svg class="icon"><use href="#i-clock"/></svg><span><b>乗車履歴</b><small>依頼・提示額の記録</small></span></button></div>
 <div class="section-title">よく使う行き先 · サンプル</div><button class="place-row" data-destination="Nadi Town, Fiji"><svg class="icon"><use href="#i-clock"/></svg><span>Nadi Town<small>街の中心へ</small></span><svg class="icon"><use href="#i-arrow"/></svg></button><button class="place-row" data-destination="Nadi International Airport, Fiji"><svg class="icon"><use href="#i-clock"/></svg><span>Nadi Airport<small>空港へ</small></span><svg class="icon"><use href="#i-arrow"/></svg></button>
 <div class="notice-line"><svg class="icon"><use href="#i-shield"/></svg><span>アプリへの登録と、営業許可の確認は別です。確認元・日時・有効期限を表示します。</span></div></div></section>
-<section id="offers-page" class="page panel" hidden><div class="backline"><button class="icon-btn" data-nav="home" aria-label="戻る"><svg class="icon"><use href="#i-back"/></svg></button>ルートに戻る</div><p class="eyebrow">COMPARE OFFERS</p><h1>料金と車両で選ぶ</h1><p id="offer-destination" class="muted"></p><p class="banner">車両・金額・到着時間は架空のサンプルです。実際の配車・固定運賃の確約は行いません。</p><div id="offer-access-feedback" class="empty" role="status" aria-live="polite" hidden><strong id="offer-access-title"></strong><p id="offer-access-message"></p><button id="offer-access-action" class="secondary" type="button" hidden></button></div><div id="offers"></div></section>
+<section id="offers-page" class="page panel" hidden><div class="backline"><button class="icon-btn" data-nav="home" aria-label="戻る"><svg class="icon"><use href="#i-back"/></svg></button>ルートに戻る</div><p class="eyebrow">COMPARE OFFERS</p><h1>料金と車両で選ぶ</h1><p id="offer-destination" class="muted"></p><p class="banner">車両・金額・到着時間は架空のサンプルです。実際の配車・固定運賃の確約は行いません。</p><div id="offer-access-feedback" class="empty" role="status" aria-live="polite" hidden><strong id="offer-access-title"></strong><p id="offer-access-message"></p><button id="offer-access-action" class="secondary" type="button" hidden></button></div><div id="cancellation-recovery-feedback" class="empty" role="status" aria-live="polite" hidden><strong id="cancellation-recovery-title"></strong><p id="cancellation-recovery-message"></p><button id="cancellation-recovery-action" class="secondary" type="button" hidden></button></div><div id="offers"></div></section>
 <section id="verify-page" class="page panel" hidden><p class="eyebrow">BEFORE YOU BOARD</p><h1>この車で、合っていますか？</h1><p class="muted">許可情報に加えて、目の前の車両も照合。</p><form id="lookup-form"><label class="field">ナンバープレート<input id="plate-input" placeholder="例：DEMO 001" maxlength="20" autocomplete="off" autocapitalize="characters" required></label><label class="checkbox"><input id="airport-check" type="checkbox">空港から乗車（空港側の確認も必要）</label><button class="primary" type="submit">登録情報を照合する</button></form><p class="samples-label">テスト用ナンバー</p><div class="sample-buttons"><button data-plate="DEMO 001">確認済みの見本</button><button data-plate="DEMO 003">期限切れ</button><button data-plate="DEMO 004">申請中</button><button data-plate="DEMO 999">未登録</button></div><div id="lookup-result" aria-live="polite"></div><p class="muted">照合先はこのプレビュー内の架空台帳です。LTAの公的登録簿とは接続していません。</p></section>
 <section id="register-page" class="page panel" hidden><div class="backline"><button class="icon-btn" data-nav="role" aria-label="役割選択に戻る"><svg class="icon"><use href="#i-back"/></svg></button>運転手として登録</div><p class="eyebrow">DRIVER ONBOARDING</p><h1>タクシー登録申請</h1><p class="muted">申請後、発行元の情報と照合してから掲載。</p><div class="banner">テスト専用です。実名・実際の免許番号や書類は入れないでください。入力内容は送信・永続保存されません。</div><button class="small-action" id="fill-sample">サンプル情報を入力する</button><div class="form-progress" id="progress"><span class="on"></span><span></span><span></span></div>
 <form id="registration-form"><div id="reg-step-0"><label class="field">運転手氏名<input name="name" maxlength="160" required></label><label class="field">連絡先（国番号を含む）<input name="phone" type="tel" maxlength="22" required></label><label class="field">運転免許番号<input name="driverLicence" maxlength="160" required></label><label class="field">PSV運転手許可番号<input name="psvPermit" maxlength="160" required></label></div>
@@ -708,6 +708,71 @@
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(active){await active.flow.idle();await active.dom.idle();}return snapshot();};
     return Object.freeze({snapshot,enter,apply,refresh,activate,completeCancellation,reconcileCancellation,retryCancellation,leave,idle});
+  }
+  function createCancellationRecoveryDomBridge({lifecycle,elements}){
+    if(!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.reconcileCancellation!=='function'||typeof lifecycle.retryCancellation!=='function'||!elements||!elements.panel||!elements.title||!elements.message||!elements.action||typeof elements.action.addEventListener!=='function'||typeof elements.action.removeEventListener!=='function')throw Error('取消結果案内パネルの設定が不正です。');
+    const offerButtons=[...(elements.offerButtons||[])],driverControls=[...(elements.driverControls||[])];
+    let attached=false,detached=false,pending=null,pendingKind=null,lastAction='idle';
+    const content=()=>{
+      const state=lifecycle.snapshot();
+      if(state.terminalReason==='request_cancelled')return null;
+      if(pendingKind==='retry'||state.lastAction==='cancellation_retry_pending')return {title:'取消を再確認しています',message:'同じ依頼を一度だけ再送しています。画面を閉じずにお待ちください。',action:null,label:''};
+      if(state.cancellationRetryAllowed===true&&state.cancellationRetryUsed!==true)return {title:'取消結果を確認できませんでした',message:'依頼は停止中です。自動では再送しません。必要な場合だけ、同じ依頼を一度だけ再送できます。',action:'retry_cancellation',label:'同じ依頼を一度だけ再送'};
+      if(state.lastAction==='cancellation_retry_stopped')return {title:'取消結果を確認できません',message:'安全のため追加の再送を停止しました。利用者履歴で最新状態を確認してください。',action:null,label:''};
+      if(['cancellation_unresolved','cancellation_recovery_failed'].includes(state.lastAction))return {title:'取消結果を確認できません',message:'安全のため操作を停止しました。利用者履歴で最新状態を確認してください。',action:null,label:''};
+      return null;
+    };
+    const view=()=>{
+      const current=content();
+      return Object.freeze({hidden:!current,title:current?.title||'',message:current?.message||'',action:current?.action||null,label:current?.label||'',busy:Boolean(pending)});
+    };
+    const snapshot=()=>Object.freeze({attached,detached,busy:Boolean(pending),pendingKind,lastAction,view:view()});
+    const render=()=>{
+      const current=view();
+      offerButtons.forEach(button=>{button.disabled=true;});
+      driverControls.forEach(control=>{control.hidden=true;control.setAttribute?.('aria-hidden','true');});
+      if(detached)return current;
+      elements.panel.hidden=current.hidden;elements.title.textContent=current.title;elements.message.textContent=current.message;
+      const showAction=Boolean(current.action)&&!current.busy;
+      elements.action.hidden=!showAction;elements.action.disabled=!showAction;elements.action.textContent=current.label;
+      elements.action.setAttribute?.('data-cancellation-action',current.action||'');
+      return current;
+    };
+    const start=(kind,work)=>{
+      pendingKind=kind;lastAction=kind+'_pending';
+      let task;
+      task=Promise.resolve(work).then(result=>{
+        if(detached)return {processed:false,reason:'stale_action',state:snapshot()};
+        lastAction=result?.reason||kind+'_completed';
+        return {processed:kind==='retry'?result?.retried===true:result?.reconciled===true,reason:result?.reason||kind+'_completed',result,state:snapshot()};
+      },()=>{lastAction=kind+'_failed';return {processed:false,reason:lastAction,state:snapshot()};}).finally(()=>{if(pending===task){pending=null;pendingKind=null;}render();});
+      pending=task;render();return task;
+    };
+    const reconcile=()=>{
+      if(!attached||detached)return Promise.resolve({processed:false,reason:'bridge_inactive',state:snapshot()});
+      if(pending)return pending;
+      return start('reconcile',lifecycle.reconcileCancellation());
+    };
+    const activate=()=>{
+      if(!attached||detached)return Promise.resolve({processed:false,reason:'bridge_inactive',state:snapshot()});
+      if(pending)return Promise.resolve({processed:false,reason:'action_in_progress',state:snapshot()});
+      if(view().action!=='retry_cancellation')return Promise.resolve({processed:false,reason:'action_not_available',state:snapshot()});
+      return start('retry',lifecycle.retryCancellation());
+    };
+    const onClick=event=>{event?.preventDefault?.();void activate();};
+    const attach=()=>{
+      if(detached)return {attached:false,reason:'bridge_detached',state:snapshot()};
+      if(attached)return {attached:false,reason:'already_attached',state:snapshot()};
+      attached=true;elements.action.addEventListener('click',onClick);lastAction='attached';render();return {attached:true,reason:'attached',state:snapshot()};
+    };
+    const detach=()=>{
+      if(detached)return {detached:false,reason:'already_detached',state:snapshot()};
+      if(attached)elements.action.removeEventListener('click',onClick);
+      attached=false;detached=true;offerButtons.forEach(button=>{button.disabled=true;});elements.panel.hidden=true;elements.action.hidden=true;elements.action.disabled=true;lastAction='detached';
+      return {detached:true,reason:'detached',state:snapshot()};
+    };
+    const idle=async()=>{if(pending)await pending;return snapshot();};
+    return Object.freeze({snapshot,attach,render,reconcile,activate,detach,idle});
   }
   function createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery}){
     if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||requestRecovery!==undefined&&typeof requestRecovery!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');
@@ -1907,7 +1972,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createOfferAccessDomBridge,createOfferPageLifecycle,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createOfferAccessDomBridge,createOfferPageLifecycle,createCancellationRecoveryDomBridge,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
