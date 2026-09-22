@@ -1300,6 +1300,26 @@ test('generation three coalesces hide and resume events into its pending offer r
   assert.deepEqual(timers.pending().map(item=>item.delay),[28000]);assert.equal(target.listenerCount('visibilitychange'),1);assert.equal(target.listenerCount('pageshow'),1);assert.equal(elements.action.listenerCount('click'),1);
   lifecycle.leave();assert.equal(timers.pending().length,0);
 });
+test('an offer response completed while hidden stays disabled until one visible refresh', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements(),requests=[];let reads=0;
+  const lifecycle=R.createOfferPageLifecycle({
+    createFlow:()=>R.createOfferExpiryRefreshFlow({
+      eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),createAbortController:()=>new AbortController(),
+      readOffers:value=>{reads+=1;return new Promise(resolve=>requests.push({value,resolve}));}
+    }),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements})
+  });
+  lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:10.000Z',offers:[{id:'offer-before-hide'}]});
+  const hiddenRead=lifecycle.refresh('expiry');while(requests.length<1)await new Promise(resolve=>setImmediate(resolve));documentState.visibilityState='hidden';target.dispatch('visibilitychange');
+  requests[0].resolve({status:200,body:{serverNow:'2026-09-22T00:00:12.000Z',nextExpiryAt:'2026-09-22T00:00:20.000Z',offers:[{id:'offer-hidden'}]}});
+  const deferred=await hiddenRead;await lifecycle.idle();let state=lifecycle.snapshot();
+  assert.equal(deferred.refreshed,false);assert.equal(deferred.reason,'hidden_refresh_deferred');assert.equal(reads,1);assert.equal(state.flow.offersSelectable,false);assert.equal(state.flow.refreshOnVisible,true);assert.equal(state.flow.serverNow,null);assert.equal(state.flow.nextExpiryAt,null);assert.equal(timers.pending().length,0);assert.ok(elements.offerButtons.every(button=>button.disabled));
+  documentState.visibilityState='visible';target.dispatch('visibilitychange');target.dispatch('pageshow');while(requests.length<2)await new Promise(resolve=>setImmediate(resolve));
+  state=lifecycle.snapshot();assert.equal(reads,2);assert.equal(requests[1].value.reason,'resume');assert.equal(state.flow.offersSelectable,false);target.dispatch('pageshow');await Promise.resolve();assert.equal(reads,2);
+  requests[1].resolve({status:200,body:{serverNow:'2026-09-22T00:00:25.000Z',nextExpiryAt:'2026-09-22T00:00:40.000Z',offers:[{id:'offer-visible'}]}});await lifecycle.idle();state=lifecycle.snapshot();
+  assert.equal(reads,2);assert.equal(state.flow.offersSelectable,true);assert.equal(state.flow.refreshes,1);assert.equal(state.flow.lastReason,'resumed');assert.equal(state.flow.nextExpiryAt,'2026-09-22T00:00:40.000Z');assert.ok(elements.offerButtons.every(button=>button.disabled===false));assert.deepEqual(timers.pending().map(item=>item.delay),[15000]);
+  assert.equal(target.listenerCount('visibilitychange'),1);assert.equal(target.listenerCount('pageshow'),1);assert.equal(elements.action.listenerCount('click'),1);lifecycle.leave();assert.equal(timers.pending().length,0);
+});
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));

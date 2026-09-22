@@ -428,9 +428,15 @@
   }
   function createOfferExpiryRefreshFlow({readOffers,eventTarget,documentState,setTimer=setTimeout,clearTimer=clearTimeout,createAbortController=()=>typeof AbortController==='function'?new AbortController():null}){
     if(typeof readOffers!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string'||typeof setTimer!=='function'||typeof clearTimer!=='function'||typeof createAbortController!=='function')throw Error('提示期限更新の設定が不正です。');
-    let attached=false,detached=false,visible=documentState.visibilityState!=='hidden',timer=null,timerVersion=0,operation=null,requestController=null,refreshOnVisible=false,refreshes=0,lastReason='idle',serverNow=null,nextExpiryAt=null,offersSelectable=false,action=null,guidance='idle',accessOutcome=null;
+    let attached=false,detached=false,visible=documentState.visibilityState!=='hidden',timer=null,timerVersion=0,operation=null,requestController=null,refreshOnVisible=false,refreshes=0,lastReason='idle',serverNow=null,nextExpiryAt=null,offersSelectable=false,action=null,guidance='idle',accessOutcome=null,stateListener=null;
     const operations=new Set();
     const snapshot=()=>Object.freeze({attached,detached,visible,busy:Boolean(operation),timerScheduled:timer!==null,refreshOnVisible,refreshes,lastReason,serverNow,nextExpiryAt,offersSelectable,action,guidance,accessOutcome});
+    const notify=()=>{if(stateListener!==null)stateListener(snapshot());};
+    const setStateListener=listener=>{
+      if(listener!==null&&typeof listener!=='function')throw Error('提示期限更新の状態通知が不正です。');
+      stateListener=listener;
+      return {connected:stateListener!==null,state:snapshot()};
+    };
     const reject=reason=>Promise.resolve({refreshed:false,reason,state:snapshot()});
     const cancelTimer=()=>{
       timerVersion+=1;
@@ -496,6 +502,12 @@
         const outcome=readOutcome(value);
         if(outcome.kind==='access')return applyAccessOutcome(outcome.status);
         if(outcome.kind==='failed')return requireManualRefresh('refresh_failed');
+        if(!visible){
+          const parsed=parseList(outcome.value);
+          if(!parsed)return requireManualRefresh('invalid_offer_list');
+          serverNow=null;nextExpiryAt=null;offersSelectable=false;action=null;guidance='refreshing';refreshOnVisible=true;lastReason='hidden_refresh_deferred';
+          return {refreshed:false,reason:lastReason,state:snapshot()};
+        }
         const applied=apply(outcome.value);
         if(!applied.applied)return requireManualRefresh('invalid_offer_list');
         refreshes+=1;lastReason=reason==='resume'?'resumed':reason==='manual'?'manual_refreshed':'refreshed';
@@ -503,7 +515,7 @@
       },()=>{
         if(!detached&&attached&&version===timerVersion)return requireManualRefresh('refresh_failed');
         return {refreshed:false,reason:'stale_refresh',state:snapshot()};
-      }).finally(()=>{operations.delete(task);if(operation===task)operation=null;if(requestController===controller)requestController=null;});
+      }).then(result=>{notify();return result;}).finally(()=>{operations.delete(task);if(operation===task)operation=null;if(requestController===controller)requestController=null;});
       operation=task;operations.add(task);return task;
     };
     const syncVisibility=name=>{
@@ -531,13 +543,13 @@
     const detach=()=>{
       if(detached)return {detached:false,reason:'already_detached',state:snapshot()};
       if(attached){eventTarget.removeEventListener('visibilitychange',onVisibilityChange);eventTarget.removeEventListener('pageshow',onPageShow);}
-      attached=false;detached=true;refreshOnVisible=false;offersSelectable=false;action=null;guidance='detached';accessOutcome=null;
+      attached=false;detached=true;refreshOnVisible=false;offersSelectable=false;action=null;guidance='detached';accessOutcome=null;stateListener=null;
       if(requestController!==null){try{requestController.abort();}catch{}requestController=null;}
       cancelTimer();lastReason='detached';
       return {detached:true,reason:'detached',state:snapshot()};
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
-    return Object.freeze({snapshot,attach,apply,refresh,detach,idle});
+    return Object.freeze({snapshot,setStateListener,attach,apply,refresh,detach,idle});
   }
   function createOfferAccessDomBridge({flow,elements,onReauthenticate=()=>({requested:true}),onPassengerHome=()=>({navigated:true}),onActionComplete=()=>({completed:true})}){
     if(!flow||typeof flow.snapshot!=='function'||typeof flow.refresh!=='function'||!elements||!elements.panel||!elements.title||!elements.message||!elements.action||typeof elements.action.addEventListener!=='function'||typeof elements.action.removeEventListener!=='function'||typeof onReauthenticate!=='function'||typeof onPassengerHome!=='function'||typeof onActionComplete!=='function')throw Error('提示案内パネルの設定が不正です。');
@@ -614,8 +626,8 @@
     const enter=()=>{
       if(active)leave();
       const currentGeneration=++generation,flow=createFlow(Object.freeze({generation:currentGeneration})),dom=createDomBridge(Object.freeze({generation:currentGeneration,flow}));
-      if(!flow||typeof flow.attach!=='function'||typeof flow.apply!=='function'||typeof flow.refresh!=='function'||typeof flow.detach!=='function'||typeof flow.idle!=='function'||!dom||typeof dom.attach!=='function'||typeof dom.render!=='function'||typeof dom.activate!=='function'||typeof dom.detach!=='function'||typeof dom.idle!=='function')throw Error('提示ページライフサイクルの構成が不正です。');
-      const entry={generation:currentGeneration,flow,dom};active=entry;flow.attach();dom.attach();lastAction='entered';
+      if(!flow||typeof flow.setStateListener!=='function'||typeof flow.attach!=='function'||typeof flow.apply!=='function'||typeof flow.refresh!=='function'||typeof flow.detach!=='function'||typeof flow.idle!=='function'||!dom||typeof dom.attach!=='function'||typeof dom.render!=='function'||typeof dom.activate!=='function'||typeof dom.detach!=='function'||typeof dom.idle!=='function')throw Error('提示ページライフサイクルの構成が不正です。');
+      const entry={generation:currentGeneration,flow,dom};active=entry;flow.setStateListener(()=>{if(active===entry)dom.render();});flow.attach();dom.attach();lastAction='entered';
       return {entered:true,reason:'entered',generation:currentGeneration,state:snapshot()};
     };
     const apply=value=>{
