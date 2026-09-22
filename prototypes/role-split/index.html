@@ -426,9 +426,9 @@
     };
     return Object.freeze({snapshot,recoverOnStartup,resume,beginSession,setVisible,dispose});
   }
-  function createOfferExpiryRefreshFlow({readOffers,eventTarget,documentState,setTimer=setTimeout,clearTimer=clearTimeout}){
-    if(typeof readOffers!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string'||typeof setTimer!=='function'||typeof clearTimer!=='function')throw Error('提示期限更新の設定が不正です。');
-    let attached=false,detached=false,visible=documentState.visibilityState!=='hidden',timer=null,timerVersion=0,operation=null,refreshOnVisible=false,refreshes=0,lastReason='idle',serverNow=null,nextExpiryAt=null,offersSelectable=false,action=null,guidance='idle',accessOutcome=null;
+  function createOfferExpiryRefreshFlow({readOffers,eventTarget,documentState,setTimer=setTimeout,clearTimer=clearTimeout,createAbortController=()=>typeof AbortController==='function'?new AbortController():null}){
+    if(typeof readOffers!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string'||typeof setTimer!=='function'||typeof clearTimer!=='function'||typeof createAbortController!=='function')throw Error('提示期限更新の設定が不正です。');
+    let attached=false,detached=false,visible=documentState.visibilityState!=='hidden',timer=null,timerVersion=0,operation=null,requestController=null,refreshOnVisible=false,refreshes=0,lastReason='idle',serverNow=null,nextExpiryAt=null,offersSelectable=false,action=null,guidance='idle',accessOutcome=null;
     const operations=new Set();
     const snapshot=()=>Object.freeze({attached,detached,visible,busy:Boolean(operation),timerScheduled:timer!==null,refreshOnVisible,refreshes,lastReason,serverNow,nextExpiryAt,offersSelectable,action,guidance,accessOutcome});
     const reject=reason=>Promise.resolve({refreshed:false,reason,state:snapshot()});
@@ -486,8 +486,12 @@
       if(!visible){if(reason!=='manual')refreshOnVisible=true;lastReason='screen_hidden';return reject(lastReason);}
       cancelTimer();refreshOnVisible=false;offersSelectable=false;action=null;guidance='refreshing';lastReason=reason==='resume'?'resume_refresh_pending':reason==='manual'?'manual_refresh_pending':'expiry_refresh_pending';
       const version=timerVersion;
+      const controller=createAbortController();
+      if(controller!==null&&(!controller.signal||typeof controller.abort!=='function'))throw Error('提示取得の中止設定が不正です。');
+      requestController=controller;
+      const request=controller===null?Object.freeze({reason,serverNow,nextExpiryAt}):Object.freeze({reason,serverNow,nextExpiryAt,signal:controller.signal});
       let task;
-      task=Promise.resolve().then(()=>readOffers(Object.freeze({reason,serverNow,nextExpiryAt}))).then(value=>{
+      task=Promise.resolve().then(()=>readOffers(request)).then(value=>{
         if(detached||!attached||version!==timerVersion){lastReason='stale_refresh';return {refreshed:false,reason:lastReason,state:snapshot()};}
         const outcome=readOutcome(value);
         if(outcome.kind==='access')return applyAccessOutcome(outcome.status);
@@ -499,7 +503,7 @@
       },()=>{
         if(!detached&&attached&&version===timerVersion)return requireManualRefresh('refresh_failed');
         return {refreshed:false,reason:'stale_refresh',state:snapshot()};
-      }).finally(()=>{operations.delete(task);if(operation===task)operation=null;});
+      }).finally(()=>{operations.delete(task);if(operation===task)operation=null;if(requestController===controller)requestController=null;});
       operation=task;operations.add(task);return task;
     };
     const syncVisibility=name=>{
@@ -523,7 +527,9 @@
     const detach=()=>{
       if(detached)return {detached:false,reason:'already_detached',state:snapshot()};
       if(attached){eventTarget.removeEventListener('visibilitychange',onVisibilityChange);eventTarget.removeEventListener('pageshow',onPageShow);}
-      attached=false;detached=true;refreshOnVisible=false;offersSelectable=false;action=null;guidance='detached';accessOutcome=null;cancelTimer();lastReason='detached';
+      attached=false;detached=true;refreshOnVisible=false;offersSelectable=false;action=null;guidance='detached';accessOutcome=null;
+      if(requestController!==null){try{requestController.abort();}catch{}requestController=null;}
+      cancelTimer();lastReason='detached';
       return {detached:true,reason:'detached',state:snapshot()};
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);return snapshot();};
