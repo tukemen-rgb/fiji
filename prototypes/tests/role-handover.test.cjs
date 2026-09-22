@@ -1696,6 +1696,38 @@ test('recovered passenger generation requires a fresh cancellation page before r
   old.page.leave();fresh.page.leave();assert.equal(target.listenerCount('fiji:auth-session-changed'),0);
   assert.doesNotMatch(JSON.stringify([old.page.snapshot(),fresh.page.snapshot()]),/passenger-generation|cancel-provider-recovery-(old|fresh)-key|ride-/);
 });
+test('fresh cancellation reconciliation fails closed when passenger generation is lost again', async () => {
+  for(const delayedOutcome of ['cancelled','network_failure']){
+    const {R,m}=setup();passenger(m);
+    const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),target=recoveryEventTarget(),documentState={visibilityState:'visible'},elements=cancellationRecoveryDomElements();
+    let providerAvailable=true,releaseState,rejectState,historyNavigations=0,retries=0,sessionReads=0,stateReads=0;
+    const lifecycle=R.createOfferPageLifecycle({
+      rideId:ride.id,baselineRevision:ride.revision,baselineStatus:ride.status,cancellationIdempotencyKey:'cancel-fresh-reconcile-loss-key',
+      readCancellationState:()=>{stateReads+=1;return new Promise((resolve,reject)=>{releaseState=resolve;rejectState=reject;});},
+      retryCancellationCommand:async()=>{retries+=1;return {status:503};},
+      onCancellationRecovered:()=>{historyNavigations+=1;return {navigated:true,page:'passenger-history'};},
+      createFlow:()=>R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>expiryTimers().set(callback,delay),clearTimer:()=>{},readOffers:async()=>({status:500})}),
+      createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerAccessDomElements()})
+    });
+    lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
+    const page=R.createCancellationRecoveryPageController({
+      lifecycle,elements,eventTarget:target,
+      sessionGenerationForPassenger:()=>{sessionReads+=1;return providerAvailable?'passenger-generation-a':null;}
+    });
+    assert.equal(page.start().started,true);const pending=page.reconcile();while(!releaseState)await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(stateReads,1);assert.equal(target.listenerCount('fiji:auth-session-changed'),1);
+    providerAvailable=false;target.dispatch('fiji:auth-session-changed',{detail:{sessionGeneration:'passenger-generation-a',tokenRef:'spoofed-token'}});
+    assert.equal(page.snapshot().session.lastAction,'logout');assert.equal(target.listenerCount('fiji:auth-session-changed'),0);
+    assert.equal(elements.panel.hidden,true);assert.equal(elements.action.listenerCount('click'),0);
+    if(delayedOutcome==='cancelled')releaseState({status:200,body:{id:ride.id,status:'cancelled',revision:ride.revision+1,viewerRole:'passenger',nextAction:'show_cancelled_history',updatedAt:'2026-09-22T00:00:06.000Z'}});else rejectState(Error('delayed network failure'));
+    const completed=await pending;await page.idle();assert.equal(completed.processed,false);assert.equal(completed.reason,'stale_action');
+    assert.equal(historyNavigations,0);assert.equal(retries,0);assert.equal(lifecycle.snapshot().terminalReason,'session_invalidated');assert.equal(lifecycle.snapshot().lastAction,'logout');
+    assert.equal(lifecycle.snapshot().cancellationRetryAllowed,false);assert.equal(elements.panel.hidden,true);assert.equal(elements.action.listenerCount('click'),0);
+    providerAvailable=true;const readsAfterLoss=sessionReads;target.dispatch('fiji:auth-session-changed',{detail:{sessionGeneration:'passenger-generation-a'}});
+    assert.equal(sessionReads,readsAfterLoss);assert.equal(stateReads,1);assert.equal((await page.activate()).reason,'bridge_inactive');
+    assert.doesNotMatch(JSON.stringify(page.snapshot()),/passenger-generation|spoofed-token|cancel-fresh-reconcile-loss-key|ride-/);page.leave();
+  }
+});
 test('cancellation session bridge rejects a raw session object instead of using object identity', () => {
   const {R}=setup(),target=recoveryEventTarget(),invalidations=[];
   const bridge=R.createCancellationSessionEventBridge({
