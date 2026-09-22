@@ -1885,6 +1885,44 @@
     const fail=token=>{if(!canApply(token))return Object.freeze({accepted:false,reason:'stale_place',state:snapshot()});pending=null;return Object.freeze({accepted:true,reason:'place_failed',state:snapshot()});};
     return Object.freeze({snapshot,begin,cancel,canApply,apply,fail});
   }
+  const SERVICE_TIME_ZONE='Pacific/Fiji';
+  function serviceTimeParts(value){
+    const time=typeof value==='number'?value:Date.parse(value);
+    if(!Number.isFinite(time))throw Error('予約日時を確認してください。');
+    const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:SERVICE_TIME_ZONE,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(time)).filter(part=>part.type!=='literal').map(part=>[part.type,part.value]));
+    return Object.freeze({year:Number(parts.year),month:Number(parts.month),day:Number(parts.day),hour:Number(parts.hour),minute:Number(parts.minute),second:Number(parts.second)});
+  }
+  function serviceDateTimeLocalValue(value){
+    if(value===undefined||value===null||value==='')return '';
+    const part=serviceTimeParts(value),pad=value=>String(value).padStart(2,'0');
+    return `${part.year}-${pad(part.month)}-${pad(part.day)}T${pad(part.hour)}:${pad(part.minute)}`;
+  }
+  function parseServiceDateTimeLocal(value,now=Date.now()){
+    const match=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(String(value||''));
+    if(!match)throw Error('予約日時を確認してください。');
+    const wanted={year:Number(match[1]),month:Number(match[2]),day:Number(match[3]),hour:Number(match[4]),minute:Number(match[5])};
+    const wallTime=Date.UTC(wanted.year,wanted.month-1,wanted.day,wanted.hour,wanted.minute);
+    const wallDate=new Date(wallTime);
+    if(wallDate.getUTCFullYear()!==wanted.year||wallDate.getUTCMonth()+1!==wanted.month||wallDate.getUTCDate()!==wanted.day||wallDate.getUTCHours()!==wanted.hour||wallDate.getUTCMinutes()!==wanted.minute)throw Error('予約日時を確認してください。');
+    let instant=wallTime;
+    for(let attempt=0;attempt<3;attempt+=1){
+      const shown=serviceTimeParts(instant);
+      instant+=wallTime-Date.UTC(shown.year,shown.month-1,shown.day,shown.hour,shown.minute,shown.second);
+    }
+    const shown=serviceTimeParts(instant);
+    if(shown.year!==wanted.year||shown.month!==wanted.month||shown.day!==wanted.day||shown.hour!==wanted.hour||shown.minute!==wanted.minute)throw Error('このフィジー時間は予約に使用できません。');
+    if(instant<=Number(now))throw Error('予約日時は現在より後を選んでください。');
+    return new Date(instant).toISOString();
+  }
+  function pickupTimeView(value){
+    if(value===undefined||value===null||value==='')return Object.freeze({mode:'immediate',pickupAt:null,timeZone:SERVICE_TIME_ZONE,inputValue:'',label:'今すぐ'});
+    const time=Date.parse(value);
+    if(!Number.isFinite(time))throw Error('予約日時を確認してください。');
+    const pickupAt=new Date(time).toISOString();
+    if(pickupAt!==value)throw Error('予約日時は正規化済みの値を使用してください。');
+    const label=new Intl.DateTimeFormat('ja-JP',{timeZone:SERVICE_TIME_ZONE,year:'numeric',month:'numeric',day:'numeric',weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date(time))+'（フィジー時間）';
+    return Object.freeze({mode:'scheduled',pickupAt,timeZone:SERVICE_TIME_ZONE,inputValue:serviceDateTimeLocalValue(pickupAt),label});
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -2055,7 +2093,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createOfferAccessDomBridge,createOfferPageLifecycle,createCancellationRecoveryDomBridge,createCancellationSessionEventBridge,createCancellationRecoveryPageController,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,SERVICE_TIME_ZONE,serviceDateTimeLocalValue,parseServiceDateTimeLocal,pickupTimeView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createOfferAccessDomBridge,createOfferPageLifecycle,createCancellationRecoveryDomBridge,createCancellationSessionEventBridge,createCancellationRecoveryPageController,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -2163,10 +2201,10 @@ $('schedule-open').onclick = () => {
 };
 $('reset-demo').onclick = () => location.reload();
 function localDateTimeValue(value){
-  const d=new Date(value);return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,16);
+  return R.serviceDateTimeLocalValue(value);
 }
 function pickupTimeLabel(value){
-  return value?new Date(value).toLocaleString('ja-JP',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}):'今すぐ';
+  return R.pickupTimeView(value).label;
 }
 function updateScheduleControl(){
   $('schedule-open').textContent=state.pickupAt?pickupTimeLabel(state.pickupAt):'今すぐ';
@@ -2181,11 +2219,12 @@ function invalidateCurrentSearch(changes){
   }catch(error){toast(error.message);return false;}
 }
 $('save-schedule').onclick = () => {
-  const d = new Date($('schedule-time').value);
-  if (!Number.isFinite(d.getTime()) || d.getTime() <= Date.now()) return toast('現在より後の日時を選んでください。');
-  if(!invalidateCurrentSearch({pickupAt:d.toISOString()}))return;
-  state.pickupAt=d.toISOString();updateScheduleControl();$('schedule-dialog').close();
-  toast(d.toLocaleString('ja-JP') + ' を次の依頼に設定しました。実際の予約は送信されません。');
+  let pickupAt;
+  try{pickupAt=R.parseServiceDateTimeLocal($('schedule-time').value,Date.now());}
+  catch(error){return toast(error.message);}
+  if(!invalidateCurrentSearch({pickupAt}))return;
+  state.pickupAt=pickupAt;updateScheduleControl();$('schedule-dialog').close();
+  toast(pickupTimeLabel(pickupAt) + ' を次の依頼に設定しました。実際の予約は送信されません。');
 };
 $('clear-schedule').onclick=()=>{
   if(!invalidateCurrentSearch({pickupAt:null}))return;
@@ -2449,7 +2488,7 @@ const money=cents=>(cents/100).toFixed(2);
 const statusLabel=s=>({collecting:'提示待ち',assigned:'配車確定の見本',arriving:'迎車中',on_trip:'乗車中',completed:'完了',cancelled:'取消済み'}[s]||s);
 function icon(name){return `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;}
 function details(items){return `<dl class="details">${items.map(([k,v])=>`<div class="detail"><dt>${esc(k)}</dt><dd>${esc(v??'—')}</dd></div>`).join('')}</dl>`;}
-function scheduleMarkup(r){return r.pickupAt?`<p class="banner"><strong>予約日時（デモ）</strong><br>${esc(pickupTimeLabel(r.pickupAt))} · この端末の表示時刻</p>`:'<p class="muted">乗車予定：今すぐ</p>';}
+function scheduleMarkup(r){const view=R.pickupTimeView(r.pickupAt);return view.mode==='scheduled'?`<p class="banner" data-pickup-at="${esc(view.pickupAt)}"><strong>予約日時（デモ）</strong><br>${esc(view.label)}</p>`:'<p class="muted">乗車予定：今すぐ</p>';}
 function routeMarkup(r){return `${scheduleMarkup(r)}<div class="trip-route"><div><span>乗車地点</span>${esc(r.pickup)}</div><div><span>降車地点</span>${esc(r.destination)}</div></div>`;}
 function renderRoleChooser(){
   $('passenger-resume').textContent=model.state.profiles.passenger?model.state.profiles.passenger.name+' さんの画面を開く':'利用者登録へ進む';

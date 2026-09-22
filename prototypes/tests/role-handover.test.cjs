@@ -3661,6 +3661,35 @@ test('cancelling a scheduled assignment retains its pickup time for both histori
   assert.equal(m.myRequests().find(r=>r.id===ride.id).pickupAt,pickupAt);
   m.useReviewedFixture(); assert.equal(m.driverTrips().find(r=>r.id===ride.id).pickupAt,pickupAt);
 });
+test('one normalized Fiji pickup time survives every ride surface and device time-zone change', () => {
+  const {m,R}=setup(); passenger(m);
+  const localInput='2099-07-15T09:30';
+  const pickupAt=R.parseServiceDateTimeLocal(localInput,0);
+  assert.equal(pickupAt,'2099-07-14T21:30:00.000Z');
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt});
+  m.useReviewedFixture(); m.setOnline(true);
+  const driverRequest=m.driverRequests().find(r=>r.id===ride.id);
+  const offer=m.submitOffer(ride.id,{fare:'23.50',eta:'7'});
+  m.chooseRole('passenger'); m.selectOffer(offer.id);
+  const passengerHistory=m.myRequests().find(r=>r.id===ride.id);
+  m.useReviewedFixture(); const driverHistory=m.driverTrips().find(r=>r.id===ride.id);
+  assert.deepEqual([ride.pickupAt,driverRequest.pickupAt,ride.quoteSnapshot.pickupAt,passengerHistory.pickupAt,driverHistory.pickupAt],[pickupAt,pickupAt,pickupAt,pickupAt,pickupAt]);
+  const expected={mode:'scheduled',pickupAt,timeZone:'Pacific/Fiji',inputValue:localInput,label:'2099/7/15(水) 09:30（フィジー時間）'};
+  const originalTimeZone=process.env.TZ;
+  try{
+    for(const deviceTimeZone of ['UTC','America/Los_Angeles','Pacific/Auckland']){
+      process.env.TZ=deviceTimeZone;
+      assert.deepEqual({...R.pickupTimeView(pickupAt)},expected,deviceTimeZone);
+      assert.equal(R.parseServiceDateTimeLocal(localInput,0),pickupAt,deviceTimeZone);
+    }
+  }finally{
+    if(originalTimeZone===undefined)delete process.env.TZ;else process.env.TZ=originalTimeZone;
+  }
+  assert.match(source,/SERVICE_TIME_ZONE='Pacific\/Fiji'/);
+  assert.match(source,/data-pickup-at="\$\{esc\(view\.pickupAt\)\}"/);
+  assert.match(source,/pickupAt=R\.parseServiceDateTimeLocal\(\$\('schedule-time'\)\.value,Date\.now\(\)\)/);
+  assert.doesNotMatch(source,/この端末の表示時刻/);
+});
 
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
   const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
