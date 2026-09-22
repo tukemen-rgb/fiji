@@ -610,11 +610,12 @@
     const idle=async()=>{if(pending)await pending;return snapshot();};
     return Object.freeze({snapshot,attach,render,activate,detach,idle});
   }
-  function createOfferPageLifecycle({createFlow,createDomBridge,rideId=null,readCancellationState=null,onCancellationRecovered=null}){
-    if(typeof createFlow!=='function'||typeof createDomBridge!=='function'||readCancellationState!==null&&typeof readCancellationState!=='function'||onCancellationRecovered!==null&&typeof onCancellationRecovered!=='function'||readCancellationState&&!(typeof rideId==='string'&&rideId.length>0))throw Error('提示ページライフサイクルの設定が不正です。');
-    let active=null,generation=0,lastAction='idle',terminalReason=null,cancellationRecovery=null,recoveryAttempted=false;
+  function createOfferPageLifecycle({createFlow,createDomBridge,rideId=null,readCancellationState=null,onCancellationRecovered=null,retryCancellationCommand=null,cancellationIdempotencyKey=null,baselineRevision=null,baselineStatus=null}){
+    const retryConfigured=retryCancellationCommand!==null||cancellationIdempotencyKey!==null||baselineRevision!==null||baselineStatus!==null;
+    if(typeof createFlow!=='function'||typeof createDomBridge!=='function'||readCancellationState!==null&&typeof readCancellationState!=='function'||onCancellationRecovered!==null&&typeof onCancellationRecovered!=='function'||readCancellationState&&!(typeof rideId==='string'&&rideId.length>0)||retryConfigured&&(typeof retryCancellationCommand!=='function'||typeof cancellationIdempotencyKey!=='string'||!cancellationIdempotencyKey||!Number.isInteger(baselineRevision)||baselineRevision<1||!['collecting','assigned','arriving'].includes(baselineStatus)||typeof readCancellationState!=='function'))throw Error('提示ページライフサイクルの設定が不正です。');
+    let active=null,generation=0,lastAction='idle',terminalReason=null,cancellationRecovery=null,cancellationRetry=null,recoveryAttempted=false,retryAllowed=false,retryUsed=false;
     const operations=new Set();
-    const snapshot=()=>Object.freeze({entered:Boolean(active),generation,activeGeneration:active?.generation||null,busy:operations.size>0,lastAction,terminalReason,flow:active?.flow.snapshot()||null,dom:active?.dom.snapshot()||null});
+    const snapshot=()=>Object.freeze({entered:Boolean(active),generation,activeGeneration:active?.generation||null,busy:operations.size>0,lastAction,terminalReason,cancellationRetryAllowed:retryAllowed,cancellationRetryUsed:retryUsed,flow:active?.flow.snapshot()||null,dom:active?.dom.snapshot()||null});
     const track=work=>{
       let task;
       task=Promise.resolve(work).finally(()=>operations.delete(task));operations.add(task);return task;
@@ -659,9 +660,19 @@
         entry.dom.render();lastAction=result.reason;return {...result,pageState:snapshot()};
       }));
     };
-    const validRecoveredCancellation=response=>{
+    const validRecoveredRide=response=>{
       const body=response?.body;
-      return response?.status===200&&body&&typeof body==='object'&&!Array.isArray(body)&&Object.keys(body).sort().join(',')==='id,nextAction,revision,status,updatedAt,viewerRole'&&body.id===rideId&&body.status==='cancelled'&&Number.isInteger(body.revision)&&body.revision>0&&body.viewerRole==='passenger'&&body.nextAction==='show_cancelled_history'&&typeof body.updatedAt==='string'&&Number.isFinite(Date.parse(body.updatedAt));
+      const actions={collecting:'compare_offers',assigned:'track_pickup',arriving:'confirm_vehicle',on_trip:'show_on_trip',completed:'show_completed',cancelled:'show_cancelled_history'};
+      return response?.status===200&&body&&typeof body==='object'&&!Array.isArray(body)&&Object.keys(body).sort().join(',')==='id,nextAction,revision,status,updatedAt,viewerRole'&&body.id===rideId&&Number.isInteger(body.revision)&&body.revision>0&&body.viewerRole==='passenger'&&actions[body.status]===body.nextAction&&typeof body.updatedAt==='string'&&Number.isFinite(Date.parse(body.updatedAt));
+    };
+    const validRecoveredCancellation=response=>validRecoveredRide(response)&&response.body.status==='cancelled'&&response.body.nextAction==='show_cancelled_history';
+    const recoveredBaselineUnchanged=response=>validRecoveredRide(response)&&response.body.revision===baselineRevision&&response.body.status===baselineStatus;
+    const transientFailure=response=>!response||response.status===0||[408,425,429].includes(response.status)||response.status>=500;
+    const finalizeCancellation=async body=>{
+      retryAllowed=false;terminalReason='request_cancelled';lastAction='request_cancelled';
+      let navigation=null;
+      if(onCancellationRecovered){try{navigation=await onCancellationRecovered(Object.freeze({...body}));}catch(error){navigation={navigated:false,reason:'navigation_failed'};}}
+      return {reconciled:true,reason:'request_cancelled',ride:Object.freeze({...body}),navigation,state:snapshot()};
     };
     const reconcileCancellation=()=>{
       if(cancellationRecovery)return cancellationRecovery;
@@ -673,17 +684,30 @@
       const work=(async()=>{
         let response;
         try{response=await readCancellationState();}
-        catch(error){lastAction='cancellation_recovery_failed';return {reconciled:false,reason:'recovery_failed',state:snapshot()};}
-        if(!validRecoveredCancellation(response)){lastAction='cancellation_unresolved';return {reconciled:false,reason:'cancellation_unresolved',state:snapshot()};}
-        terminalReason='request_cancelled';lastAction='request_cancelled';
-        let navigation=null;
-        if(onCancellationRecovered){try{navigation=await onCancellationRecovered(Object.freeze({...response.body}));}catch(error){navigation={navigated:false,reason:'navigation_failed'};}}
-        return {reconciled:true,reason:'request_cancelled',ride:Object.freeze({...response.body}),navigation,state:snapshot()};
+        catch(error){if(retryConfigured){retryAllowed=true;lastAction='cancellation_retry_required';return {reconciled:false,reason:'explicit_retry_required',state:snapshot()};}lastAction='cancellation_recovery_failed';return {reconciled:false,reason:'recovery_failed',state:snapshot()};}
+        if(validRecoveredCancellation(response))return finalizeCancellation(response.body);
+        if(retryConfigured&&(transientFailure(response)||recoveredBaselineUnchanged(response))){retryAllowed=true;lastAction='cancellation_retry_required';return {reconciled:false,reason:'explicit_retry_required',state:snapshot()};}
+        lastAction='cancellation_unresolved';return {reconciled:false,reason:'cancellation_unresolved',state:snapshot()};
       })();
       cancellationRecovery=track(work);cancellationRecovery.finally(()=>{cancellationRecovery=null;});return cancellationRecovery;
     };
+    const retryCancellation=()=>{
+      if(cancellationRetry)return cancellationRetry;
+      if(terminalReason==='request_cancelled')return Promise.resolve({retried:false,reason:'request_cancelled',state:snapshot()});
+      if(retryUsed)return Promise.resolve({retried:false,reason:'retry_already_used',state:snapshot()});
+      if(!retryAllowed||!retryCancellationCommand)return Promise.resolve({retried:false,reason:'retry_not_allowed',state:snapshot()});
+      retryAllowed=false;retryUsed=true;lastAction='cancellation_retry_pending';
+      const request=Object.freeze({action:'cancel_ride',rideId,expectedRevision:baselineRevision,cancelReason:'passenger_requested',idempotencyKey:cancellationIdempotencyKey});
+      const work=(async()=>{
+        let response;
+        try{response=await retryCancellationCommand(request);}catch(error){lastAction='cancellation_retry_stopped';return {retried:false,reason:'retry_outcome_unknown',state:snapshot()};}
+        if(validRecoveredCancellation(response)){const completed=await finalizeCancellation(response.body);return {...completed,retried:true};}
+        lastAction='cancellation_retry_stopped';return {retried:false,reason:transientFailure(response)?'retry_outcome_unknown':'retry_rejected',state:snapshot()};
+      })();
+      cancellationRetry=track(work);cancellationRetry.finally(()=>{cancellationRetry=null;});return cancellationRetry;
+    };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(active){await active.flow.idle();await active.dom.idle();}return snapshot();};
-    return Object.freeze({snapshot,enter,apply,refresh,activate,completeCancellation,reconcileCancellation,leave,idle});
+    return Object.freeze({snapshot,enter,apply,refresh,activate,completeCancellation,reconcileCancellation,retryCancellation,leave,idle});
   }
   function createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery}){
     if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||requestRecovery!==undefined&&typeof requestRecovery!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');

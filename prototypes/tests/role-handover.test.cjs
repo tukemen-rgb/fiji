@@ -1405,6 +1405,46 @@ test('unknown cancellation outcome reads current state once without replaying th
   documentState.visibilityState='hidden';target.dispatch('visibilitychange');documentState.visibilityState='visible';target.dispatch('visibilitychange');target.dispatch('pageshow');await Promise.resolve();assert.equal(stateReads,1);
   assert.equal(ride.status,'cancelled');assert.equal(ride.cancelReason,'passenger_requested');assert.equal(m.getOffers(ride.id).length,0);assert.throws(()=>m.selectOffer(oldOffer.id));
 });
+test('an explicit cancellation retry reuses the original key once after recovery fails', async () => {
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),oldOffer=m.getOffers(ride.id)[0],originalKey='cancel-original-key';
+  const target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements();let stateReads=0,cancellationCommands=1,retryRequest,releaseRetry,historyNavigations=0;
+  const lifecycle=R.createOfferPageLifecycle({
+    rideId:ride.id,baselineRevision:ride.revision,baselineStatus:ride.status,cancellationIdempotencyKey:originalKey,
+    readCancellationState:async()=>{stateReads+=1;throw Error('simulated recovery network failure');},
+    retryCancellationCommand:request=>{cancellationCommands+=1;retryRequest=request;m.cancelRide(ride.id,ride.revision);return new Promise(resolve=>{releaseRetry=()=>resolve({status:200,body:{id:ride.id,status:'cancelled',revision:ride.revision,viewerRole:'passenger',nextAction:'show_cancelled_history',updatedAt:ride.cancelledAt}});});},
+    onCancellationRecovered:()=>{historyNavigations+=1;return {navigated:true,page:'passenger-history'};},
+    createFlow:()=>R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>({status:500})}),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements})
+  });
+  lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:oldOffer.id}]});
+  const recovery=await lifecycle.reconcileCancellation();let state=lifecycle.snapshot();
+  assert.equal(recovery.reason,'explicit_retry_required');assert.equal(stateReads,1);assert.equal(cancellationCommands,1);assert.equal(state.cancellationRetryAllowed,true);assert.equal(state.cancellationRetryUsed,false);assert.ok(elements.offerButtons.every(button=>button.disabled));assert.equal(timers.pending().length,0);
+  const first=lifecycle.retryCancellation(),duplicate=lifecycle.retryCancellation();assert.equal(first,duplicate);while(!releaseRetry)await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual({...retryRequest},{action:'cancel_ride',rideId:ride.id,expectedRevision:1,cancelReason:'passenger_requested',idempotencyKey:originalKey});assert.equal(cancellationCommands,2);assert.equal(historyNavigations,0);
+  releaseRetry();const completed=await first;assert.equal(await duplicate,completed);await lifecycle.idle();state=lifecycle.snapshot();
+  assert.equal(completed.retried,true);assert.equal(completed.reconciled,true);assert.equal(completed.reason,'request_cancelled');assert.equal(historyNavigations,1);assert.equal(cancellationCommands,2);assert.equal(state.terminalReason,'request_cancelled');assert.equal(state.cancellationRetryAllowed,false);assert.equal(state.cancellationRetryUsed,true);
+  assert.equal((await lifecycle.retryCancellation()).reason,'request_cancelled');assert.equal(cancellationCommands,2);assert.equal(lifecycle.enter().reason,'request_cancelled');assert.equal(m.getOffers(ride.id).length,0);assert.throws(()=>m.selectOffer(oldOffer.id));
+});
+test('a cancellation retry with another unknown result stops without a loop', async () => {
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),originalKey='cancel-stop-key';
+  const target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements();let retries=0,releaseRetry,retryRequest,historyNavigations=0;
+  const lifecycle=R.createOfferPageLifecycle({
+    rideId:ride.id,baselineRevision:ride.revision,baselineStatus:ride.status,cancellationIdempotencyKey:originalKey,
+    readCancellationState:async()=>({status:200,body:{id:ride.id,status:'collecting',revision:ride.revision,viewerRole:'passenger',nextAction:'compare_offers',updatedAt:'2026-09-22T00:00:00.000Z'}}),
+    retryCancellationCommand:request=>{retries+=1;retryRequest=request;return new Promise(resolve=>{releaseRetry=resolve;});},
+    onCancellationRecovered:()=>{historyNavigations+=1;},
+    createFlow:()=>R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>({status:500})}),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements})
+  });
+  lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
+  const recovery=await lifecycle.reconcileCancellation();assert.equal(recovery.reason,'explicit_retry_required');assert.equal(retries,0);assert.equal(lifecycle.snapshot().cancellationRetryAllowed,true);
+  const first=lifecycle.retryCancellation(),duplicate=lifecycle.retryCancellation();assert.equal(first,duplicate);while(!releaseRetry)await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(retries,1);assert.equal(retryRequest.idempotencyKey,originalKey);releaseRetry({status:503});const stopped=await first;assert.equal(await duplicate,stopped);await lifecycle.idle();const state=lifecycle.snapshot();
+  assert.equal(stopped.retried,false);assert.equal(stopped.reason,'retry_outcome_unknown');assert.equal(state.lastAction,'cancellation_retry_stopped');assert.equal(state.terminalReason,'cancellation_outcome_unknown');assert.equal(state.cancellationRetryAllowed,false);assert.equal(state.cancellationRetryUsed,true);assert.equal(historyNavigations,0);
+  assert.equal((await lifecycle.retryCancellation()).reason,'retry_already_used');assert.equal(retries,1);assert.equal(lifecycle.enter().reason,'cancellation_outcome_unknown');assert.ok(elements.offerButtons.every(button=>button.disabled));assert.equal(timers.pending().length,0);
+});
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));
