@@ -1936,14 +1936,15 @@
   }
   function createScheduleConflictRecoveryController({conflict,sessionForPassenger,readCurrentRide,eventTarget=null,createAbortController=()=>typeof AbortController==='function'?new AbortController():null}={}){
     if(conflict?.outcome!=='conflict'||!Number.isInteger(conflict.revision)||conflict.revision<1||typeof sessionForPassenger!=='function'||typeof readCurrentRide!=='function'||typeof createAbortController!=='function'||(eventTarget!==null&&(typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function')))throw Error('予約競合の最新状態確認設定が不正です。');
-    let phase='locked',action='refresh',target=null,reads=0,lastReason='conflict',operation=null,controller=null,version=1,eventAttached=false;
+    let phase='locked',action='refresh',target=null,reads=0,lastReason='conflict',operation=null,controller=null,version=1,eventAttached=false,confirmation=null;
     const snapshot=()=>Object.freeze({phase,busy:Boolean(operation),reads,lastReason,commandsLocked:phase!=='confirmed',action,target,autoCommandReplay:false});
     const session=()=>{try{const value=sessionForPassenger();return value&&typeof value==='object'&&!Array.isArray(value)?value:null;}catch{return null;}};
     const initialBinding=session();
-    const stop=(reason,nextPhase='unresolved')=>{phase=nextPhase;action=nextPhase==='reauth'?'reauth':'refresh';target=null;lastReason=reason;return {processed:false,reason,state:snapshot()};};
+    const stop=(reason,nextPhase='unresolved')=>{confirmation=null;phase=nextPhase;action=nextPhase==='reauth'?'reauth':'refresh';target=null;lastReason=reason;return {processed:false,reason,state:snapshot()};};
     const detachSessionListener=()=>{if(eventAttached){eventTarget.removeEventListener('fiji:auth-session-changed',onAuthSessionChanged);eventAttached=false;}};
     const stopForSessionChange=reason=>{version+=1;try{controller?.abort();}catch{}controller=null;operation=null;detachSessionListener();return stop(reason,'reauth');};
     const onAuthSessionChanged=()=>{const current=session();if(current===initialBinding)return;stopForSessionChange(current?'stale_session':'session_unavailable');};
+    const confirm=(reason,nextTarget)=>{phase='confirmed';action=null;target=nextTarget;lastReason=reason;const result=Object.freeze({processed:true,reason,target,state:snapshot()});confirmation=result;return result;};
     if(!initialBinding){phase='reauth';action='reauth';lastReason='session_unavailable';}
     else if(eventTarget){eventTarget.addEventListener('fiji:auth-session-changed',onAuthSessionChanged);eventAttached=true;}
     const refresh=()=>{
@@ -1964,17 +1965,22 @@
         if(status===200){
           const view=currentRideRecoveryView('passenger',response);
           if(view?.kind!=='ride'||view.ride.revision<conflict.revision)return stop('invalid_current_ride');
-          phase='confirmed';action=null;target=view.ride.status==='collecting'?'offers':'passenger-history';lastReason='latest_state_confirmed';
-          return {processed:true,reason:lastReason,target,state:snapshot()};
+          return confirm('latest_state_confirmed',view.ride.status==='collecting'?'offers':'passenger-history');
         }
-        if(status===204){phase='confirmed';action=null;target='passenger-history';lastReason='no_current_ride';return {processed:true,reason:lastReason,target,state:snapshot()};}
+        if(status===204)return confirm('no_current_ride','passenger-history');
         if(status===401||status===403)return stop('reauthentication_required','reauth');
         return stop('latest_state_unavailable');
       },()=>token===version?stop('latest_state_unavailable'):{processed:false,reason:'stale_recovery',state:snapshot()}).finally(()=>{if(operation===task)operation=null;if(controller?.signal===request.signal)controller=null;});
       operation=task;return task;
     };
-    const invalidate=()=>{version+=1;try{controller?.abort();}catch{}controller=null;operation=null;detachSessionListener();phase='stale';action=null;target=null;lastReason='invalidated';return snapshot();};
-    return Object.freeze({snapshot,refresh,invalidate});
+    const consume=result=>{
+      if(result!==confirmation||phase!=='confirmed')return {processed:false,reason:'stale_recovery',state:snapshot()};
+      const current=session();
+      if(current!==initialBinding){stopForSessionChange(current?'stale_session':'session_unavailable');return {processed:false,reason:'stale_recovery',state:snapshot()};}
+      confirmation=null;return {processed:true,reason:result.reason,target:result.target,state:snapshot()};
+    };
+    const invalidate=()=>{version+=1;try{controller?.abort();}catch{}controller=null;operation=null;confirmation=null;detachSessionListener();phase='stale';action=null;target=null;lastReason='invalidated';return snapshot();};
+    return Object.freeze({snapshot,refresh,consume,invalidate});
   }
   function create(){
     let seq=10;
@@ -2192,11 +2198,12 @@ const commandFeedbackDom=R.createCommandFeedbackDomBridge({commandUi,elements:{b
       commandUi.applyFeedback('passenger',generation,'unresolved',{title:'最新状態へ接続できません',message:'認証済みの最新状態通信は未接続です。予約変更は再送せず、操作を停止しています。',disableCommands:true,action:null});
       restartGuard.mark('passenger','unresolved');renderCommandFeedback();return {processed:false,reason:'service_unavailable'};
     }
-    const recovery=await scheduleConflictRecoveryController.refresh(),view=scheduleConflictRecoveryController.snapshot();
-    if(recovery.processed===true){const target=recovery.target;scheduleConflictRecoveryController.invalidate();scheduleConflictRecoveryController=null;scheduleConflictRecovery=null;restartGuard.clear();commandUi.clear();show(target);return {processed:true,reason:recovery.reason};}
+    const controller=scheduleConflictRecoveryController,recovery=await controller.refresh(),applied=recovery.processed===true?controller.consume(recovery):recovery,view=controller.snapshot();
+    if(controller!==scheduleConflictRecoveryController)return {processed:false,reason:'stale_recovery'};
+    if(applied.processed===true){const target=applied.target;controller.invalidate();scheduleConflictRecoveryController=null;scheduleConflictRecovery=null;restartGuard.clear();commandUi.clear();show(target);return {processed:true,reason:applied.reason};}
     const outcome=view.action==='reauth'?'reauth':'unresolved',generation=commandUi.snapshot().generation;
     commandUi.applyFeedback('passenger',generation,outcome,{title:outcome==='reauth'?'再ログインが必要です':'最新状態を確認できません',message:outcome==='reauth'?'安全のため操作を停止しました。役割選択へ戻り、再ログインしてください。':'予約変更は再送していません。接続を確認してから最新状態をもう一度確認してください。',disableCommands:true,action:view.action});
-    restartGuard.mark('passenger',outcome);renderCommandFeedback();return {processed:false,reason:recovery.reason};
+    restartGuard.mark('passenger',outcome);renderCommandFeedback();return {processed:false,reason:applied.reason};
   }
   restartGuard.clear();commandUi.clear();show(state.page);return {processed:true,reason:action};
 }});
