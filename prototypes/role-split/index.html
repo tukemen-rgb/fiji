@@ -604,7 +604,7 @@
     const detach=()=>{
       if(detached)return {detached:false,reason:'already_detached',state:snapshot()};
       if(attached)elements.action.removeEventListener('click',onClick);
-      attached=false;detached=true;elements.panel.hidden=true;elements.action.hidden=true;elements.action.disabled=true;lastAction='detached';
+      attached=false;detached=true;offerButtons.forEach(button=>{button.disabled=true;});elements.panel.hidden=true;elements.action.hidden=true;elements.action.disabled=true;lastAction='detached';
       return {detached:true,reason:'detached',state:snapshot()};
     };
     const idle=async()=>{if(pending)await pending;return snapshot();};
@@ -623,6 +623,11 @@
       if(!active)return {left:false,reason:'not_entered',state:snapshot()};
       const previous=active;active=null;lastAction='left';previous.dom.detach();previous.flow.detach();
       return {left:true,reason:'left',generation:previous.generation,state:snapshot()};
+    };
+    const completeCancellation=()=>{
+      if(!active)return {completed:false,reason:'page_inactive',state:snapshot()};
+      const previous=active;active=null;lastAction='request_cancelled';previous.dom.detach();previous.flow.detach();
+      return {completed:true,reason:'request_cancelled',generation:previous.generation,state:snapshot()};
     };
     const enter=()=>{
       if(active)leave();
@@ -654,7 +659,7 @@
       }));
     };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(active){await active.flow.idle();await active.dom.idle();}return snapshot();};
-    return Object.freeze({snapshot,enter,apply,refresh,activate,leave,idle});
+    return Object.freeze({snapshot,enter,apply,refresh,activate,completeCancellation,leave,idle});
   }
   function createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery}){
     if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||requestRecovery!==undefined&&typeof requestRecovery!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');

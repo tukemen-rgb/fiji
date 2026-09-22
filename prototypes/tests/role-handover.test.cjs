@@ -1350,6 +1350,30 @@ test('hidden offer access responses lock stale offers once without a resume read
     lifecycle.leave();assert.equal(target.listenerCount('visibilitychange'),0);assert.equal(target.listenerCount('pageshow'),0);
   }
 });
+test('confirmed cancellation closes a pending offer page and rejects its delayed response', async () => {
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),oldOffer=m.getOffers(ride.id)[0];
+  const target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements(),requests=[];let reads=0;
+  const lifecycle=R.createOfferPageLifecycle({
+    createFlow:()=>R.createOfferExpiryRefreshFlow({
+      eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),createAbortController:()=>new AbortController(),
+      readOffers:value=>{reads+=1;return new Promise(resolve=>requests.push({value,resolve}));}
+    }),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements})
+  });
+  lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:oldOffer.id}]});
+  const pending=lifecycle.refresh('expiry');while(requests.length<1)await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(elements.offerButtons.every(button=>button.disabled));assert.equal(requests[0].value.signal.aborted,false);
+  m.cancelRide(ride.id,ride.revision);const completed=lifecycle.completeCancellation();
+  assert.equal(completed.completed,true);assert.equal(completed.reason,'request_cancelled');assert.equal(requests[0].value.signal.aborted,true);assert.equal(lifecycle.completeCancellation().reason,'page_inactive');
+  assert.ok(elements.offerButtons.every(button=>button.disabled));assert.equal(target.listenerCount('visibilitychange'),0);assert.equal(target.listenerCount('pageshow'),0);assert.equal(elements.action.listenerCount('click'),0);assert.equal(timers.pending().length,0);
+  requests[0].resolve({status:200,body:{serverNow:'2026-09-22T00:00:05.000Z',nextExpiryAt:'2026-09-22T00:00:40.000Z',offers:[{id:oldOffer.id}]}});
+  const delayed=await pending;await lifecycle.idle();const state=lifecycle.snapshot();
+  assert.equal(delayed.refreshed,false);assert.equal(delayed.reason,'stale_page');assert.equal(state.entered,false);assert.equal(state.lastAction,'request_cancelled');assert.equal(state.flow,null);assert.equal(state.dom,null);assert.equal(reads,1);
+  assert.equal(lifecycle.apply({serverNow:'2026-09-22T00:00:06.000Z',nextExpiryAt:'2026-09-22T00:00:50.000Z',offers:[{id:oldOffer.id}]}).reason,'page_inactive');
+  documentState.visibilityState='hidden';target.dispatch('visibilitychange');documentState.visibilityState='visible';target.dispatch('visibilitychange');target.dispatch('pageshow');await Promise.resolve();assert.equal(reads,1);
+  assert.equal(ride.status,'cancelled');assert.equal(ride.cancelReason,'passenger_requested');assert.equal(m.getOffers(ride.id).length,0);assert.throws(()=>m.selectOffer(oldOffer.id));assert.equal(R.cancellationReasonView(ride.cancelReason).kind,'passenger');
+});
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));
