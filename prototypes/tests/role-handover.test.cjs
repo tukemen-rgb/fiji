@@ -3719,6 +3719,27 @@ test('schedule change and offer selection race commits exactly one revision winn
   assert.match(source,/state\.currentRequest=r\.id;state\.currentRequestRevision=r\.revision/);
 });
 
+test('a rejected schedule edit restores the confirmed request and offers one safe latest-state route', () => {
+  const {m,R}=setup();passenger(m);
+  const confirmedAt='2099-07-14T21:30:00.000Z',attemptedAt='2099-07-14T22:30:00.000Z';
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:confirmedAt});
+  const offer=m.getOffers(ride.id)[0],staleRevision=ride.revision;
+  m.selectOffer(offer.id,staleRevision);
+  assert.throws(()=>m.invalidateRideSearch(ride.id,{pickupAt:attemptedAt},staleRevision),/別の画面で更新/);
+  const latest=m.myRequests().find(request=>request.id===ride.id),view=R.scheduleConflictRecoveryView(latest);
+  assert.deepEqual({...view},{
+    outcome:'conflict',pickupAt:confirmedAt,inputValue:'2099-07-15T09:30',label:'2099/7/15(水) 09:30（フィジー時間）',revision:staleRevision+1,
+    page:'passenger-history',title:'予約内容が更新されました',message:'入力した日時は保存していません。確定済み依頼の予約日時を履歴で確認してください。',disableCommands:true,action:'refresh'
+  });
+  assert.notEqual(view.pickupAt,attemptedAt);assert.ok(Object.isFrozen(view));
+  const collecting=R.scheduleConflictRecoveryView({...latest,status:'collecting'});
+  assert.equal(collecting.page,'offers');assert.match(collecting.message,/入力した日時は保存していません/);
+  assert.match(source,/function recoverSearchRevisionConflict\(error\)/);
+  assert.match(source,/state\.pickupAt=view\.pickupAt;state\.currentRequestRevision=view\.revision;\$\('schedule-time'\)\.value=view\.inputValue;updateScheduleControl\(\)/);
+  assert.match(source,/if\(\$\('schedule-dialog'\)\.open\)\$\('schedule-dialog'\)\.close\(\)/);
+  assert.match(source,/else if\(action==='refresh'&&scheduleConflictRecovery\)\{const target=scheduleConflictRecovery\.page;scheduleConflictRecovery=null;show\(target\);\}/);
+});
+
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
   const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
   m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);

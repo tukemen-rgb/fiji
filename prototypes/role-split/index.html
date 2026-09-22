@@ -217,7 +217,7 @@
     const clear=()=>{current=commandFeedback(role,'idle');return snapshot();};
     const applyFeedback=(nextRole,expectedGeneration,outcome,feedback)=>{
       const normalized=nextRole==='driver'?'driver':nextRole==='passenger'?'passenger':null,keys=feedback&&typeof feedback==='object'&&!Array.isArray(feedback)?Object.keys(feedback).sort():[];
-      const validOutcome=['idle','pending','confirmed','unresolved','reauth'].includes(outcome),validFeedback=keys.join(',')==='action,disableCommands,message,title'&&typeof feedback.title==='string'&&typeof feedback.message==='string'&&typeof feedback.disableCommands==='boolean'&&[null,'reconnect','refresh','reauth'].includes(feedback.action);
+      const validOutcome=['idle','pending','confirmed','unresolved','reauth','conflict','rejected'].includes(outcome),validFeedback=keys.join(',')==='action,disableCommands,message,title'&&typeof feedback.title==='string'&&typeof feedback.message==='string'&&typeof feedback.disableCommands==='boolean'&&[null,'reconnect','refresh','reauth'].includes(feedback.action);
       if(!normalized||normalized!==role||expectedGeneration!==generation||!validOutcome||!validFeedback)return {accepted:false,state:snapshot()};
       current=Object.freeze({role,outcome,title:feedback.title.slice(0,160),message:feedback.message.slice(0,320),disableCommands:feedback.disableCommands,action:feedback.action});
       return {accepted:true,state:snapshot()};
@@ -1923,6 +1923,17 @@
     const label=new Intl.DateTimeFormat('ja-JP',{timeZone:SERVICE_TIME_ZONE,year:'numeric',month:'numeric',day:'numeric',weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date(time))+'（フィジー時間）';
     return Object.freeze({mode:'scheduled',pickupAt,timeZone:SERVICE_TIME_ZONE,inputValue:serviceDateTimeLocalValue(pickupAt),label});
   }
+  function scheduleConflictRecoveryView(request){
+    const status=['collecting','assigned','arriving','on_trip','completed','cancelled'].includes(request?.status)?request.status:null;
+    if(!status||!Number.isInteger(request?.revision)||request.revision<1)throw Error('最新の依頼状態を確認できません。');
+    const pickup=pickupTimeView(request.pickupAt),collecting=status==='collecting';
+    return Object.freeze({
+      outcome:'conflict',pickupAt:pickup.pickupAt,inputValue:pickup.inputValue,label:pickup.label,revision:request.revision,
+      page:collecting?'offers':'passenger-history',title:'予約内容が更新されました',
+      message:collecting?'入力した日時は保存していません。最新の予約日時と提示を確認してください。':'入力した日時は保存していません。確定済み依頼の予約日時を履歴で確認してください。',
+      disableCommands:true,action:'refresh'
+    });
+  }
   function create(){
     let seq=10;
     const state={activeRole:null,profile:null,profiles:{passenger:null,driver:null},records:V.samples(),requests:[],offers:[],online:{},registeredAt:null};
@@ -2094,7 +2105,7 @@
     seedRequests();
     return {state,chooseRole,leave,registerPassenger,registerDriver,useReviewedFixture,gate,setOnline,requestRide,cancelRide,invalidateRideSearch,myRequests,getOffers,offerSummary,driverRequests,submitOffer,selectOffer,driverTrips,invalidateVehicleConfirmation,canStartTrip,confirmVehicle,advanceTrip,ownRecord};
   }
-    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,SERVICE_TIME_ZONE,serviceDateTimeLocalValue,parseServiceDateTimeLocal,pickupTimeView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createOfferAccessDomBridge,createOfferPageLifecycle,createCancellationRecoveryDomBridge,createCancellationSessionEventBridge,createCancellationRecoveryPageController,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
+    const api={pages,route,fareInput,googleIdentityConnectionView,googleIdentityRegistrationSnapshot,restoreGoogleIdentityRegistrationSnapshot,googleMapsConnectionView,createGoogleMapsReadinessController,createPickupInputController,pickupRequestView,pickupAirportScope,pickupEditorView,cancellationReasonView,passengerRegistrationInput,googlePlaceDestination,createGooglePlaceSelectionController,SERVICE_TIME_ZONE,serviceDateTimeLocalValue,parseServiceDateTimeLocal,pickupTimeView,scheduleConflictRecoveryView,create,commandFeedback,createCommandUiController,createCommandRestartGuard,createStartupRecoveryController,createStartupRecoveryUiAdapter,createStartupRecoveryFlow,createOfferExpiryRefreshFlow,createOfferAccessDomBridge,createOfferPageLifecycle,createCancellationRecoveryDomBridge,createCancellationSessionEventBridge,createCancellationRecoveryPageController,createStartupRecoveryEventBridge,createRoleRecoveryLifecycle,createRoleRoutingBoundary,createRoleNotificationRecovery,createNotificationFeedbackFlow,createNotificationFeedbackEventBridge,createNotificationHintEventBridge,createAsyncNotificationSubscriptionBridge,createRecoverableNotificationSubscriptionBridge,createNotificationSubscriptionFeedbackBridge,createCommandFeedbackDomBridge,createNotificationSubscriptionDomBridge,isAllowedRoleServiceProvider,createRoleServiceLifecycle,createRolePageRuntime,createRolePageRouter};
   if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.TaxiRoles=api;
 })(typeof globalThis!=='undefined'?globalThis:this);
 </script>
@@ -2115,6 +2126,7 @@ const commandUi=R.createCommandUiController();
 let restartStorage=null;try{restartStorage=window.localStorage;}catch{}
 const restartGuard=R.createCommandRestartGuard(restartStorage);
 let startupRecovery=restartGuard.restore(),startupRecoveryApplied=false;
+let scheduleConflictRecovery=null;
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let toastTimer;
 function toast(text) { $('toast').textContent = text; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(()=> $('toast').hidden = true, 5000); }
@@ -2130,7 +2142,11 @@ function runCommandAction(role,action){
   catch(error){const outcome=commandOutcomeForError(error);if(['unresolved','reauth','conflict'].includes(outcome))restartGuard.mark(role,outcome);else restartGuard.clear();commandUi.finish(outcome);renderCommandFeedback();throw error;}
 }
 const commandFeedbackDom=R.createCommandFeedbackDomBridge({commandUi,elements:{box:$('command-feedback'),title:$('command-feedback-title'),message:$('command-feedback-message'),action:$('command-feedback-action'),commandButtons:document.querySelectorAll('[data-command-action]')},activate:async action=>{
-  restartGuard.clear();startupRecovery=null;commandUi.clear();if(action==='reauth')show('role');else show(state.page);return {processed:true,reason:action};
+  restartGuard.clear();startupRecovery=null;commandUi.clear();
+  if(action==='reauth')show('role');
+  else if(action==='refresh'&&scheduleConflictRecovery){const target=scheduleConflictRecovery.page;scheduleConflictRecovery=null;show(target);}
+  else show(state.page);
+  return {processed:true,reason:action};
 }});
 const injectedRoleServices=window.FijiPrototypeServices||null;
 const rolePageRuntime=R.createRolePageRuntime({
@@ -2210,6 +2226,17 @@ function pickupTimeLabel(value){
 function updateScheduleControl(){
   $('schedule-open').textContent=state.pickupAt?pickupTimeLabel(state.pickupAt):'今すぐ';
 }
+function recoverSearchRevisionConflict(error){
+  if(commandOutcomeForError(error)!=='conflict')return false;
+  const latest=model.myRequests().find(request=>request.id===state.currentRequest);
+  if(!latest)return false;
+  let view;try{view=R.scheduleConflictRecoveryView(latest);}catch{return false;}
+  state.pickupAt=view.pickupAt;state.currentRequestRevision=view.revision;$('schedule-time').value=view.inputValue;updateScheduleControl();
+  if($('schedule-dialog').open)$('schedule-dialog').close();
+  scheduleConflictRecovery=view;commandUi.setRole('passenger');const generation=commandUi.snapshot().generation;
+  commandUi.applyFeedback('passenger',generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});
+  restartGuard.mark('passenger','conflict');renderCommandFeedback();toast(view.message);return true;
+}
 function invalidateCurrentSearch(changes){
   try{
     const result=model.invalidateRideSearch(state.currentRequest,changes,state.currentRequestRevision);
@@ -2217,7 +2244,7 @@ function invalidateCurrentSearch(changes){
     state.currentRequest=null;state.currentRequestRevision=null;state.expectedId=null;state.selected=null;$('live-summary').hidden=true;$('offers').replaceChildren();clearLines();
     toast('検索条件を変更したため、前の依頼と提示を取り消しました。もう一度料金を比較してください。');
     return true;
-  }catch(error){toast(error.message);return false;}
+  }catch(error){if(!recoverSearchRevisionConflict(error))toast(error.message);return false;}
 }
 $('save-schedule').onclick = () => {
   let pickupAt;
