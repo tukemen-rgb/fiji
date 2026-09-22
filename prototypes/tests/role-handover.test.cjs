@@ -1374,6 +1374,37 @@ test('confirmed cancellation closes a pending offer page and rejects its delayed
   documentState.visibilityState='hidden';target.dispatch('visibilitychange');documentState.visibilityState='visible';target.dispatch('visibilitychange');target.dispatch('pageshow');await Promise.resolve();assert.equal(reads,1);
   assert.equal(ride.status,'cancelled');assert.equal(ride.cancelReason,'passenger_requested');assert.equal(m.getOffers(ride.id).length,0);assert.throws(()=>m.selectOffer(oldOffer.id));assert.equal(R.cancellationReasonView(ride.cancelReason).kind,'passenger');
 });
+test('unknown cancellation outcome reads current state once without replaying the command', async () => {
+  const {R,m}=setup();passenger(m);
+  const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'}),oldOffer=m.getOffers(ride.id)[0];
+  const target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements(),offerRequests=[];let releaseState,stateReads=0,cancellationCommands=0,historyNavigations=0;
+  const sendCancellation=()=>{cancellationCommands+=1;return m.cancelRide(ride.id,ride.revision);};
+  const lifecycle=R.createOfferPageLifecycle({
+    rideId:ride.id,
+    readCancellationState:()=>{stateReads+=1;return new Promise(resolve=>{releaseState=resolve;});},
+    onCancellationRecovered:state=>{historyNavigations+=1;assert.equal(state.id,ride.id);return {navigated:true,page:'passenger-history'};},
+    createFlow:()=>R.createOfferExpiryRefreshFlow({
+      eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),createAbortController:()=>new AbortController(),
+      readOffers:value=>new Promise(resolve=>offerRequests.push({value,resolve}))
+    }),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements})
+  });
+  lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:oldOffer.id}]});
+  const pendingOffers=lifecycle.refresh('expiry');while(offerRequests.length<1)await new Promise(resolve=>setImmediate(resolve));
+  sendCancellation();
+  const first=lifecycle.reconcileCancellation(),duplicate=lifecycle.reconcileCancellation();assert.equal(first,duplicate);
+  while(!releaseState)await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(stateReads,1);assert.equal(cancellationCommands,1);assert.equal(offerRequests[0].value.signal.aborted,true);assert.ok(elements.offerButtons.every(button=>button.disabled));
+  assert.equal(target.listenerCount('visibilitychange'),0);assert.equal(target.listenerCount('pageshow'),0);assert.equal(elements.action.listenerCount('click'),0);assert.equal(timers.pending().length,0);
+  releaseState({status:200,body:{id:ride.id,status:'cancelled',revision:ride.revision,viewerRole:'passenger',nextAction:'show_cancelled_history',updatedAt:ride.cancelledAt}});
+  const recovered=await first;assert.equal(await duplicate,recovered);assert.equal(recovered.reconciled,true);assert.equal(recovered.reason,'request_cancelled');assert.equal(historyNavigations,1);assert.equal(cancellationCommands,1);
+  offerRequests[0].resolve({status:200,body:{serverNow:'2026-09-22T00:00:05.000Z',nextExpiryAt:'2026-09-22T00:00:40.000Z',offers:[{id:oldOffer.id}]}});
+  const delayed=await pendingOffers;await lifecycle.idle();const state=lifecycle.snapshot();
+  assert.equal(delayed.reason,'stale_page');assert.equal(state.entered,false);assert.equal(state.terminalReason,'request_cancelled');assert.equal(state.lastAction,'request_cancelled');assert.equal(stateReads,1);assert.equal(historyNavigations,1);
+  assert.equal(lifecycle.enter().reason,'request_cancelled');assert.equal(lifecycle.apply({offers:[{id:oldOffer.id}]}).reason,'page_inactive');assert.equal((await lifecycle.reconcileCancellation()).reason,'request_cancelled');assert.equal(stateReads,1);
+  documentState.visibilityState='hidden';target.dispatch('visibilitychange');documentState.visibilityState='visible';target.dispatch('visibilitychange');target.dispatch('pageshow');await Promise.resolve();assert.equal(stateReads,1);
+  assert.equal(ride.status,'cancelled');assert.equal(ride.cancelReason,'passenger_requested');assert.equal(m.getOffers(ride.id).length,0);assert.throws(()=>m.selectOffer(oldOffer.id));
+});
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));

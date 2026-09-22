@@ -610,11 +610,11 @@
     const idle=async()=>{if(pending)await pending;return snapshot();};
     return Object.freeze({snapshot,attach,render,activate,detach,idle});
   }
-  function createOfferPageLifecycle({createFlow,createDomBridge}){
-    if(typeof createFlow!=='function'||typeof createDomBridge!=='function')throw Error('提示ページライフサイクルの設定が不正です。');
-    let active=null,generation=0,lastAction='idle';
+  function createOfferPageLifecycle({createFlow,createDomBridge,rideId=null,readCancellationState=null,onCancellationRecovered=null}){
+    if(typeof createFlow!=='function'||typeof createDomBridge!=='function'||readCancellationState!==null&&typeof readCancellationState!=='function'||onCancellationRecovered!==null&&typeof onCancellationRecovered!=='function'||readCancellationState&&!(typeof rideId==='string'&&rideId.length>0))throw Error('提示ページライフサイクルの設定が不正です。');
+    let active=null,generation=0,lastAction='idle',terminalReason=null,cancellationRecovery=null,recoveryAttempted=false;
     const operations=new Set();
-    const snapshot=()=>Object.freeze({entered:Boolean(active),generation,activeGeneration:active?.generation||null,busy:operations.size>0,lastAction,flow:active?.flow.snapshot()||null,dom:active?.dom.snapshot()||null});
+    const snapshot=()=>Object.freeze({entered:Boolean(active),generation,activeGeneration:active?.generation||null,busy:operations.size>0,lastAction,terminalReason,flow:active?.flow.snapshot()||null,dom:active?.dom.snapshot()||null});
     const track=work=>{
       let task;
       task=Promise.resolve(work).finally(()=>operations.delete(task));operations.add(task);return task;
@@ -626,10 +626,11 @@
     };
     const completeCancellation=()=>{
       if(!active)return {completed:false,reason:'page_inactive',state:snapshot()};
-      const previous=active;active=null;lastAction='request_cancelled';previous.dom.detach();previous.flow.detach();
+      const previous=active;active=null;terminalReason='request_cancelled';lastAction='request_cancelled';previous.dom.detach();previous.flow.detach();
       return {completed:true,reason:'request_cancelled',generation:previous.generation,state:snapshot()};
     };
     const enter=()=>{
+      if(terminalReason)return {entered:false,reason:terminalReason,state:snapshot()};
       if(active)leave();
       const currentGeneration=++generation,flow=createFlow(Object.freeze({generation:currentGeneration})),dom=createDomBridge(Object.freeze({generation:currentGeneration,flow}));
       if(!flow||typeof flow.setStateListener!=='function'||typeof flow.attach!=='function'||typeof flow.apply!=='function'||typeof flow.refresh!=='function'||typeof flow.detach!=='function'||typeof flow.idle!=='function'||!dom||typeof dom.attach!=='function'||typeof dom.render!=='function'||typeof dom.activate!=='function'||typeof dom.detach!=='function'||typeof dom.idle!=='function')throw Error('提示ページライフサイクルの構成が不正です。');
@@ -658,8 +659,31 @@
         entry.dom.render();lastAction=result.reason;return {...result,pageState:snapshot()};
       }));
     };
+    const validRecoveredCancellation=response=>{
+      const body=response?.body;
+      return response?.status===200&&body&&typeof body==='object'&&!Array.isArray(body)&&Object.keys(body).sort().join(',')==='id,nextAction,revision,status,updatedAt,viewerRole'&&body.id===rideId&&body.status==='cancelled'&&Number.isInteger(body.revision)&&body.revision>0&&body.viewerRole==='passenger'&&body.nextAction==='show_cancelled_history'&&typeof body.updatedAt==='string'&&Number.isFinite(Date.parse(body.updatedAt));
+    };
+    const reconcileCancellation=()=>{
+      if(cancellationRecovery)return cancellationRecovery;
+      if(recoveryAttempted)return Promise.resolve({reconciled:terminalReason==='request_cancelled',reason:terminalReason==='request_cancelled'?'request_cancelled':'recovery_already_attempted',state:snapshot()});
+      if(!active)return Promise.resolve({reconciled:false,reason:'page_inactive',state:snapshot()});
+      if(!readCancellationState)return Promise.resolve({reconciled:false,reason:'recovery_not_configured',state:snapshot()});
+      recoveryAttempted=true;terminalReason='cancellation_outcome_unknown';lastAction='cancellation_recovery_pending';
+      const previous=active;active=null;previous.dom.detach();previous.flow.detach();
+      const work=(async()=>{
+        let response;
+        try{response=await readCancellationState();}
+        catch(error){lastAction='cancellation_recovery_failed';return {reconciled:false,reason:'recovery_failed',state:snapshot()};}
+        if(!validRecoveredCancellation(response)){lastAction='cancellation_unresolved';return {reconciled:false,reason:'cancellation_unresolved',state:snapshot()};}
+        terminalReason='request_cancelled';lastAction='request_cancelled';
+        let navigation=null;
+        if(onCancellationRecovered){try{navigation=await onCancellationRecovered(Object.freeze({...response.body}));}catch(error){navigation={navigated:false,reason:'navigation_failed'};}}
+        return {reconciled:true,reason:'request_cancelled',ride:Object.freeze({...response.body}),navigation,state:snapshot()};
+      })();
+      cancellationRecovery=track(work);cancellationRecovery.finally(()=>{cancellationRecovery=null;});return cancellationRecovery;
+    };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(active){await active.flow.idle();await active.dom.idle();}return snapshot();};
-    return Object.freeze({snapshot,enter,apply,refresh,activate,completeCancellation,leave,idle});
+    return Object.freeze({snapshot,enter,apply,refresh,activate,completeCancellation,reconcileCancellation,leave,idle});
   }
   function createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery}){
     if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||requestRecovery!==undefined&&typeof requestRecovery!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');
