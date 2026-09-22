@@ -1490,6 +1490,31 @@ test('cancellation recovery panel stops after the single retry stays unknown', a
   assert.equal((await bridge.activate()).reason,'action_not_available');assert.equal(retries,1);assert.equal(lifecycle.snapshot().lastAction,'cancellation_retry_stopped');
   bridge.detach();assert.equal(elements.panel.hidden,true);assert.equal(elements.action.listenerCount('click'),0);
 });
+test('logout and passenger account switch discard a delayed cancellation retry result', async () => {
+  for(const sessionChange of ['logout','account_switch']){
+    const {R,m}=setup();passenger(m);
+    const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
+    const target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),offerElements=offerAccessDomElements(),elements=cancellationRecoveryDomElements();let retries=0,releaseRetry,historyNavigations=0;
+    const lifecycle=R.createOfferPageLifecycle({
+      rideId:ride.id,baselineRevision:ride.revision,baselineStatus:ride.status,cancellationIdempotencyKey:'cancel-session-bound-key',
+      readCancellationState:async()=>{throw Error('simulated network failure');},
+      retryCancellationCommand:()=>{retries+=1;return new Promise(resolve=>{releaseRetry=resolve;});},
+      onCancellationRecovered:()=>{historyNavigations+=1;return {navigated:true,page:'passenger-history'};},
+      createFlow:()=>R.createOfferExpiryRefreshFlow({eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),readOffers:async()=>({status:500})}),
+      createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements:offerElements})
+    });
+    const bridge=R.createCancellationRecoveryDomBridge({lifecycle,elements});bridge.attach();lifecycle.enter();lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:30.000Z',offers:[{id:'offer-stale'}]});
+    await bridge.reconcile();const pending=bridge.activate();while(!releaseRetry)await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(retries,1);assert.equal(elements.panel.hidden,false);assert.equal(elements.action.listenerCount('click'),1);
+    const invalidated=bridge.invalidateSession(sessionChange);assert.equal(invalidated.invalidated,true);assert.equal(invalidated.reason,sessionChange);
+    assert.equal(elements.panel.hidden,true);assert.equal(elements.action.hidden,true);assert.equal(elements.action.listenerCount('click'),0);assert.ok(elements.offerButtons.every(button=>button.disabled));
+    releaseRetry({status:200,body:{id:ride.id,status:'cancelled',revision:ride.revision+1,viewerRole:'passenger',nextAction:'show_cancelled_history',updatedAt:'2026-09-22T00:00:05.000Z'}});
+    const delayed=await pending;await lifecycle.idle();const state=lifecycle.snapshot();
+    assert.equal(delayed.processed,false);assert.equal(delayed.reason,'stale_action');assert.equal(historyNavigations,0);assert.equal(state.terminalReason,'session_invalidated');assert.equal(state.lastAction,sessionChange);assert.equal(state.cancellationRetryAllowed,false);
+    assert.equal(lifecycle.enter().reason,'session_invalidated');assert.equal((await bridge.activate()).reason,'bridge_inactive');assert.equal(retries,1);
+    assert.doesNotMatch(JSON.stringify(bridge.snapshot()),/cancel-session-bound-key|ride-/);assert.equal(bridge.snapshot().detached,true);
+  }
+});
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));

@@ -613,7 +613,7 @@
   function createOfferPageLifecycle({createFlow,createDomBridge,rideId=null,readCancellationState=null,onCancellationRecovered=null,retryCancellationCommand=null,cancellationIdempotencyKey=null,baselineRevision=null,baselineStatus=null}){
     const retryConfigured=retryCancellationCommand!==null||cancellationIdempotencyKey!==null||baselineRevision!==null||baselineStatus!==null;
     if(typeof createFlow!=='function'||typeof createDomBridge!=='function'||readCancellationState!==null&&typeof readCancellationState!=='function'||onCancellationRecovered!==null&&typeof onCancellationRecovered!=='function'||readCancellationState&&!(typeof rideId==='string'&&rideId.length>0)||retryConfigured&&(typeof retryCancellationCommand!=='function'||typeof cancellationIdempotencyKey!=='string'||!cancellationIdempotencyKey||!Number.isInteger(baselineRevision)||baselineRevision<1||!['collecting','assigned','arriving'].includes(baselineStatus)||typeof readCancellationState!=='function'))throw Error('提示ページライフサイクルの設定が不正です。');
-    let active=null,generation=0,lastAction='idle',terminalReason=null,cancellationRecovery=null,cancellationRetry=null,recoveryAttempted=false,retryAllowed=false,retryUsed=false;
+    let active=null,generation=0,lastAction='idle',terminalReason=null,cancellationRecovery=null,cancellationRetry=null,recoveryAttempted=false,retryAllowed=false,retryUsed=false,sessionRevision=0;
     const operations=new Set();
     const snapshot=()=>Object.freeze({entered:Boolean(active),generation,activeGeneration:active?.generation||null,busy:operations.size>0,lastAction,terminalReason,cancellationRetryAllowed:retryAllowed,cancellationRetryUsed:retryUsed,flow:active?.flow.snapshot()||null,dom:active?.dom.snapshot()||null});
     const track=work=>{
@@ -668,10 +668,12 @@
     const validRecoveredCancellation=response=>validRecoveredRide(response)&&response.body.status==='cancelled'&&response.body.nextAction==='show_cancelled_history';
     const recoveredBaselineUnchanged=response=>validRecoveredRide(response)&&response.body.revision===baselineRevision&&response.body.status===baselineStatus;
     const transientFailure=response=>!response||response.status===0||[408,425,429].includes(response.status)||response.status>=500;
-    const finalizeCancellation=async body=>{
+    const finalizeCancellation=async(body,expectedSessionRevision)=>{
+      if(expectedSessionRevision!==sessionRevision)return {reconciled:false,reason:'stale_session',state:snapshot()};
       retryAllowed=false;terminalReason='request_cancelled';lastAction='request_cancelled';
       let navigation=null;
       if(onCancellationRecovered){try{navigation=await onCancellationRecovered(Object.freeze({...body}));}catch(error){navigation={navigated:false,reason:'navigation_failed'};}}
+      if(expectedSessionRevision!==sessionRevision)return {reconciled:false,reason:'stale_session',state:snapshot()};
       return {reconciled:true,reason:'request_cancelled',ride:Object.freeze({...body}),navigation,state:snapshot()};
     };
     const reconcileCancellation=()=>{
@@ -681,11 +683,13 @@
       if(!readCancellationState)return Promise.resolve({reconciled:false,reason:'recovery_not_configured',state:snapshot()});
       recoveryAttempted=true;terminalReason='cancellation_outcome_unknown';lastAction='cancellation_recovery_pending';
       const previous=active;active=null;previous.dom.detach();previous.flow.detach();
+      const expectedSessionRevision=sessionRevision;
       const work=(async()=>{
         let response;
         try{response=await readCancellationState();}
-        catch(error){if(retryConfigured){retryAllowed=true;lastAction='cancellation_retry_required';return {reconciled:false,reason:'explicit_retry_required',state:snapshot()};}lastAction='cancellation_recovery_failed';return {reconciled:false,reason:'recovery_failed',state:snapshot()};}
-        if(validRecoveredCancellation(response))return finalizeCancellation(response.body);
+        catch(error){if(expectedSessionRevision!==sessionRevision)return {reconciled:false,reason:'stale_session',state:snapshot()};if(retryConfigured){retryAllowed=true;lastAction='cancellation_retry_required';return {reconciled:false,reason:'explicit_retry_required',state:snapshot()};}lastAction='cancellation_recovery_failed';return {reconciled:false,reason:'recovery_failed',state:snapshot()};}
+        if(expectedSessionRevision!==sessionRevision)return {reconciled:false,reason:'stale_session',state:snapshot()};
+        if(validRecoveredCancellation(response))return finalizeCancellation(response.body,expectedSessionRevision);
         if(retryConfigured&&(transientFailure(response)||recoveredBaselineUnchanged(response))){retryAllowed=true;lastAction='cancellation_retry_required';return {reconciled:false,reason:'explicit_retry_required',state:snapshot()};}
         lastAction='cancellation_unresolved';return {reconciled:false,reason:'cancellation_unresolved',state:snapshot()};
       })();
@@ -698,19 +702,27 @@
       if(!retryAllowed||!retryCancellationCommand)return Promise.resolve({retried:false,reason:'retry_not_allowed',state:snapshot()});
       retryAllowed=false;retryUsed=true;lastAction='cancellation_retry_pending';
       const request=Object.freeze({action:'cancel_ride',rideId,expectedRevision:baselineRevision,cancelReason:'passenger_requested',idempotencyKey:cancellationIdempotencyKey});
+      const expectedSessionRevision=sessionRevision;
       const work=(async()=>{
         let response;
-        try{response=await retryCancellationCommand(request);}catch(error){lastAction='cancellation_retry_stopped';return {retried:false,reason:'retry_outcome_unknown',state:snapshot()};}
-        if(validRecoveredCancellation(response)){const completed=await finalizeCancellation(response.body);return {...completed,retried:true};}
+        try{response=await retryCancellationCommand(request);}catch(error){if(expectedSessionRevision!==sessionRevision)return {retried:false,reason:'stale_session',state:snapshot()};lastAction='cancellation_retry_stopped';return {retried:false,reason:'retry_outcome_unknown',state:snapshot()};}
+        if(expectedSessionRevision!==sessionRevision)return {retried:false,reason:'stale_session',state:snapshot()};
+        if(validRecoveredCancellation(response)){const completed=await finalizeCancellation(response.body,expectedSessionRevision);return {...completed,retried:completed.reconciled===true};}
         lastAction='cancellation_retry_stopped';return {retried:false,reason:transientFailure(response)?'retry_outcome_unknown':'retry_rejected',state:snapshot()};
       })();
       cancellationRetry=track(work);cancellationRetry.finally(()=>{cancellationRetry=null;});return cancellationRetry;
     };
+    const invalidateCancellationSession=reason=>{
+      if(!['logout','account_switch'].includes(reason))return {invalidated:false,reason:'invalid_session_change',state:snapshot()};
+      sessionRevision+=1;retryAllowed=false;terminalReason='session_invalidated';lastAction=reason;
+      if(active){const previous=active;active=null;previous.dom.detach();previous.flow.detach();}
+      return {invalidated:true,reason,state:snapshot()};
+    };
     const idle=async()=>{while(operations.size>0)await Promise.all([...operations]);if(active){await active.flow.idle();await active.dom.idle();}return snapshot();};
-    return Object.freeze({snapshot,enter,apply,refresh,activate,completeCancellation,reconcileCancellation,retryCancellation,leave,idle});
+    return Object.freeze({snapshot,enter,apply,refresh,activate,completeCancellation,reconcileCancellation,retryCancellation,invalidateCancellationSession,leave,idle});
   }
   function createCancellationRecoveryDomBridge({lifecycle,elements}){
-    if(!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.reconcileCancellation!=='function'||typeof lifecycle.retryCancellation!=='function'||!elements||!elements.panel||!elements.title||!elements.message||!elements.action||typeof elements.action.addEventListener!=='function'||typeof elements.action.removeEventListener!=='function')throw Error('取消結果案内パネルの設定が不正です。');
+    if(!lifecycle||typeof lifecycle.snapshot!=='function'||typeof lifecycle.reconcileCancellation!=='function'||typeof lifecycle.retryCancellation!=='function'||typeof lifecycle.invalidateCancellationSession!=='function'||!elements||!elements.panel||!elements.title||!elements.message||!elements.action||typeof elements.action.addEventListener!=='function'||typeof elements.action.removeEventListener!=='function')throw Error('取消結果案内パネルの設定が不正です。');
     const offerButtons=[...(elements.offerButtons||[])],driverControls=[...(elements.driverControls||[])];
     let attached=false,detached=false,pending=null,pendingKind=null,lastAction='idle';
     const content=()=>{
@@ -771,8 +783,14 @@
       attached=false;detached=true;offerButtons.forEach(button=>{button.disabled=true;});elements.panel.hidden=true;elements.action.hidden=true;elements.action.disabled=true;lastAction='detached';
       return {detached:true,reason:'detached',state:snapshot()};
     };
+    const invalidateSession=reason=>{
+      if(!attached||detached)return {invalidated:false,reason:'bridge_inactive',state:snapshot()};
+      const result=lifecycle.invalidateCancellationSession(reason);
+      if(!result.invalidated)return {...result,bridgeState:snapshot()};
+      detach();return {...result,bridgeState:snapshot()};
+    };
     const idle=async()=>{if(pending)await pending;return snapshot();};
-    return Object.freeze({snapshot,attach,render,reconcile,activate,detach,idle});
+    return Object.freeze({snapshot,attach,render,reconcile,activate,invalidateSession,detach,idle});
   }
   function createStartupRecoveryEventBridge({flow,eventTarget,documentState,requestRecovery}){
     if(!flow||typeof flow.snapshot!=='function'||typeof flow.setVisible!=='function'||typeof flow.resume!=='function'||typeof flow.dispose!=='function'||requestRecovery!==undefined&&typeof requestRecovery!=='function'||!eventTarget||typeof eventTarget.addEventListener!=='function'||typeof eventTarget.removeEventListener!=='function'||!documentState||typeof documentState.visibilityState!=='string')throw Error('起動時復旧イベントの設定が不正です。');
