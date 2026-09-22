@@ -2016,11 +2016,12 @@
       if(!['collecting','assigned','arriving'].includes(r.status))throw Error('乗車開始後・完了後の依頼は取り消せません。');
       return markCancelled(r,'passenger_requested');
     }
-    function invalidateRideSearch(id,changes={}){
+    function invalidateRideSearch(id,changes={},expectedRevision){
       const p=need('passenger');
       if(!id)return Object.freeze({invalidated:false,reason:'no_request'});
       const r=state.requests.find(r=>r.id===id&&r.passengerId===p.id);
       if(!r)throw Error('この依頼の検索条件を変更できません。');
+      assertRevision(r,expectedRevision);
       const has=key=>Object.prototype.hasOwnProperty.call(changes,key);
       const routeChanged=(has('pickup')&&text(changes.pickup)!==r.pickup)||(has('destination')&&text(changes.destination)!==r.destination)||(has('airport')&&!!changes.airport!==r.airport);
       const scheduleChanged=has('pickupAt')&&normalizePickupAt(changes.pickupAt)!==r.pickupAt;
@@ -2108,7 +2109,7 @@ const placeSelection = R.createGooglePlaceSelectionController();
 const mapsReadiness = R.createGoogleMapsReadinessController();
 let records = model.state.records;
 const names = {taxi_permit:'Taxi Permit（営業許可）',vehicle_licence:'車両登録・PSV車両資格',driver_licence:'運転免許',psv_driver_permit:'PSV運転手許可',fitness:'車両検査・適合証明',insurance:'営業利用を含む保険',operator_assignment:'名義人の同意・運転権限',airport_authorization:'空港側の営業承認'};
-const state = { page:'role', currentRequest:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapConnectionToken:null, mapScript:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
+const state = { page:'role', currentRequest:null, currentRequestRevision:null, airport:false, expectedId:null, regStep:0, documents:{}, selected:null, destination:'', pickup:'Nadi, Fiji', pickupAt:null, map:null, routeLib:null, mapConnectionToken:null, mapScript:null, mapMarks:[], mapLines:[], loadingMap:false, mapReady:false, routeSeq:0 };
 const pickupInput=R.createPickupInputController(state.pickup);
 const commandUi=R.createCommandUiController();
 let restartStorage=null;try{restartStorage=window.localStorage;}catch{}
@@ -2211,9 +2212,9 @@ function updateScheduleControl(){
 }
 function invalidateCurrentSearch(changes){
   try{
-    const result=model.invalidateRideSearch(state.currentRequest,changes);
+    const result=model.invalidateRideSearch(state.currentRequest,changes,state.currentRequestRevision);
     if(!result.invalidated)return true;
-    state.currentRequest=null;state.expectedId=null;state.selected=null;$('live-summary').hidden=true;$('offers').replaceChildren();clearLines();
+    state.currentRequest=null;state.currentRequestRevision=null;state.expectedId=null;state.selected=null;$('live-summary').hidden=true;$('offers').replaceChildren();clearLines();
     toast('検索条件を変更したため、前の依頼と提示を取り消しました。もう一度料金を比較してください。');
     return true;
   }catch(error){toast(error.message);return false;}
@@ -2254,7 +2255,7 @@ $('find-offers').onclick = () => {
     if(!pickupView.ready){if(pickupView.action==='edit_pickup')showPickupFallback(pickupView.message);else toast(pickupView.message);return;}
     if (!state.destination) { $('destination').focus();return toast('先に目的地を入力してください。'); }
     const r=model.requestRide({pickup:pickupView.value,destination:$('destination').value,airport:state.airport,pickupAt:state.pickupAt});
-    state.currentRequest=r.id;state.expectedId=null;state.selected=null;state.pickupAt=r.pickupAt;updateScheduleControl();
+    state.currentRequest=r.id;state.currentRequestRevision=r.revision;state.expectedId=null;state.selected=null;state.pickupAt=r.pickupAt;updateScheduleControl();
     if(state.mapReady)drawRoute();show('offers');
   }catch(e){toast(e.message);}
 };
@@ -2262,6 +2263,7 @@ function renderPassengerOffers(){
   try{
     const request=model.myRequests().find(r=>r.id===state.currentRequest);
     if(!request){$('offers').innerHTML='<div class="empty">先に目的地を入力してください。</div>';return;}
+    state.currentRequestRevision=request.revision;
     $('offer-destination').textContent=request.pickup+' → '+request.destination+' · '+pickupTimeLabel(request.pickupAt);
     if(request.status!=='collecting'){
       $('offers').innerHTML='<div class="banner">この依頼は '+esc(statusLabel(request.status))+' です。</div><button class="secondary" id="open-my-ride">乗車履歴を見る</button>';
@@ -2279,7 +2281,7 @@ function renderPassengerOffers(){
 }
 function openVehicleCheck(req){
   model.invalidateVehicleConfirmation(req.id);
-  state.currentRequest=req.id;state.expectedId=req.driverId;state.airport=req.airport;
+  state.currentRequest=req.id;state.currentRequestRevision=req.revision;state.expectedId=req.driverId;state.airport=req.airport;
   const r=records.find(x=>x.id===req.driverId);
   state.selected={id:r.id,plate:r.plate,selectedAt:req.quoteSnapshot.selectedAt};
   $('plate-input').value='';$('airport-check').checked=req.airport;
@@ -2537,7 +2539,7 @@ $('edit-passenger').onclick=()=>{
 function renderPassengerHistory(){
   const trips=model.myRequests().slice().reverse();
   $('passenger-history').innerHTML=trips.length?trips.map(r=>`<article class="card"><div class="row"><span class="badge">${esc(statusLabel(r.status))}</span><small class="muted">${esc(r.id)}</small></div>${routeMarkup(r)}${r.quoteSnapshot?`<p>記録した提示額 <strong>FJ$${money(r.quoteSnapshot.fareCents)}</strong> <span class="muted">/ 概算・デモ</span></p>`:''}${r.status==='collecting'?`<button class="secondary" data-view-offers="${esc(r.id)}">提示額を見る</button>`:['assigned','arriving'].includes(r.status)?`<button class="secondary" data-view-car="${esc(r.id)}">予約車両を確認</button>`:''}${['collecting','assigned','arriving'].includes(r.status)?`<div class="spacer"></div><button class="secondary" data-cancel-ride="${esc(r.id)}">依頼を取り消す</button>`:''}${r.status==='cancelled'?cancellationMarkup(r):''}</article>`).join(''):'<div class="empty">まだ依頼はありません。配車画面から行き先を入力してください。</div>';
-  $('passenger-history').querySelectorAll('[data-view-offers]').forEach(b=>b.onclick=()=>{state.currentRequest=b.dataset.viewOffers;show('offers');});
+  $('passenger-history').querySelectorAll('[data-view-offers]').forEach(b=>b.onclick=()=>{const request=trips.find(r=>r.id===b.dataset.viewOffers);state.currentRequest=request.id;state.currentRequestRevision=request.revision;show('offers');});
   $('passenger-history').querySelectorAll('[data-view-car]').forEach(b=>b.onclick=()=>openVehicleCheck(trips.find(r=>r.id===b.dataset.viewCar)));
   $('passenger-history').querySelectorAll('[data-cancel-ride]').forEach(b=>b.onclick=()=>openCancellation(b.dataset.cancelRide));
 }
@@ -2561,7 +2563,7 @@ $('confirm-cancel').onclick=()=>{
   try{
     const {id,revision}=cancelRequest,result=runCommandAction('passenger',()=>model.cancelRide(id,revision));if(!result.ok)return;
     if(state.currentRequest===id){
-      state.currentRequest=null;state.expectedId=null;state.selected=null;
+      state.currentRequest=null;state.currentRequestRevision=null;state.expectedId=null;state.selected=null;
       $('lookup-result').innerHTML='';
     }
     $('cancel-dialog').close();show('passenger-history');

@@ -3459,7 +3459,7 @@ test('editing pickup, destination or schedule immediately invalidates the active
     assert.equal(result.invalidated,true);assert.equal(result.reason,reason);assert.equal(ride.status,'cancelled');assert.equal(ride.cancelReason,reason);
     assert.ok(m.state.offers.filter(o=>o.requestId===ride.id).every(o=>o.status==='expired'));assert.throws(()=>m.selectOffer(offer.id));
   }
-  assert.match(source,/state\.currentRequest=null;state\.expectedId=null;state\.selected=null;\$\('live-summary'\)\.hidden=true;\$\('offers'\)\.replaceChildren\(\);clearLines\(\);/);
+  assert.match(source,/state\.currentRequest=null;state\.currentRequestRevision=null;state\.expectedId=null;state\.selected=null;\$\('live-summary'\)\.hidden=true;\$\('offers'\)\.replaceChildren\(\);clearLines\(\);/);
 });
 test('cancelled history distinguishes route edits, schedule edits and explicit cancellation', () => {
   const {R}=setup();
@@ -3689,6 +3689,34 @@ test('one normalized Fiji pickup time survives every ride surface and device tim
   assert.match(source,/data-pickup-at="\$\{esc\(view\.pickupAt\)\}"/);
   assert.match(source,/pickupAt=R\.parseServiceDateTimeLocal\(\$\('schedule-time'\)\.value,Date\.now\(\)\)/);
   assert.doesNotMatch(source,/この端末の表示時刻/);
+});
+test('schedule change and offer selection race commits exactly one revision winner', () => {
+  const firstAt='2099-07-14T21:30:00.000Z',secondAt='2099-07-14T22:30:00.000Z';
+  {
+    const {m}=setup();passenger(m);
+    const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:firstAt});
+    const offer=m.getOffers(ride.id)[0],expectedRevision=ride.revision;
+    const changed=m.invalidateRideSearch(ride.id,{pickupAt:secondAt},expectedRevision);
+    assert.deepEqual({...changed},{invalidated:true,reason:'schedule_changed'});
+    const replacement=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:secondAt});
+    assert.throws(()=>m.selectOffer(offer.id,expectedRevision),/別の画面で更新/);
+    assert.equal(ride.status,'cancelled');assert.equal(ride.revision,expectedRevision+1);assert.equal(ride.pickupAt,firstAt);
+    assert.equal(offer.status,'expired');assert.equal(ride.quoteSnapshot,undefined);
+    assert.equal(replacement.status,'collecting');assert.equal(replacement.pickupAt,secondAt);assert.notEqual(replacement.id,ride.id);
+  }
+  {
+    const {m}=setup();passenger(m);
+    const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:firstAt});
+    const offer=m.getOffers(ride.id)[0],expectedRevision=ride.revision;
+    m.selectOffer(offer.id,expectedRevision);
+    assert.throws(()=>m.invalidateRideSearch(ride.id,{pickupAt:secondAt},expectedRevision),/別の画面で更新/);
+    assert.equal(ride.status,'assigned');assert.equal(ride.revision,expectedRevision+1);assert.equal(ride.pickupAt,firstAt);
+    assert.equal(ride.quoteSnapshot.pickupAt,firstAt);assert.equal(offer.status,'selected');
+    assert.ok(!m.state.requests.some(request=>request.id!==ride.id&&request.pickupAt===secondAt));
+    assert.throws(()=>m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach',pickupAt:secondAt}),/進行中の乗車/);
+  }
+  assert.match(source,/model\.invalidateRideSearch\(state\.currentRequest,changes,state\.currentRequestRevision\)/);
+  assert.match(source,/state\.currentRequest=r\.id;state\.currentRequestRevision=r\.revision/);
 });
 
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
