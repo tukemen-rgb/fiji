@@ -510,7 +510,11 @@
       if(!attached||detached)return;
       const nextVisible=documentState.visibilityState!=='hidden';
       if(!nextVisible){
-        if(visible){visible=false;refreshOnVisible=action===null&&nextExpiryAt!==null;cancelTimer();lastReason='hidden';}
+        if(visible){
+          visible=false;
+          if(operation){refreshOnVisible=false;lastReason='hidden_during_refresh';}
+          else{refreshOnVisible=action===null&&nextExpiryAt!==null;cancelTimer();lastReason='hidden';}
+        }
         return;
       }
       const resumed=!visible;visible=true;

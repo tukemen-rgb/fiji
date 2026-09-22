@@ -1278,6 +1278,28 @@ test('rapid offer page re-entry aborts every intermediate read and keeps only ge
   assert.deepEqual(timers.pending().map(item=>item.delay),[40000]);assert.equal(target.listenerCount('visibilitychange'),1);assert.equal(target.listenerCount('pageshow'),1);assert.equal(elements.action.listenerCount('click'),1);
   lifecycle.leave();assert.equal(timers.pending().length,0);
 });
+test('generation three coalesces hide and resume events into its pending offer read', async () => {
+  const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'},timers=expiryTimers(),elements=offerAccessDomElements();let reads=0,release,request;
+  const lifecycle=R.createOfferPageLifecycle({
+    createFlow:()=>R.createOfferExpiryRefreshFlow({
+      eventTarget:target,documentState,setTimer:(callback,delay)=>timers.set(callback,delay),clearTimer:id=>timers.clear(id),createAbortController:()=>new AbortController(),
+      readOffers:value=>{reads+=1;request=value;return new Promise(resolve=>{release=resolve;});}
+    }),
+    createDomBridge:({flow})=>R.createOfferAccessDomBridge({flow,elements})
+  });
+  lifecycle.enter();lifecycle.enter();assert.equal(lifecycle.enter().generation,3);
+  lifecycle.apply({serverNow:'2026-09-22T00:00:00.000Z',nextExpiryAt:'2026-09-22T00:00:10.000Z',offers:[{id:'offer-current'}]});
+  const pending=lifecycle.refresh('expiry');while(!release)await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(reads,1);assert.equal(request.signal.aborted,false);assert.equal(timers.pending().length,0);
+  documentState.visibilityState='hidden';target.dispatch('visibilitychange');assert.equal(lifecycle.snapshot().flow.lastReason,'hidden_during_refresh');assert.equal(request.signal.aborted,false);
+  documentState.visibilityState='visible';target.dispatch('visibilitychange');target.dispatch('pageshow');await Promise.resolve();await Promise.resolve();
+  assert.equal(reads,1);assert.equal(lifecycle.snapshot().flow.busy,true);assert.equal(request.signal.aborted,false);assert.equal(timers.pending().length,0);
+  release({status:200,body:{serverNow:'2026-09-22T00:00:12.000Z',nextExpiryAt:'2026-09-22T00:00:40.000Z',offers:[{id:'offer-latest'}]}});
+  const result=await pending;await lifecycle.idle();const state=lifecycle.snapshot();
+  assert.equal(result.refreshed,true);assert.equal(result.reason,'refreshed');assert.equal(reads,1);assert.equal(state.activeGeneration,3);assert.equal(state.flow.offersSelectable,true);assert.equal(state.flow.nextExpiryAt,'2026-09-22T00:00:40.000Z');assert.equal(state.flow.refreshes,1);
+  assert.deepEqual(timers.pending().map(item=>item.delay),[28000]);assert.equal(target.listenerCount('visibilitychange'),1);assert.equal(target.listenerCount('pageshow'),1);assert.equal(elements.action.listenerCount('click'),1);
+  lifecycle.leave();assert.equal(timers.pending().length,0);
+});
 test('startup recovery event bridge attaches each lifecycle listener once', async () => {
   const {R}=setup(),target=recoveryEventTarget(),documentState={visibilityState:'visible'};
   const {flow}=recoveryFlow(R,'passenger',async()=>({status:204}));
