@@ -3850,6 +3850,31 @@ test('fresh passenger read failures cannot revive the pre-reauthentication sched
   }
 });
 
+test('explicit latest-state recovery after fresh offline entry never reuses the old schedule conflict', async () => {
+  const {R}=setup(),oldSession=Object.freeze({accountRef:'passenger-old-explicit',viewerRole:'passenger'});
+  const oldTarget=recoveryEventTarget(),conflict=R.scheduleConflictRecoveryView({status:'assigned',revision:8,pickupAt:'2099-07-14T21:30:00.000Z'});
+  const oldController=R.createScheduleConflictRecoveryController({conflict,eventTarget:oldTarget,sessionForPassenger:()=>oldSession,readCurrentRide:async()=>({status:200,body:{id:'ride-old',status:'assigned',revision:8,viewerRole:'passenger',nextAction:'track_pickup',updatedAt:'2099-07-14T21:31:00.000Z'}}),createAbortController:()=>null});
+  const oldConfirmation=await oldController.refresh();assert.equal(oldConfirmation.processed,true);
+  oldController.invalidate();assert.equal(oldController.consume(oldConfirmation).reason,'stale_recovery');assert.equal(oldTarget.listenerCount('fiji:auth-session-changed'),0);
+
+  let reads=0,releaseFresh;
+  const fixture=roleLifecycleFixture(R,{readCurrentRide:()=>{
+    reads+=1;if(reads===1)throw Error('offline');
+    return new Promise(resolve=>{releaseFresh=resolve;});
+  }}),boundary=R.createRoleRoutingBoundary({lifecycle:fixture.lifecycle});
+  assert.equal((await boundary.navigate('home','passenger')).reason,'role_entered');
+  assert.equal(reads,1);assert.equal(boundary.snapshot().page,'home');assert.deepEqual(fixture.bundles[0].pages,[]);
+
+  const explicit=boundary.recover('refresh');await Promise.resolve();await Promise.resolve();assert.equal(reads,2);
+  const duplicate=await boundary.recover('refresh');assert.equal(duplicate.recovered,false);assert.equal(duplicate.reason,'recovery_in_progress');assert.equal(reads,2);
+  releaseFresh({status:200,body:currentRideView('passenger',{id:'ride-fresh',status:'assigned',revision:9,nextAction:'track_pickup',updatedAt:'2099-07-15T00:00:00.000Z'})});
+  const recovered=await explicit;assert.equal(recovered.recovered,true);assert.equal(recovered.reason,'recovered');assert.equal(reads,2);
+  assert.deepEqual(fixture.bundles[0].pages,['passenger-history']);assert.equal(boundary.snapshot().page,'home');
+  const publicView=JSON.stringify([boundary.snapshot(),fixture.lifecycle.snapshot(),fixture.bundles[0].pages]);
+  assert.equal(publicView.includes('passenger-old-explicit'),false);assert.equal(publicView.includes('2099-07-14'),false);assert.equal(publicView.includes(conflict.label),false);
+  await Promise.resolve();assert.equal(reads,2,'復旧後に旧競合や連打から追加読取しない');assert.equal(oldController.consume(oldConfirmation).reason,'stale_recovery');
+});
+
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
   const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
   m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);
