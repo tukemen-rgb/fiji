@@ -2191,7 +2191,10 @@ function runCommandAction(role,action){
 }
 const commandFeedbackDom=R.createCommandFeedbackDomBridge({commandUi,elements:{box:$('command-feedback'),title:$('command-feedback-title'),message:$('command-feedback-message'),action:$('command-feedback-action'),commandButtons:document.querySelectorAll('[data-command-action]')},activate:async action=>{
   startupRecovery=null;
-  if(action==='reauth'){restartGuard.clear();commandUi.clear();show('role');return {processed:true,reason:action};}
+  if(action==='reauth'){
+    scheduleConflictRecoveryController?.invalidate();scheduleConflictRecoveryController=null;scheduleConflictRecovery=null;
+    restartGuard.clear();commandUi.clear();show('role');return {processed:true,reason:action};
+  }
   if(action==='refresh'&&scheduleConflictRecovery){
     if(!scheduleConflictRecoveryController){
       const generation=commandUi.snapshot().generation;
