@@ -3912,6 +3912,38 @@ test('auth change during explicit fresh recovery discards its delayed result and
   }
 });
 
+test('stable passenger session binding keeps explicit recovery alive through token refresh', async () => {
+  const {R}=setup(),oldSession=Object.freeze({accountRef:'passenger-old-token-refresh',viewerRole:'passenger'});
+  const oldTarget=recoveryEventTarget(),conflict=R.scheduleConflictRecoveryView({status:'assigned',revision:8,pickupAt:'2099-07-14T21:30:00.000Z'});
+  const oldController=R.createScheduleConflictRecoveryController({conflict,eventTarget:oldTarget,sessionForPassenger:()=>oldSession,readCurrentRide:async()=>({status:200,body:{id:'ride-old',status:'assigned',revision:8,viewerRole:'passenger',nextAction:'track_pickup',updatedAt:'2099-07-14T21:31:00.000Z'}}),createAbortController:()=>null});
+  const oldConfirmation=await oldController.refresh();oldController.invalidate();assert.equal(oldController.consume(oldConfirmation).reason,'stale_recovery');
+
+  const stableSession=Object.freeze({accountRef:'passenger-stable-token-refresh',viewerRole:'passenger'}),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),reads=[],signals=[],renders=[];
+  let page='role',releaseFresh,router,lifecycle;
+  const services=allowedRoleServices({sessionForRole:()=>stableSession,readCurrentRide:({sessionBinding,request})=>{
+    reads.push(sessionBinding);signals.push(request.signal);
+    if(reads.length===1)throw Error('offline');
+    return new Promise(resolve=>{releaseFresh=resolve;});
+  }});
+  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>(lifecycle=R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()}))});
+  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:target=>target==='role'?{page:'role',role:null}:{page:target,role:'passenger'},render:destination=>{page=destination.page;renders.push(page);}});router.attach();
+  assert.equal((await router.navigate('home')).reason,'entered');await router.idle();assert.deepEqual(reads,[stableSession]);
+  const generation=lifecycle.snapshot().generation,explicit=lifecycle.requestRecovery({role:'passenger',generation,reason:'connectivity'});
+  while(!releaseFresh)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(reads,[stableSession,stableSession]);
+
+  eventTarget.dispatch('fiji:auth-session-changed',{detail:{viewerRole:'driver',sessionBinding:{accountRef:'untrusted-event-session'},accessToken:'rotated-token'}});
+  while(runtime.snapshot().lastAction!=='within_role')await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(lifecycle.snapshot().generation,generation);assert.equal(signals[1].aborted,false);assert.deepEqual(reads,[stableSession,stableSession]);
+
+  releaseFresh({status:200,body:currentRideView('passenger',{id:'ride-fresh-token-refresh',status:'assigned',revision:9,nextAction:'track_pickup',updatedAt:'2099-07-15T00:00:00.000Z'})});
+  const recovered=await explicit;assert.equal(recovered.recovered,true);assert.equal(recovered.reason,'recovered');await router.idle();
+  assert.equal(page,'passenger-history');assert.equal(renders.filter(rendered=>rendered==='passenger-history').length,1);assert.deepEqual(reads,[stableSession,stableSession]);assert.equal(signals[1].aborted,false);
+  assert.equal(oldController.consume(oldConfirmation).reason,'stale_recovery');
+  const publicView=JSON.stringify([runtime.snapshot(),router.snapshot(),lifecycle.snapshot()]);
+  for(const value of [oldSession.accountRef,stableSession.accountRef,'untrusted-event-session','rotated-token','2099-07-14',conflict.label])assert.equal(publicView.includes(value),false);
+  router.detach();
+});
+
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
   const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
   m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);
