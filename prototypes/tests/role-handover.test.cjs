@@ -3875,6 +3875,43 @@ test('explicit latest-state recovery after fresh offline entry never reuses the 
   await Promise.resolve();assert.equal(reads,2,'復旧後に旧競合や連打から追加読取しない');assert.equal(oldController.consume(oldConfirmation).reason,'stale_recovery');
 });
 
+test('auth change during explicit fresh recovery discards its delayed result and the old schedule conflict', async () => {
+  const {R}=setup();
+  for(const change of ['logout','account_switch']){
+    const oldSession=Object.freeze({accountRef:`passenger-old-${change}`,viewerRole:'passenger'}),accountA=Object.freeze({accountRef:`passenger-fresh-a-${change}`,viewerRole:'passenger'}),accountB=Object.freeze({accountRef:`passenger-fresh-b-${change}`,viewerRole:'passenger'});
+    const oldTarget=recoveryEventTarget(),conflict=R.scheduleConflictRecoveryView({status:'assigned',revision:8,pickupAt:'2099-07-14T21:30:00.000Z'});
+    const oldController=R.createScheduleConflictRecoveryController({conflict,eventTarget:oldTarget,sessionForPassenger:()=>oldSession,readCurrentRide:async()=>({status:200,body:{id:'ride-old',status:'assigned',revision:8,viewerRole:'passenger',nextAction:'track_pickup',updatedAt:'2099-07-14T21:31:00.000Z'}}),createAbortController:()=>null});
+    const oldConfirmation=await oldController.refresh();oldController.invalidate();assert.equal(oldController.consume(oldConfirmation).reason,'stale_recovery');
+
+    const eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('passenger'),reads=[],signals=[];let session=accountA,page='role',releaseFresh,router,lifecycle;
+    const services=allowedRoleServices({sessionForRole:()=>session,readCurrentRide:({sessionBinding,request})=>{
+      reads.push(sessionBinding.accountRef);signals.push(request.signal);
+      if(reads.length===1)throw Error('offline');
+      if(sessionBinding===accountA)return new Promise(resolve=>{releaseFresh=resolve;});
+      return Promise.resolve({status:204});
+    }});
+    const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
+    const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>(lifecycle=R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()})),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
+    router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:target=>target==='role'?{page:'role',role:null}:{page:target,role:'passenger'},render:destination=>{page=destination.page;}});router.attach();
+    assert.equal((await router.navigate('home')).reason,'entered');await router.idle();assert.deepEqual(reads,[accountA.accountRef]);
+    const generation=lifecycle.snapshot().generation,explicit=lifecycle.requestRecovery({role:'passenger',generation,reason:'connectivity'});
+    while(!releaseFresh)await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(reads,[accountA.accountRef,accountA.accountRef]);
+
+    session=change==='logout'?null:accountB;eventTarget.dispatch('fiji:auth-session-changed',{detail:{sessionBinding:oldSession,viewerRole:'driver'}});
+    if(change==='logout')while(runtime.snapshot().lastAction!=='session_unavailable')await new Promise(resolve=>setImmediate(resolve));
+    else while(reads.length!==3)await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(signals[1].aborted,true);const before={page,reads:[...reads],runtime:runtime.snapshot().lastAction,action:elements.action.textContent,hidden:elements.action.hidden,disabled:elements.commandButtons[0].disabled};
+    releaseFresh({status:200,body:currentRideView('passenger',{id:'ride-delayed',status:'assigned',revision:9,nextAction:'track_pickup',updatedAt:'2099-07-15T00:00:00.000Z'})});
+    const stale=await explicit;assert.equal(stale.recovered,false);assert.equal(stale.reason,'stale_recovery');await router.idle();
+    assert.equal(page,before.page);assert.deepEqual(reads,before.reads);assert.equal(page,'home');assert.notEqual(page,'passenger-history');assert.equal(oldController.consume(oldConfirmation).reason,'stale_recovery');
+    if(change==='logout'){assert.equal(runtime.snapshot().activeRole,'passenger');assert.equal(runtime.snapshot().lastAction,'session_unavailable');assert.equal(fallbackUi.snapshot().action,'reauth');assert.equal(elements.commandButtons[0].disabled,true);}
+    else{assert.equal(runtime.snapshot().activeRole,'passenger');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(elements.action.hidden,true);assert.equal(elements.commandButtons[0].disabled,false);}
+    const publicView=JSON.stringify([runtime.snapshot(),router.snapshot(),fallbackUi.snapshot()]);
+    for(const value of [oldSession.accountRef,accountA.accountRef,accountB.accountRef,'2099-07-14',conflict.label])assert.equal(publicView.includes(value),false);
+    router.detach();
+  }
+});
+
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
   const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
   m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);
