@@ -4072,6 +4072,37 @@ test('authentication recovery events cannot revive a page stopped after token re
   router.detach();assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),0);
 });
 
+test('explicit reentry coalesces role and hash bursts into one new session lifecycle', async () => {
+  const {R}=setup(),accountA=Object.freeze({accountRef:'passenger-reentry-old',viewerRole:'passenger'}),accountB=Object.freeze({accountRef:'passenger-reentry-current',viewerRole:'passenger'}),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('passenger'),reads=[],subscriptions=[],disconnections=[],handled=[],renders=[];
+  let session=accountA,page='role',releaseCurrent,router,lifecycle;
+  const services=allowedRoleServices({
+    sessionForRole:()=>session,
+    readCurrentRide:({sessionBinding})=>{reads.push(sessionBinding);return sessionBinding===accountB?new Promise(resolve=>{releaseCurrent=resolve;}):Promise.resolve({status:204});},
+    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding);},
+    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding,hint.revision]);return {processed:true};}
+  });
+  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
+  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>(lifecycle=R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()})),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
+  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:target=>target==='role'?{page:'role',role:null}:{page:target,role:'passenger'},render:destination=>{page=destination.page;renders.push(page);}});router.attach();
+  assert.equal((await router.navigate('home')).reason,'entered');await router.idle();assert.deepEqual(reads,[accountA]);assert.equal(subscriptions.length,1);assert.equal(lifecycle.snapshot().generation,1);
+
+  session=null;eventTarget.dispatch('fiji:auth-session-changed');eventTarget.dispatch('fiji:auth-session-changed');await router.idle();
+  assert.equal(runtime.snapshot().lastAction,'session_unavailable');assert.deepEqual(disconnections,[accountA]);assert.equal(elements.action.listenerCount('click'),1);
+  assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');await router.idle();assert.equal(page,'role');assert.equal(runtime.snapshot().activeRole,null);assert.equal(elements.action.listenerCount('click'),0);
+
+  session=accountB;const first=router.navigate('home');while(!releaseCurrent||subscriptions.length!==2)await new Promise(resolve=>setImmediate(resolve));
+  const duplicateHome=router.navigate('home'),history=router.navigate('passenger-history');eventTarget.dispatch('hashchange');eventTarget.dispatch('hashchange');await Promise.resolve();
+  assert.deepEqual(reads,[accountA,accountB]);assert.equal(subscriptions.length,2);assert.equal(lifecycle.snapshot().generation,2);assert.equal(runtime.snapshot().busy,true);assert.deepEqual(disconnections,[accountA]);
+  const oldHint=await subscriptions[0].onHint({type:'ride.changed',rideId:'old-ride',revision:61});assert.equal(oldHint.reason,'subscription_inactive');assert.deepEqual(handled,[]);
+
+  releaseCurrent({status:204});await Promise.all([first,duplicateHome,history]);await router.idle();
+  assert.deepEqual(reads,[accountA,accountB]);assert.equal(subscriptions.length,2);assert.equal(lifecycle.snapshot().generation,2);assert.deepEqual(disconnections,[accountA]);assert.equal(page,'home');assert.equal(router.snapshot().page,'home');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(runtime.snapshot().activeRole,'passenger');
+  const currentHint=await subscriptions[1].onHint({type:'ride.changed',rideId:'current-ride',revision:62});await router.idle();assert.equal(currentHint.processed,true);assert.deepEqual(handled,[[accountB,62]]);assert.deepEqual(reads,[accountA,accountB]);
+  assert.equal(eventTarget.listenerCount('hashchange'),1);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);for(const type of ['visibilitychange','pageshow','online'])assert.equal(eventTarget.listenerCount(type),1);assert.equal(elements.action.listenerCount('click'),1);
+  const publicView=JSON.stringify([runtime.snapshot(),router.snapshot(),lifecycle.snapshot(),fallbackUi.snapshot(),renders]);for(const value of [accountA.accountRef,accountB.accountRef,'old-ride','current-ride'])assert.equal(publicView.includes(value),false);
+  router.detach();assert.deepEqual(disconnections,[accountA,accountB]);assert.equal(eventTarget.listenerCount('hashchange'),0);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),0);
+});
+
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
   const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
   m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);
