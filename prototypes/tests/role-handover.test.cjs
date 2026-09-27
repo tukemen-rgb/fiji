@@ -4297,6 +4297,50 @@ for(const failure of ['unauthorized','forbidden','offline'])test(`logout during 
   router.detach();assert.equal(eventTarget.listenerCount('hashchange'),0);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),0);
 });
 
+for(const failure of ['unauthorized','forbidden','offline'])test(`account switch during explicit reentry after ${failure} starts only the newest passenger generation`,{timeout:5000},async () => {
+  const {R}=setup(),accounts=['passenger-roundtrip-switch-a','passenger-roundtrip-switch-b','passenger-roundtrip-switch-c','passenger-roundtrip-switch-d'].map(accountRef=>Object.freeze({accountRef:`${accountRef}-${failure}`,viewerRole:'passenger'})),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),storage=memoryStorage(),reads=[],signals=[],subscriptions=[],disconnections=[],handled=[],renders=[];
+  let session=accounts[0],page='role',releaseC,router,lifecycle;
+  const services=allowedRoleServices({
+    sessionForRole:()=>session,
+    readCurrentRide:({sessionBinding,request})=>{
+      reads.push(sessionBinding);signals.push(request.signal);
+      if(sessionBinding===accounts[1]){
+        if(failure==='offline')throw Error('offline');
+        return Promise.resolve({status:failure==='unauthorized'?401:403});
+      }
+      if(sessionBinding===accounts[2])return new Promise(resolve=>{releaseC=resolve;});
+      return Promise.resolve({status:204});
+    },
+    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding);},
+    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding,hint.revision]);return {processed:true};}
+  });
+  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>(lifecycle=R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage}))});
+  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:target=>target==='role'?{page:'role',role:null}:{page:target,role:'passenger'},render:destination=>{page=destination.page;renders.push(page);}});router.attach();
+  assert.equal((await router.navigate('home')).reason,'entered');await router.idle();
+  session=null;eventTarget.dispatch('fiji:auth-session-changed');await router.idle();assert.equal(runtime.snapshot().lastAction,'session_unavailable');
+  assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('home')).reason,'entered');await router.idle();
+  assert.equal(JSON.parse(storage.value('taxi-command-guard-v1')).outcome,failure==='offline'?'unresolved':'reauth');
+  assert.equal((await router.navigate('role')).reason,'role_chooser');assert.equal(storage.value('taxi-command-guard-v1'),undefined);assert.deepEqual(disconnections,[accounts[0],accounts[1]]);
+
+  session=accounts[2];const firstC=router.navigate('home');while(!releaseC||subscriptions.length!==3)await new Promise(resolve=>setImmediate(resolve));
+  const duplicateC=router.navigate('passenger-history');eventTarget.dispatch('hashchange');eventTarget.dispatch('hashchange');await Promise.resolve();
+  assert.deepEqual(reads,accounts.slice(0,3));assert.equal(lifecycle.snapshot().generation,3);assert.equal(signals[2].aborted,false);
+
+  session=accounts[3];for(let i=0;i<6;i++)eventTarget.dispatch('fiji:auth-session-changed',{detail:{viewerRole:i%2?'driver':'passenger',sessionBinding:accounts[2],accessToken:`ignored-roundtrip-switch-${i}`}});
+  for(let wait=0;wait<200&&(reads.length!==4||subscriptions.length!==4||runtime.snapshot().lastAction!=='entered');wait+=1)await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(reads,accounts);assert.equal(subscriptions.length,4);assert.equal(lifecycle.snapshot().generation,4);assert.equal(signals[2].aborted,true);assert.equal(signals[3].aborted,false);assert.deepEqual(disconnections,accounts.slice(0,3));
+  assert.equal(page,'home');assert.equal(router.snapshot().page,'home');assert.equal(storage.value('taxi-command-guard-v1'),undefined);
+
+  const historyBeforeStaleC=renders.filter(rendered=>rendered==='passenger-history').length,renderCountBeforeStaleC=renders.length;
+  releaseC({status:200,body:currentRideView('passenger',{id:`stale-roundtrip-switch-${failure}-ride`,status:'assigned',revision:120,nextAction:'track_pickup',updatedAt:'2099-07-15T04:00:00.000Z'})});await Promise.all([firstC,duplicateC]);await router.idle();
+  assert.equal(renders.filter(rendered=>rendered==='passenger-history').length,historyBeforeStaleC);assert.equal(renders.length,renderCountBeforeStaleC);assert.equal(page,'home');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(storage.value('taxi-command-guard-v1'),undefined);assert.deepEqual(reads,accounts);
+  for(let i=0;i<3;i++)assert.equal((await subscriptions[i].onHint({type:'ride.changed',rideId:`stale-roundtrip-switch-${i}`,revision:121+i})).reason,'subscription_inactive');
+  const currentHint=await subscriptions[3].onHint({type:'ride.changed',rideId:'current-roundtrip-switch-d',revision:124});await router.idle();assert.equal(currentHint.processed,true);assert.deepEqual(handled,[[accounts[3],124]]);assert.deepEqual(reads,accounts);
+  assert.equal(eventTarget.listenerCount('hashchange'),1);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);for(const type of ['visibilitychange','pageshow','online'])assert.equal(eventTarget.listenerCount(type),1);
+  const publicView=JSON.stringify([runtime.snapshot(),router.snapshot(),lifecycle.snapshot(),renders]);for(const value of [...accounts.map(account=>account.accountRef),'ignored-roundtrip-switch',`stale-roundtrip-switch-${failure}-ride`,'current-roundtrip-switch-d'])assert.equal(publicView.includes(value),false);
+  router.detach();assert.deepEqual(disconnections,accounts);assert.equal(eventTarget.listenerCount('hashchange'),0);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),0);
+});
+
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
   const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
   m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);
