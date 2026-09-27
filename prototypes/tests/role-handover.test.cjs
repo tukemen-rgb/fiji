@@ -4131,6 +4131,46 @@ test('logout during coalesced reentry keeps the reauthentication lock ahead of s
   router.detach();assert.equal(eventTarget.listenerCount('hashchange'),0);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),0);
 });
 
+test('account switch during coalesced reentry starts only the latest passenger lifecycle', async () => {
+  const {R}=setup(),accounts=['passenger-reentry-a','passenger-reentry-b','passenger-reentry-c'].map(accountRef=>Object.freeze({accountRef,viewerRole:'passenger'})),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),fallbackUi=R.createCommandUiController('passenger'),reads=[],signals=[],subscriptions=[],disconnections=[],handled=[],renders=[];
+  let session=accounts[0],page='role',releaseB,releaseC,router,lifecycle;
+  const services=allowedRoleServices({
+    sessionForRole:()=>session,
+    readCurrentRide:({sessionBinding,request})=>{
+      reads.push(sessionBinding);signals.push(request.signal);
+      if(sessionBinding===accounts[1])return new Promise(resolve=>{releaseB=resolve;});
+      if(sessionBinding===accounts[2])return new Promise(resolve=>{releaseC=resolve;});
+      return Promise.resolve({status:204});
+    },
+    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding);},
+    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding,hint.revision]);return {processed:true};}
+  });
+  const fallbackDom=R.createCommandFeedbackDomBridge({commandUi:fallbackUi,elements,activate:action=>action==='reauth'?router.navigate('role'):Promise.resolve({processed:false,reason:'action_not_available'})});
+  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>(lifecycle=R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage:memoryStorage()})),renderUnavailable:view=>{fallbackUi.setRole(view.role);fallbackUi.applyFeedback(view.role,fallbackUi.snapshot().generation,view.outcome,{title:view.title,message:view.message,disableCommands:view.disableCommands,action:view.action});fallbackDom.attach();fallbackDom.render();},clearUnavailable:()=>{fallbackUi.clear();fallbackDom.detach();}});
+  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:target=>target==='role'?{page:'role',role:null}:{page:target,role:'passenger'},render:destination=>{page=destination.page;renders.push(page);}});router.attach();
+  assert.equal((await router.navigate('home')).reason,'entered');await router.idle();assert.deepEqual(reads,[accounts[0]]);assert.equal(subscriptions.length,1);
+  session=null;eventTarget.dispatch('fiji:auth-session-changed');await router.idle();assert.equal(runtime.snapshot().lastAction,'session_unavailable');assert.deepEqual(disconnections,[accounts[0]]);
+  assert.equal((await fallbackDom.activate()).reason,'dom_bridge_stale');await router.idle();assert.equal(page,'role');
+
+  session=accounts[1];const firstB=router.navigate('home');while(!releaseB||subscriptions.length!==2)await new Promise(resolve=>setImmediate(resolve));
+  const duplicateB=router.navigate('passenger-history');eventTarget.dispatch('hashchange');eventTarget.dispatch('hashchange');await Promise.resolve();assert.deepEqual(reads,[accounts[0],accounts[1]]);assert.equal(lifecycle.snapshot().generation,2);
+  session=accounts[2];for(let i=0;i<5;i++)eventTarget.dispatch('fiji:auth-session-changed',{detail:{viewerRole:i%2?'driver':'passenger',sessionBinding:accounts[1],accessToken:`stale-reentry-token-${i}`}});
+  while(!releaseC||subscriptions.length!==3)await new Promise(resolve=>setImmediate(resolve));
+  const duplicateC=router.navigate('passenger-account');eventTarget.dispatch('hashchange');eventTarget.dispatch('hashchange');await Promise.resolve();
+  assert.deepEqual(reads,accounts);assert.equal(lifecycle.snapshot().generation,3);assert.equal(subscriptions.length,3);assert.deepEqual(disconnections,[accounts[0],accounts[1]]);assert.equal(signals[1].aborted,true);assert.equal(signals[2].aborted,false);
+
+  const historyBeforeOldSuccess=renders.filter(rendered=>rendered==='passenger-history').length;
+  releaseB({status:200,body:currentRideView('passenger',{id:'stale-reentry-b-ride',status:'assigned',revision:80,nextAction:'track_pickup',updatedAt:'2099-07-15T01:00:00.000Z'})});await Promise.all([firstB,duplicateB]);await Promise.resolve();
+  assert.equal(renders.filter(rendered=>rendered==='passenger-history').length,historyBeforeOldSuccess);assert.deepEqual(reads,accounts);assert.equal(signals[2].aborted,false);
+  releaseC({status:204});await duplicateC;await router.idle();
+  assert.deepEqual(reads,accounts);assert.equal(page,'home');assert.equal(router.snapshot().page,'home');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(runtime.snapshot().activeRole,'passenger');assert.equal(lifecycle.snapshot().generation,3);assert.deepEqual(disconnections,[accounts[0],accounts[1]]);
+  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'stale-a-ride',revision:81})).reason,'subscription_inactive');assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'stale-b-ride',revision:82})).reason,'subscription_inactive');
+  const currentHint=await subscriptions[2].onHint({type:'ride.changed',rideId:'current-c-ride',revision:83});await router.idle();assert.equal(currentHint.processed,true);assert.deepEqual(handled,[[accounts[2],83]]);assert.deepEqual(reads,accounts);
+  assert.equal(eventTarget.listenerCount('hashchange'),1);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),1);for(const type of ['visibilitychange','pageshow','online'])assert.equal(eventTarget.listenerCount(type),1);
+  const publicView=JSON.stringify([runtime.snapshot(),router.snapshot(),lifecycle.snapshot(),fallbackUi.snapshot(),renders]);for(const value of [...accounts.map(account=>account.accountRef),'stale-reentry-token','stale-reentry-b-ride','current-c-ride'])assert.equal(publicView.includes(value),false);
+  router.detach();assert.deepEqual(disconnections,accounts);assert.equal(eventTarget.listenerCount('hashchange'),0);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),0);
+});
+
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
   const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
   m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);
