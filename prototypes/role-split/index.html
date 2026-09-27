@@ -1719,6 +1719,7 @@
       try{destination=resolve(target);}catch{lastAction='resolve_failed';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}
       const role=destination?.role==='driver'?'driver':destination?.role==='passenger'?'passenger':null,nextPage=destination?.page;
       if(typeof nextPage!=='string'||!role&&nextPage!=='role'||role&&!pages[role].includes(nextPage)){lastAction='invalid_destination';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}
+      if(role&&page!=='role'&&runtime.snapshot()?.lastAction==='session_unavailable'){lastAction='reauthentication_requires_navigation';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}
       page=nextPage;activeRole=role;
       if(!role){runtime.leave();lastAction='role_chooser';try{render(destination);}catch{lastAction='render_failed';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}return Promise.resolve({navigated:true,reason:'role_chooser',state:snapshot()});}
       try{render(destination);}catch{lastAction='render_failed';return Promise.resolve({navigated:false,reason:lastAction,state:snapshot()});}
