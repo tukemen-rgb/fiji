@@ -4212,6 +4212,46 @@ for(const failure of ['unauthorized','forbidden','offline'])test(`latest passeng
   router.detach();assert.deepEqual(disconnections,accounts);assert.equal(eventTarget.listenerCount('hashchange'),0);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),0);
 });
 
+for(const failure of ['unauthorized','forbidden','offline'])test(`explicit reentry after ${failure} starts only a clean passenger generation`,{timeout:5000},async () => {
+  const {R}=setup(),accounts=['passenger-roundtrip-a','passenger-roundtrip-b','passenger-roundtrip-c'].map(accountRef=>Object.freeze({accountRef:`${accountRef}-${failure}`,viewerRole:'passenger'})),eventTarget=recoveryEventTarget(),elements=feedbackDomElements(),storage=memoryStorage(),reads=[],signals=[],subscriptions=[],disconnections=[],handled=[],renders=[];
+  let session=accounts[0],page='role',releaseC,router,lifecycle;
+  const services=allowedRoleServices({
+    sessionForRole:()=>session,
+    readCurrentRide:({sessionBinding,request})=>{
+      reads.push(sessionBinding);signals.push(request.signal);
+      if(sessionBinding===accounts[1]){
+        if(failure==='offline')throw Error('offline');
+        return Promise.resolve({status:failure==='unauthorized'?401:403});
+      }
+      if(sessionBinding===accounts[2])return new Promise(resolve=>{releaseC=resolve;});
+      return Promise.resolve({status:204});
+    },
+    subscribeNotifications:async context=>{subscriptions.push(context);return()=>disconnections.push(context.sessionBinding);},
+    handleNotificationHint:async({sessionBinding,hint})=>{handled.push([sessionBinding,hint.revision]);return {processed:true};}
+  });
+  const runtime=R.createRolePageRuntime({services,createLifecycle:injected=>(lifecycle=R.createRoleServiceLifecycle({services:injected,elements,eventTarget,documentState:{visibilityState:'visible'},navigate:target=>page===target?null:router.navigate(target),storage}))});
+  router=R.createRolePageRouter({runtime,eventTarget,readHash:()=>page,resolve:target=>target==='role'?{page:'role',role:null}:{page:target,role:'passenger'},render:destination=>{page=destination.page;renders.push(page);}});router.attach();
+  assert.equal((await router.navigate('home')).reason,'entered');await router.idle();
+  session=null;eventTarget.dispatch('fiji:auth-session-changed');await router.idle();assert.equal(runtime.snapshot().lastAction,'session_unavailable');
+  assert.equal((await router.navigate('role')).reason,'role_chooser');session=accounts[1];assert.equal((await router.navigate('home')).reason,'entered');await router.idle();
+  const expectedOutcome=failure==='offline'?'unresolved':'reauth',failedMarker=JSON.parse(storage.value('taxi-command-guard-v1'));
+  assert.equal(failedMarker.role,'passenger');assert.equal(failedMarker.outcome,expectedOutcome);assert.deepEqual(reads,[accounts[0],accounts[1]]);assert.equal(lifecycle.snapshot().generation,2);
+
+  assert.equal((await router.navigate('role')).reason,'role_chooser');assert.equal(storage.value('taxi-command-guard-v1'),undefined);assert.deepEqual(disconnections,[accounts[0],accounts[1]]);
+  session=accounts[2];for(let i=0;i<6;i++)eventTarget.dispatch('fiji:auth-session-changed',{detail:{viewerRole:i%2?'passenger':'driver',sessionBinding:accounts[1],accessToken:`ignored-roundtrip-token-${i}`}});await Promise.resolve();await Promise.resolve();
+  assert.equal(page,'role');assert.deepEqual(reads,[accounts[0],accounts[1]]);assert.equal(subscriptions.length,2);assert.equal(lifecycle.snapshot().generation,2);
+
+  const firstC=router.navigate('home');while(!releaseC||subscriptions.length!==3)await new Promise(resolve=>setImmediate(resolve));
+  const duplicateC=router.navigate('passenger-history'),accountC=router.navigate('passenger-account');eventTarget.dispatch('hashchange');eventTarget.dispatch('hashchange');await Promise.resolve();
+  assert.deepEqual(reads,accounts);assert.equal(lifecycle.snapshot().generation,3);assert.equal(subscriptions.length,3);assert.equal(signals[2].aborted,false);assert.deepEqual(disconnections,[accounts[0],accounts[1]]);
+  releaseC({status:204});await Promise.all([firstC,duplicateC,accountC]);await router.idle();
+  assert.deepEqual(reads,accounts);assert.equal(storage.value('taxi-command-guard-v1'),undefined);assert.equal(page,'home');assert.equal(router.snapshot().page,'home');assert.equal(runtime.snapshot().lastAction,'entered');assert.equal(lifecycle.snapshot().generation,3);
+  assert.equal((await subscriptions[0].onHint({type:'ride.changed',rideId:'stale-roundtrip-a',revision:101})).reason,'subscription_inactive');assert.equal((await subscriptions[1].onHint({type:'ride.changed',rideId:'stale-roundtrip-b',revision:102})).reason,'subscription_inactive');
+  const currentHint=await subscriptions[2].onHint({type:'ride.changed',rideId:'current-roundtrip-c',revision:103});await router.idle();assert.equal(currentHint.processed,true);assert.deepEqual(handled,[[accounts[2],103]]);assert.deepEqual(reads,accounts);
+  const publicView=JSON.stringify([runtime.snapshot(),router.snapshot(),lifecycle.snapshot(),failedMarker,renders]);for(const value of [...accounts.map(account=>account.accountRef),'ignored-roundtrip-token','stale-roundtrip-a','stale-roundtrip-b','current-roundtrip-c'])assert.equal(publicView.includes(value),false);
+  router.detach();assert.deepEqual(disconnections,accounts);assert.equal(eventTarget.listenerCount('hashchange'),0);assert.equal(eventTarget.listenerCount('fiji:auth-session-changed'),0);
+});
+
 test('offer refresh records time expiry and explains why no quote is selectable', () => {
   const {m}=setup(); passenger(m); const ride=m.requestRide({pickup:'Demo Hotel',destination:'Demo Beach'});
   m.state.offers.filter(o=>o.requestId===ride.id).forEach(o=>o.expiresAt=Date.now()-1);
